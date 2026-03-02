@@ -4,6 +4,15 @@
   // THEME ENGINE • SETTINGS UI • RENDER ENGINE • AUDIO ENGINE
   // ─────────────────────────────────────────────────────────
 
+  // PLUGIN METADATA
+  const AMX_PLUGIN_NAME        = "AudioMetrix";
+  const AMX_VERSION            = "3.2";
+  const AMX_CHECK_FOR_UPDATES  = true;
+  const AMX_UPDATE_URL         =
+    "https://raw.githubusercontent.com/MCelliotG/Audiometrix-plugin-for-FMDX-Webservers/main/AudioMetrix/audiometrix.js";
+  const AMX_HOMEPAGE_URL       =
+    "https://github.com/MCelliotG/Audiometrix-plugin-for-FMDX-Webservers";
+
   // GLOBAL HARDENED CONSTANTS
   const VALID_THEMES = [
     "automatic", "aegean", "aurora", "emerald", "escapade", "goldenbrown",
@@ -54,16 +63,19 @@
     STATE.cache.pillar.height = 0;
   }
 
-  const STORAGE_ENABLE = "amx_enabled_state";
-  const STORAGE_THEME = "AMX_THEME";
-  const STORAGE_GLOW_ENABLED = "AMX_GLOW_ENABLED";
-  const STORAGE_SHOW_PEAKS = "AMX_SHOW_PEAKS";
+  const STORAGE_ENABLE        = "amx_enabled_state";
+  const STORAGE_THEME         = "AMX_THEME";
+  const STORAGE_GLOW_ENABLED  = "AMX_GLOW_ENABLED";
+  const STORAGE_SHOW_PEAKS    = "AMX_SHOW_PEAKS";
   const STORAGE_SHOW_READOUTS = "AMX_SHOW_READOUTS";
-  const STORAGE_BARSTYLE = "AMX_BAR_STYLE";
-  const STORAGE_GAIN = "AMX_GAIN";
-  const STORAGE_LAYOUT = "AMX_LAYOUT_MODE"; // lr, sa, full
-  const STORAGE_RENDER = "AMX_RENDER_MODE"; // bars, gauges, mirrored
-  const AMX_DEBUG = false;
+  const STORAGE_BARSTYLE      = "AMX_BAR_STYLE";
+  const STORAGE_GAIN          = "AMX_GAIN";
+  const STORAGE_LAYOUT        = "AMX_LAYOUT_MODE"; // lr, sa, full
+  const STORAGE_RENDER        = "AMX_RENDER_MODE"; // bars, gauges, mirrored
+  const STORAGE_ATTACK        = "AMX_ATTACK_SPEED";
+  const STORAGE_RELEASE       = "AMX_RELEASE_SPEED";
+  const STORAGE_PEAK_HOLD     = "AMX_PEAK_HOLD_MS";
+  const AMX_DEBUG             = false;
 
   // HARDENED LOCAL STORAGE HELPERS
   function safeLSGet(key) {
@@ -84,6 +96,109 @@
     try {
       localStorage.removeItem(key);
     } catch (e) {}
+  }
+
+  function loadLSFloat(key, def, min = null, max = null) {
+    const raw = safeLSGet(key);
+    const v = parseFloat(raw);
+    if (isNaN(v)) return def;
+    let x = v;
+    if (min !== null) x = Math.max(min, x);
+    if (max !== null) x = Math.min(max, x);
+    return x;
+  }
+
+  function loadLSInt(key, def, min = null, max = null) {
+    const raw = safeLSGet(key);
+    const v = parseInt(raw, 10);
+    if (isNaN(v)) return def;
+    let x = v;
+    if (min !== null) x = Math.max(min, x);
+    if (max !== null) x = Math.min(max, x);
+    return x;
+  }
+
+  function loadLSBool(key, def) {
+    const raw = safeLSGet(key);
+    if (raw === null) return def;
+    return raw === "true";
+  }
+
+  function loadLSEnum(key, def, allowed) {
+    const raw = safeLSGet(key);
+    if (!raw) return def;
+    return allowed.includes(raw) ? raw : def;
+  }
+
+  function applyAMXUpdateBanner() {
+    if (!STATE || !STATE.dom || !STATE.dom.updateBanner) return;
+
+    const banner = STATE.dom.updateBanner;
+    const m = STATE.meta || {};
+
+    if (m.updateAvailable && m.remoteVersion) {
+      banner.textContent = `Update available: v${m.remoteVersion} (you have v${AMX_VERSION})`;
+      banner.style.display = "block";
+    } else {
+      banner.style.display = "none";
+    }
+  }
+
+  function checkAudioMetrixUpdate() {
+    if (!AMX_CHECK_FOR_UPDATES) return;
+    if (typeof fetch !== "function") return;
+
+    try {
+      // Bypass cache
+      const url =
+        AMX_UPDATE_URL +
+        (AMX_UPDATE_URL.includes("?") ? "&" : "?") +
+        "_=" +
+        Date.now();
+
+      fetch(url, { cache: "no-store" })
+        .then(resp => {
+          if (!resp || !resp.ok) return null;
+          return resp.text();
+        })
+        .then(text => {
+          if (!text) return;
+
+          const match = text.match(/AMX_VERSION\s*=\s*["']([^"']+)["']/);
+          if (!match || !match[1]) return;
+
+          const remoteVersion = match[1].trim();
+
+          if (!STATE.meta) STATE.meta = { updateAvailable: false, remoteVersion: null };
+
+          if (remoteVersion && remoteVersion !== AMX_VERSION) {
+            STATE.meta.updateAvailable = true;
+            STATE.meta.remoteVersion = remoteVersion;
+
+            console.log(
+              `[AudioMetrix] Update available: v${remoteVersion} (current v${AMX_VERSION}). ` +
+              `See: ${AMX_HOMEPAGE_URL}`
+            );
+          } else {
+            STATE.meta.updateAvailable = false;
+            STATE.meta.remoteVersion = remoteVersion || null;
+
+            if (AMX_DEBUG) {
+              console.log(`[AudioMetrix] Up to date (v${AMX_VERSION})`);
+            }
+          }
+          applyAMXUpdateBanner();
+        })
+        .catch(e => {
+          if (AMX_DEBUG) {
+            console.warn("[AudioMetrix] Update check failed:", e);
+          }
+        });
+    } catch (e) {
+      if (AMX_DEBUG) {
+        console.warn("[AudioMetrix] Update check init failed:", e);
+      }
+    }
   }
 
   // LOCAL STORAGE SANITIZER — PREVENTS LOCKOUT
@@ -116,7 +231,7 @@
       // GAIN (dB)
       let gRaw = safeLSGet(STORAGE_GAIN);
       let g = parseInt(gRaw, 10);
-      if (isNaN(g) || g < -12 || g > 12) {
+      if (isNaN(g) || g < -15 || g > 15) {
         safeLSSet(STORAGE_GAIN, "0");
       }
 
@@ -599,9 +714,9 @@
     aurora: {
       name: "aurora",
       colors: {
-        low: "hsl(333, 100%, 65%)",
-        mid: "hsl(75, 91%, 66%)",
-        high: "hsl(195, 100%, 50%)",
+        low: "hsl(225, 51%, 18%)",
+        mid: "hsl(283, 62%, 54%)",
+        high: "hsl(91, 100%, 40%)",
         peak: "hsl(60, 100%, 82%)"
       }
     },
@@ -619,9 +734,9 @@
     emerald: {
       name: "emerald",
       colors: {
-        low: "hsl(128, 100%, 25%)",
-        mid: "hsl(132, 100%, 50%)",
-        high: "hsl(156, 100%, 50%)",
+        low: "hsl(156, 49%, 10%)",
+        mid: "hsl(140, 52%, 55%)",
+        high: "hsl(140, 50%, 85%)",
         peak: "hsl(120, 100%, 80%)"
       }
     },
@@ -681,7 +796,7 @@
       colors: {
         low: "hsl(212, 100%, 50%)",
         mid: "hsl(61, 95%, 71%)",
-        high: "hsl(338, 100%, 50%)",
+        high: "hsl(284, 91%, 37%)",
         peak: "hsl(159, 100%, 44%)"
       }
     },
@@ -689,10 +804,10 @@
     redvelvet: {
       name: "redvelvet",
       colors: {
-        low: "hsl(0, 100%, 33%)",
-        mid: "hsl(0, 100%, 53%)",
-        high: "hsl(0, 100%, 65%)",
-        peak: "hsl(0, 100%, 84%)"
+        low: "hsl(356, 77%, 76%)",
+        mid: "hsl(57, 100%, 91%)",
+        high: "hsl(358, 97%, 31%)",
+        peak: "hsl(359, 64%, 35%)"
       }
     },
 
@@ -739,8 +854,8 @@
     tangerine: {
       name: "tangerine",
       colors: {
-        low: "hsl(0, 100%, 41%)",
-        mid: "hsl(28, 100%, 50%)",
+        low: "hsl(22, 100%, 50%)",
+        mid: "hsl(33, 100%, 46%)",
         high: "hsl(41, 100%, 48%)",
         peak: "hsl(42, 100%, 73%)"
       }
@@ -829,50 +944,29 @@
   const CONFIG = {
     audio: {
       minThreshold: 0.0015,
-      riseRate: 1.2,
-      amplification: 1.0,
+      riseRate: 1.25,
+      amplification: 1.05,
       bassReduction: -2,
       highPassCutoff: 1200,
       lowPassCutoff: 2000,
-      attackSpeed: 0.45,
-      releaseSpeed: 0.65,
-      peakHoldMs: 1000,
       peakDecayDbPerFrame: 0.7,
       peakMinVolumeThreshold: 0.5,
       peakFftSize: 256,
-      minDb: -40,
-      maxDb: +3,
-      dbGain: (() => {
-        const raw = safeLSGet(STORAGE_GAIN);
-        const n = parseInt(raw, 10);
-        if (isNaN(n)) return 0;
-        return Math.min(12, Math.max(-12, n));
-      })()
+      minDb: -35,
+      maxDb: 5,
+      calibrationDb: 9,
+      attackSpeed: loadLSFloat(STORAGE_ATTACK,  0.45, 0.05, 1.0),
+      releaseSpeed: loadLSFloat(STORAGE_RELEASE, 0.65, 0.05, 1.0),
+      peakHoldMs: loadLSInt  (STORAGE_PEAK_HOLD, 1000, 50, 2000),
+      dbGain: loadLSInt(STORAGE_GAIN, 0, -15, 15)
     },
     display: {
-      glowIntensity: (() => (safeLSGet(STORAGE_GLOW_ENABLED) === "true" ? 1 : 0))(),
-      barStyle: (() => {
-        const raw = safeLSGet(STORAGE_BARSTYLE) || "simple";
-        return VALID_STYLES.includes(raw) ? raw : "simple";
-      })(),
-      layoutMode: (() => {
-        const raw = safeLSGet("AMX_LAYOUT_MODE") || "lr";
-        return ["lr", "sa", "full"].includes(raw) ? raw : "lr";
-      })(),
-      renderMode: (() => {
-        const raw = safeLSGet("AMX_RENDER_MODE") || "bars";
-        return ["bars", "gauges", "mirrored"].includes(raw) ? raw : "bars";
-      })(),
-      showPeaks: (() => {
-        const raw = safeLSGet(STORAGE_SHOW_PEAKS);
-        if (raw === null) return false;
-        return raw === "true";
-      })(),
-      showReadouts: (() => {
-        const raw = safeLSGet(STORAGE_SHOW_READOUTS);
-        if (raw === null) return false;
-        return raw === "true";
-      })(),
+      glowIntensity: loadLSBool(STORAGE_GLOW_ENABLED, false) ? 1 : 0,
+      barStyle: loadLSEnum(STORAGE_BARSTYLE, "simple", VALID_STYLES),
+      layoutMode: loadLSEnum(STORAGE_LAYOUT, "lr", ["lr", "sa", "full"]),
+      renderMode: loadLSEnum(STORAGE_RENDER, "bars", ["bars", "gauges", "mirrored"]),
+      showPeaks: loadLSBool(STORAGE_SHOW_PEAKS, false),
+      showReadouts: loadLSBool(STORAGE_SHOW_READOUTS, false),
       dimensions: {
         barHeight: 20,
         spacing: 10,
@@ -970,7 +1064,12 @@
       left: null,
       right: null,
       audio: null
-    }
+    },
+
+    meta: {
+      updateAvailable: false,
+      remoteVersion: null
+    },
   };
 
   // ─────────────────────────────────────────
@@ -1369,9 +1468,12 @@
     function requestReposition() {
       if (panel.style.display === "none") return;
 
+      // store user position and size
+      if (panel._amxUserMoved || panel._amxUserResized) return;
+
       if (!ticking) {
         ticking = true;
-        requestAnimationFrame(() => {
+        requestAnimationFrame(function () {
           positionAMXFloatingPanel(panel, container);
           ticking = false;
         });
@@ -1383,6 +1485,197 @@
     window.addEventListener("orientationchange", requestReposition);
   }
 
+  function enableAMXPanelDragging(panel, handle) {
+    if (!panel || !handle || panel._amxDragEnabled) return;
+    panel._amxDragEnabled = true;
+
+    handle.style.cursor = "move";
+
+    let isDragging = false;
+    let startX = 0;
+    let startY = 0;
+    let startLeft = 0;
+    let startTop = 0;
+
+    function getPoint(e) {
+      if (e.touches && e.touches.length) return e.touches[0];
+      return e;
+    }
+
+    function onDown(e) {
+      if (e.type === "mousedown" && e.button !== 0) return;
+      const pt = getPoint(e);
+      e.preventDefault();
+
+      isDragging = true;
+      panel._amxUserMoved = true;
+
+      const rect = panel.getBoundingClientRect();
+      startX = pt.clientX;
+      startY = pt.clientY;
+      startLeft = rect.left;
+      startTop = rect.top;
+
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+      document.addEventListener("touchmove", onMove, { passive: false });
+      document.addEventListener("touchend", onUp);
+      document.addEventListener("touchcancel", onUp);
+    }
+
+    function onMove(e) {
+      if (!isDragging) return;
+      const pt = getPoint(e);
+      e.preventDefault();
+
+      const dx = pt.clientX - startX;
+      const dy = pt.clientY - startY;
+
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const margin = 8;
+
+      const rect = panel.getBoundingClientRect();
+      const w = rect.width;
+      const h = rect.height;
+
+      let newLeft = startLeft + dx;
+      let newTop = startTop + dy;
+
+      if (newLeft < margin) newLeft = margin;
+      if (newTop < margin) newTop = margin;
+      if (newLeft + w > vw - margin) newLeft = vw - margin - w;
+      if (newTop + h > vh - margin) newTop = vh - margin - h;
+
+      panel.style.left = newLeft + "px";
+      panel.style.top = newTop + "px";
+      panel.style.right = "auto";
+      panel.style.bottom = "auto";
+    }
+
+    function onUp() {
+      if (!isDragging) return;
+      isDragging = false;
+
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.removeEventListener("touchmove", onMove);
+      document.removeEventListener("touchend", onUp);
+      document.removeEventListener("touchcancel", onUp);
+    }
+
+    handle.addEventListener("mousedown", onDown);
+    handle.addEventListener("touchstart", onDown, { passive: false });
+  }
+
+  function enableAMXPanelResize(panel) {
+    if (!panel || panel._amxResizeEnabled) return;
+    panel._amxResizeEnabled = true;
+
+    const handle = document.createElement("div");
+    handle.id = "amx-resize-handle";
+
+    handle.style.position = "absolute";
+    handle.style.right = "6px";
+    handle.style.bottom = "6px";
+    handle.style.width = "14px";
+    handle.style.height = "14px";
+    handle.style.borderRadius = "4px";
+    handle.style.cursor = "se-resize";
+    handle.style.background = "rgba(255,255,255,0.32)";
+    handle.style.boxShadow =
+      "0 0 4px rgba(0,0,0,0.6), inset 0 0 2px rgba(0,0,0,0.4)";
+
+    handle.style.zIndex = "100001";
+
+    panel.appendChild(handle);
+
+    let isResizing = false;
+    let startX = 0;
+    let startY = 0;
+    let startW = 0;
+    let startH = 0;
+
+    function getPoint(e) {
+      if (e.touches && e.touches.length) return e.touches[0];
+      return e;
+    }
+
+    function onDown(e) {
+      if (e.type === "mousedown" && e.button !== 0) return;
+      const pt = getPoint(e);
+      e.preventDefault();
+
+      isResizing = true;
+      panel._amxUserResized = true;
+
+      const rect = panel.getBoundingClientRect();
+      startX = pt.clientX;
+      startY = pt.clientY;
+      startW = rect.width;
+      startH = rect.height;
+
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+      document.addEventListener("touchmove", onMove, { passive: false });
+      document.addEventListener("touchend", onUp);
+      document.addEventListener("touchcancel", onUp);
+    }
+
+    function onMove(e) {
+      if (!isResizing) return;
+      const pt = getPoint(e);
+      e.preventDefault();
+
+      const dx = pt.clientX - startX;
+      const dy = pt.clientY - startY;
+
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const margin = 40;
+
+      let newW = startW + dx;
+      let newH = startH + dy;
+
+      const minW = 260;
+      const maxW = Math.max(minW, vw - margin);
+      const minH = 220;
+      const maxH = Math.max(minH, vh - margin);
+
+      if (newW < minW) newW = minW;
+      if (newW > maxW) newW = maxW;
+      if (newH < minH) newH = minH;
+      if (newH > maxH) newH = maxH;
+
+      panel.style.width = newW + "px";
+      panel.style.maxHeight = newH + "px";
+      panel.style.height = newH + "px";
+
+      if (panel._amxContentArea) {
+        const topBarHeight = 36;
+        const paddingVertical = 24;
+        const contentMax = newH - topBarHeight - paddingVertical;
+        if (contentMax > 80) {
+          panel._amxContentArea.style.maxHeight = contentMax + "px";
+        }
+      }
+    }
+
+    function onUp() {
+      if (!isResizing) return;
+      isResizing = false;
+
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.removeEventListener("touchmove", onMove);
+      document.removeEventListener("touchend", onUp);
+      document.removeEventListener("touchcancel", onUp);
+    }
+
+    handle.addEventListener("mousedown", onDown);
+    handle.addEventListener("touchstart", onDown, { passive: false });
+  }
+
   function buildAMXFloatingSettings(panel) {
     try {
       // Clean panel content
@@ -1390,7 +1683,7 @@
 
       // FIXED TOP BAR (Title + Close X)
       const topBar = document.createElement("div");
-  
+
       topBar.style.width = "100%";
       topBar.style.height = "30px";
       topBar.style.display = "flex";
@@ -1399,17 +1692,22 @@
       topBar.style.boxSizing = "border-box";
       topBar.style.padding = "0 8px 0 10px";
       topBar.style.marginBottom = "6px";
-  
+
       // No dark overlay – uses panel background
       topBar.style.background = "transparent";
-  
+
       const title = document.createElement("div");
-      title.textContent = "AUDIOMETRIX SETTINGS";
-      title.style.fontSize = "18px";
-      title.style.fontWeight = "700";
+      title.id = "amx-panel-title";
+      title.innerHTML = `<div style="font-size:18px; font-weight:700;">
+          AUDIOMETRIX SETTINGS</div>
+        <div style="font-size:16px; font-weight:600; margin-top:2px;">
+          v${AMX_VERSION}</div>`;
+      title.style.display = "flex";
+      title.style.flexDirection = "column";
+      title.style.lineHeight = "1.1";
       title.style.color = "var(--color-4)";
       title.style.textShadow = "0 0 4px rgba(0,0,0,0.55)";
-  
+
       const closeBtn = document.createElement("div");
       closeBtn.innerHTML = `<i class="fa-solid fa-xmark"></i>`;
       closeBtn.style.width = "28px";
@@ -1450,22 +1748,53 @@
       // SCROLLABLE CONTENT AREA
       const content = document.createElement("div");
       content.id = "amx-panel-content";
-      
+
       content.style.width = "100%";
       content.style.boxSizing = "border-box";
       content.style.padding = "4px 0 0 0";
-      
+
       // ONLY inner scrolling allowed
       content.style.overflowY = "auto";
-      
+
       // Temporary height, will be updated by positionAMXFloatingPanel()
       content.style.maxHeight = "200px";
-      
-      // Attach content block
+
+      // Update banner
+      const updateBanner = document.createElement("div");
+      updateBanner.id = "amx-update-banner";
+      updateBanner.style.display = "none";
+      updateBanner.style.width = "100%";
+      updateBanner.style.boxSizing = "border-box";
+      updateBanner.style.padding = "4px 8px 6px 10px";
+      updateBanner.style.margin = "0 0 6px 0";
+      updateBanner.style.fontSize = "12px";
+      updateBanner.style.fontWeight = "600";
+      updateBanner.style.color = "var(--color-5)";
+      updateBanner.style.textShadow = "0 0 3px rgba(0,0,0,0.55)";
+      updateBanner.style.background = "rgba(0,0,0,0.25)";
+      updateBanner.style.borderRadius = "8px";
+      updateBanner.style.border = "1px solid var(--color-3)";
+      updateBanner.style.boxShadow =
+        "0 0 6px rgba(0,0,0,0.45), inset 0 0 4px rgba(255,255,255,0.15)";
+
+      content.appendChild(updateBanner);
+
+      // Store reference for update system
+      STATE.dom.updateBanner = updateBanner;
+
+      // Attach content block to panel
       panel.appendChild(content);
-      
+
       // Store reference for dynamic resizing
       panel._amxContentArea = content;
+      panel._amxTopBar = topBar;
+
+      // Show update banner if available
+      applyAMXUpdateBanner();
+
+      // Enable dragging + resize
+      enableAMXPanelDragging(panel, title);
+      enableAMXPanelResize(panel);
 
     // SHARED SLIDER CSS (inject ONCE)
     if (!document.getElementById("amx-sliders-css")) {
@@ -1922,7 +2251,7 @@
 
             <div class="audio-row">
               <span class="text-small">Gain (dB)</span>
-              <input id="gain-slider" type="range" min="-12" max="12" step="1" />
+              <input id="gain-slider" type="range" min="-15" max="15" step="1" />
               <span id="gain-value" class="text-small"></span>
             </div>
           `;
@@ -1935,8 +2264,10 @@
       peakHoldValue.textContent = CONFIG.audio.peakHoldMs;
       peakHoldSlider.oninput = () => {
         const v = parseInt(peakHoldSlider.value, 10);
-        peakHoldValue.textContent = v;
-        CONFIG.audio.peakHoldMs = v;
+        const clamped = Math.min(2000, Math.max(50, isNaN(v) ? 1000 : v));
+        peakHoldValue.textContent = clamped;
+        CONFIG.audio.peakHoldMs = clamped;
+        safeLSSet(STORAGE_PEAK_HOLD, String(clamped));
       };
 
       // Attack
@@ -1946,8 +2277,10 @@
       attackValue.textContent = Number(CONFIG.audio.attackSpeed).toFixed(2);
       attackSlider.oninput = () => {
         const v = parseFloat(attackSlider.value);
-        attackValue.textContent = v.toFixed(2);
-        CONFIG.audio.attackSpeed = v;
+        const clamped = Math.min(1.0, Math.max(0.05, isNaN(v) ? 0.45 : v));
+        attackValue.textContent = clamped.toFixed(2);
+        CONFIG.audio.attackSpeed = clamped;
+        safeLSSet(STORAGE_ATTACK, String(clamped));
       };
 
       // Release
@@ -1957,8 +2290,10 @@
       releaseValue.textContent = Number(CONFIG.audio.releaseSpeed).toFixed(2);
       releaseSlider.oninput = () => {
         const v = parseFloat(releaseSlider.value);
-        releaseValue.textContent = v.toFixed(2);
-        CONFIG.audio.releaseSpeed = v;
+        const clamped = Math.min(1.0, Math.max(0.05, isNaN(v) ? 0.65 : v));
+        releaseValue.textContent = clamped.toFixed(2);
+        CONFIG.audio.releaseSpeed = clamped;
+        safeLSSet(STORAGE_RELEASE, String(clamped));
       };
 
       // Gain
@@ -1967,8 +2302,8 @@
       gainSlider.value = CONFIG.audio.dbGain;
       gainValue.textContent = CONFIG.audio.dbGain;
       gainSlider.oninput = () => {
-        const v = parseInt(gainSlider.value, 10);
-        const nv = isNaN(v) ? 0 : Math.min(12, Math.max(-12, v));
+        const v  = parseInt(gainSlider.value, 10);
+        const nv = isNaN(v) ? 0 : Math.min(15, Math.max(-15, v));
         CONFIG.audio.dbGain = nv;
         gainValue.textContent = nv;
         safeLSSet(STORAGE_GAIN, String(nv));
@@ -2033,7 +2368,7 @@
     }
   }
 
-  let READOUT_FRAME_SKIP = 25;
+  let READOUT_FRAME_SKIP = 5;
   let _readoutFrame = 0;
   let _lastVisualStateKey = null;
 
@@ -2296,7 +2631,7 @@
       const lDb = STATE.levels.left.smoothDb;
       const rDb = STATE.levels.right.smoothDb;
 
-      const AMX_GAUGE_GAIN = 1.10; // 1.25–1.45 ρυθμιζόμενο
+      const AMX_GAUGE_GAIN = 1.10; // 1.25–1.45
 
       return [
         {
@@ -4707,10 +5042,10 @@
           const g = STATE.dom["gaugeNums" + side];
           if (!g) return;
 
-          g.start.textContent = "-40";
+          g.start.textContent = "-35";
           g.mid.textContent   = "-25";
           g.high.textContent  = "-15";
-          g.end.textContent   = "+3";
+          g.end.textContent   = "+5";
 
           g.start.style.display =
           g.mid.style.display   =
@@ -4840,18 +5175,18 @@
       if (STATE.dom.scales.left) {
         renderNumericScale(STATE.dom.scales.left, {
           type: "db",
-          min: -40,
-          max: 3,
-          values: [-40, -30, -20, -10, -5, 0,  3]
+          min: -35,
+          max: 5,
+          values: [-35, -30, -25, -20, -15, -10, -5, 0, 5]
         });
       }
     
       if (STATE.dom.scales.right) {
         renderNumericScale(STATE.dom.scales.right, {
           type: "db",
-          min: -40,
-          max: 3,
-          values: [-40, -30, -20, -10, -5, 0,  3]
+          min: -35,
+          max: 5,
+          values: [-35, -30, -25, -20, -15, -10, -5, 0, 5]
         });
       }
     
@@ -4943,7 +5278,6 @@
       STATE.dom.contentWrapper.appendChild(STATE.dom.canvasGauges);
 
       // INITIAL CANVAS INTRINSIC SIZE SYNC (CRITICAL)
-
       // Default active canvas
       STATE.dom.canvas = STATE.dom.canvasNormal;
       
@@ -4965,7 +5299,7 @@
       );
       requestRender();
 
-      // GAUGES canvas — initial intrinsic size
+      // GAUGES canvas
       if (STATE.dom.canvasGauges) {
         const gaugesHeight = WRAPPER_HEIGHT - 20;
 
@@ -5010,10 +5344,9 @@
       STATE.dom.labels.q.style.display = "none";
       STATE.dom.labels.a.style.display = "none";
 
-      // NATIVE SCALE ROWS (normal mode only)
-      function createScale(text, top) {
+      // SCALE ROWS — containers for numeric scales
+      function createScale(top) {
         const el = document.createElement("div");
-        el.textContent = text;
         el.style.cssText = `
           position:absolute;
           left:20px;
@@ -5028,21 +5361,12 @@
         return el;
       }
 
-      const NB = "\u00A0";
-      const scaleText =
-        NB + NB + "-40" + NB.repeat(10) + "-30" + NB.repeat(10) +
-        "-20" + NB.repeat(10) + "-10" + NB.repeat(5) + "-5" +
-        NB.repeat(2) + "-3" + NB.repeat(2) + "-1" + NB.repeat(1) +
-        "0" + NB.repeat(1) + "+1" + NB.repeat(2) + "+3";
-
-      STATE.dom.scales.left = createScale(scaleText, INNER_BASE_TOP - 24);
+      STATE.dom.scales.left = createScale(INNER_BASE_TOP - 24);
       STATE.dom.scales.right = createScale(
-        scaleText,
-        INNER_BASE_TOP + CONFIG.display.dimensions.barHeight * 2 + CONFIG.display.dimensions.spacing - 0
+        INNER_BASE_TOP + CONFIG.display.dimensions.barHeight * 2 + CONFIG.display.dimensions.spacing
       );
 
       // MIRRORED MODE — CLEAN, FINAL DOM ELEMENTS
-
       // FIXED CENTRAL L|R LABEL
       STATE.dom.mirrorLabel = document.createElement("div");
       STATE.dom.mirrorLabel.textContent = "L | R";
@@ -5092,10 +5416,10 @@
       `;
       STATE.dom.mirrorScaleLeft.innerHTML = `
         <div style="position:relative;width:95%; display:inline-flex;justify-content:space-between;">
-          <span data-db="3">+3</span>
+          <span data-db="5">+5</span>
           <span data-db="-10">-10</span>
           <span data-db="-20">-20</span>
-          <span data-db="-40">-40</span>
+          <span data-db="-35">-35</span>
         </div>
       `;
       STATE.dom.mirrorScaleWrap.appendChild(STATE.dom.mirrorScaleLeft);
@@ -5116,10 +5440,10 @@
       `;
       STATE.dom.mirrorScaleRight.innerHTML = `
         <div style="position:relative;width:95%; display:inline-flex;justify-content:space-between;">
-          <span data-db="-40">-40</span>
+          <span data-db="-35">-35</span>
           <span data-db="-20">-20</span>
           <span data-db="-10">-10</span>
-          <span data-db="+3">+3</span>
+          <span data-db="+5">+5</span>
         </div>
       `;
       STATE.dom.mirrorScaleWrap.appendChild(STATE.dom.mirrorScaleRight);
@@ -5430,31 +5754,33 @@
       // ──────────────
       function resetAudioState() {
         STATE.audio = {
-          context: null,
-          splitter: null,
-
-          // L / R
-          analyserLeft: null,
-          analyserRight: null,
-          dataLeft: null,
-          dataRight: null,
-
-          // Mid / Side (NEW – not wired yet)
-          mergerMS: null,
-          analyserMid: null,
-          analyserSide: null,
-          dataMid: null,
-          dataSide: null,
-
-          // Audio Peak
-          analyserPeak: null,
-          bassFilter: null,
-          highPassFilter: null,
-          lowPassFilter: null,
-          dataPeak: null,
-
-          source: null
-        };
+                  context: null,
+                  splitter: null,
+        
+                  // L / R
+                  analyserLeft: null,
+                  analyserRight: null,
+                  dataLeft: null,
+                  dataRight: null,
+                  timeLeft: null,
+                  timeRight: null,
+        
+                  // Mid / Side (NEW – not wired yet)
+                  mergerMS: null,
+                  analyserMid: null,
+                  analyserSide: null,
+                  dataMid: null,
+                  dataSide: null,
+        
+                  // Audio Peak
+                  analyserPeak: null,
+                  bassFilter: null,
+                  highPassFilter: null,
+                  lowPassFilter: null,
+                  dataPeak: null,
+        
+                  source: null
+                };
       }
 
       function linearToDb(x) {
@@ -5462,27 +5788,32 @@
         return 20 * Math.log10(x);
       }
 
-      function processChannel(data, prevSmoothDb) {
-        let sum = 0;
-        for (let i = 0; i < data.length; i++) {
-          const v = data[i] / 255;
-          sum += v * v;
+      function processChannel(timeData, prevSmoothDb) {
+        // RMS from time-domain samples (0..255 → -1..+1)
+        let sumSq = 0;
+        for (let i = 0; i < timeData.length; i++) {
+          const v = (timeData[i] - 128) / 128;
+          sumSq += v * v;
         }
-        const linear = Math.sqrt(sum / data.length);
 
-        if (linear < CONFIG.audio.minThreshold) {
+        const rms = Math.sqrt(sumSq / timeData.length);
+
+        if (rms < CONFIG.audio.minThreshold) {
           return { instantDb: -120, smoothDb: -120 };
         }
 
-        const shaped = Math.min(
-          Math.pow(linear * CONFIG.audio.amplification, CONFIG.audio.riseRate),
-          1
-        );
+        // RMS → dBFS + user gain + calibration
+        let instantDb =
+          linearToDb(rms) +
+          CONFIG.audio.dbGain +
+          (CONFIG.audio.calibrationDb || 0);
 
-        let instantDb = linearToDb(shaped) + CONFIG.audio.dbGain;
         let smoothDb;
 
-        if (instantDb > prevSmoothDb) {
+        // smoothing
+        if (!isFinite(prevSmoothDb) || prevSmoothDb === -999) {
+          smoothDb = instantDb;
+        } else if (instantDb > prevSmoothDb) {
           smoothDb = prevSmoothDb + (instantDb - prevSmoothDb) * CONFIG.audio.attackSpeed;
         } else {
           smoothDb = prevSmoothDb + (instantDb - prevSmoothDb) * CONFIG.audio.releaseSpeed;
@@ -5534,6 +5865,14 @@
             );
             STATE.audio.dataRight = new Uint8Array(
               STATE.audio.analyserRight.frequencyBinCount
+            );
+
+            // TIME-DOMAIN BUFFERS L / R
+            STATE.audio.timeLeft = new Uint8Array(
+              STATE.audio.analyserLeft.fftSize
+            );
+            STATE.audio.timeRight = new Uint8Array(
+              STATE.audio.analyserRight.fftSize
             );
 
             // AUDIO PIPELINE
@@ -5720,22 +6059,26 @@
             STATE.audio.analyserLeft.getByteFrequencyData(STATE.audio.dataLeft);
             STATE.audio.analyserRight.getByteFrequencyData(STATE.audio.dataRight);
 
+            // READ TIME DOMAIN FOR L / R
+            STATE.audio.analyserLeft.getByteTimeDomainData(STATE.audio.timeLeft);
+            STATE.audio.analyserRight.getByteTimeDomainData(STATE.audio.timeRight);
+
             // READ MID / SIDE DATA
             if (STATE.audio.analyserMid && STATE.audio.dataMid) {
               STATE.audio.analyserMid.getByteFrequencyData(STATE.audio.dataMid);
             }
-      
+
             if (STATE.audio.analyserSide && STATE.audio.dataSide) {
               STATE.audio.analyserSide.getByteFrequencyData(STATE.audio.dataSide);
             }
 
             // PROCESS LEFT / RIGHT SEPARATELY
             const L = processChannel(
-              STATE.audio.dataLeft,
+              STATE.audio.timeLeft,
               STATE.levels.left.smoothDb
             );
             const R = processChannel(
-              STATE.audio.dataRight,
+              STATE.audio.timeRight,
               STATE.levels.right.smoothDb
             );
       
@@ -6045,93 +6388,88 @@
           _readoutFrame++;
           if (_readoutFrame >= READOUT_FRAME_SKIP) {
             _readoutFrame = 0;
-      
+    
             if (CONFIG.display.showReadouts && STATE.dom.readouts) {
-      
+    
               const layout = CONFIG.display.layoutMode;
-              const minDb = CONFIG.audio.minDb;
-      
+              const minDb  = CONFIG.audio.minDb;
+    
               const lNow = getCurrentReadout("L");
               const rNow = getCurrentReadout("R");
+    
               const aRaw = (STATE.levels?.audio && typeof STATE.levels.audio.smooth === "number")
                 ? STATE.levels.audio.smooth
                 : 0;
+    
               const qRaw = (STATE.levels?.stereoQuality && typeof STATE.levels.stereoQuality.smooth === "number")
                 ? STATE.levels.stereoQuality.smooth
                 : 0;
-      
+    
+              // STOP detection = no readouts at all
               const active =
                 (lNow !== null && lNow > minDb + 0.5) ||
                 (rNow !== null && rNow > minDb + 0.5) ||
                 (aRaw > 1) ||
                 (qRaw > 0.5);
-
-              // LR — Stereo Levels
+    
+              // Helper for dB formatting on minDb
+              const formatDb = (val) => {
+                if (val === null) return "";
+                const v = (val < minDb ? minDb : val);
+                return `${v.toFixed(1)} dB`;
+              };
+    
+              // ─────────────────────────
+              // LR — Stereo Levels layout
+              // ─────────────────────────
               if (layout === "lr") {
-                const l = lNow;
-                const r = rNow;
-      
-                STATE.dom.readouts.L.textContent =
-                  (l !== null && l > minDb + 0.5) ? `${l.toFixed(1)} dB` : "";
-      
-                STATE.dom.readouts.R.textContent =
-                  (r !== null && r > minDb + 0.5) ? `${r.toFixed(1)} dB` : "";
-              }
-
-              // SA — Stereo Quality / Audio Peak
-              else if (layout === "sa") {
-      
+    
                 if (!active) {
-                  STATE.dom.readouts.Q.textContent = "";
-                  STATE.dom.readouts.A.textContent = "";
+                  // STOP → hide all
+                  STATE.dom.readouts.L.textContent = "";
+                  STATE.dom.readouts.R.textContent = "";
                 } else {
-                  const q = getCurrentReadout("Q");
-      
-                  // Q
-                  STATE.dom.readouts.Q.textContent =
-                    (q !== null && q > 0.5) ? `${q.toFixed(0)} %` : "";
-      
-                  // A
-                  const aClamped = Math.max(0, Math.min(255, aRaw));
-                  const aPct = (aClamped / 255) * 100;
-      
-                  STATE.dom.readouts.A.textContent =
-                    (aRaw > 1) ? `${Math.round(aPct)} %` : "";
+                  // PLAY → show all
+                  STATE.dom.readouts.L.textContent = formatDb(lNow);
+                  STATE.dom.readouts.R.textContent = formatDb(rNow);
                 }
               }
 
-              // FULL — L / R / Q / A
-              else if (layout === "full") {
-      
+              // ───────────────────────────────
+              // SA / FULL — Q / A (and L/R on FULL)
+              // ───────────────────────────────
+              else if (layout === "sa" || layout === "full") {
+
                 if (!active) {
-                  STATE.dom.readouts.L.textContent = "";
-                  STATE.dom.readouts.R.textContent = "";
+                  // STOP → hide Q/A
                   STATE.dom.readouts.Q.textContent = "";
                   STATE.dom.readouts.A.textContent = "";
+    
+                  // On FULL hide L/R
+                  if (layout === "full") {
+                    STATE.dom.readouts.L.textContent = "";
+                    STATE.dom.readouts.R.textContent = "";
+                  }
                 } else {
-                  const l = lNow;
-                  const r = rNow;
+                  // PLAYING
                   const q = getCurrentReadout("Q");
-      
-                  STATE.dom.readouts.L.textContent =
-                    (l !== null && l > minDb + 0.5) ? `${l.toFixed(1)} dB` : "";
-      
-                  STATE.dom.readouts.R.textContent =
-                    (r !== null && r > minDb + 0.5) ? `${r.toFixed(1)} dB` : "";
-      
                   STATE.dom.readouts.Q.textContent =
-                    (q !== null && q > 0.5) ? `${q.toFixed(0)} %` : "";
-      
+                    (q !== null && q > 0.5) ? `${q.toFixed(0)} %` : "0%";
+
                   const aClamped = Math.max(0, Math.min(255, aRaw));
                   const aPct = (aClamped / 255) * 100;
-      
                   STATE.dom.readouts.A.textContent =
-                    (aRaw > 1) ? `${Math.round(aPct)} %` : "";
+                    (aRaw > 1) ? `${Math.round(aPct)} %` : "0%";
+
+                  // FULL layout
+                  if (layout === "full") {
+                    STATE.dom.readouts.L.textContent = formatDb(lNow);
+                    STATE.dom.readouts.R.textContent = formatDb(rNow);
+                  }
                 }
               }
             }
           }
-      
         } catch (e) {
           console.error("[AudioMetrix] updateMetersFrame failed:", e);
         }
@@ -6156,6 +6494,10 @@
           }
         } catch (e) {}
       }, 1000);
+
+      // Log + check for update once when loading
+      console.log(`[AudioMetrix] Loaded v${AMX_VERSION}`);
+      checkAudioMetrixUpdate();
 
       // Start system
       initAudioSystem();

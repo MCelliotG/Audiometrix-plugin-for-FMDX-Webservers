@@ -14,12 +14,12 @@
     "https://github.com/MCelliotG/Audiometrix-plugin-for-FMDX-Webservers";
 
   // Generic plugin metadata for /setup updater (FM-DX Webserver convention)
-  const pluginVersion         = "3.2";
+  const pluginVersion         = AMX_VERSION;
   const pluginName            = AMX_PLUGIN_NAME;
   const pluginHomepageUrl     = AMX_HOMEPAGE_URL;
   const pluginUpdateUrl       = AMX_UPDATE_URL;
   const pluginSetupOnlyNotify = true;
-  const CHECK_FOR_UPDATES     = true;
+  const CHECK_FOR_UPDATES     = AMX_CHECK_FOR_UPDATES;
 
   // GLOBAL HARDENED CONSTANTS
   const VALID_THEMES = [
@@ -152,6 +152,7 @@
     }
   }
 
+  // PANEL UPDATE CHECK
   function checkAudioMetrixUpdate() {
     if (!AMX_CHECK_FOR_UPDATES) return;
     if (typeof fetch !== "function") return;
@@ -177,11 +178,13 @@
 
           const remoteVersion = match[1].trim();
 
-          if (!STATE.meta) STATE.meta = { updateAvailable: false, remoteVersion: null };
+          if (!STATE.meta) {
+            STATE.meta = { updateAvailable: false, remoteVersion: null };
+          }
 
           if (remoteVersion && remoteVersion !== AMX_VERSION) {
             STATE.meta.updateAvailable = true;
-            STATE.meta.remoteVersion = remoteVersion;
+            STATE.meta.remoteVersion   = remoteVersion;
 
             console.log(
               `[AudioMetrix] Update available: v${remoteVersion} (current v${AMX_VERSION}). ` +
@@ -189,12 +192,13 @@
             );
           } else {
             STATE.meta.updateAvailable = false;
-            STATE.meta.remoteVersion = remoteVersion || null;
+            STATE.meta.remoteVersion   = remoteVersion || null;
 
             if (AMX_DEBUG) {
               console.log(`[AudioMetrix] Up to date (v${AMX_VERSION})`);
             }
           }
+
           applyAMXUpdateBanner();
         })
         .catch(e => {
@@ -207,6 +211,111 @@
         console.warn("[AudioMetrix] Update check init failed:", e);
       }
     }
+  }
+
+  // SETUP UPDATE CHECK
+  function runAMXSetupUpdateCheck() {
+    if (!CHECK_FOR_UPDATES) return;
+    if (pluginSetupOnlyNotify && window.location.pathname !== "/setup") return;
+    if (typeof fetch !== "function") return;
+
+    const pluginVersionCheck = pluginVersion;
+
+    async function fetchRemoteVersion() {
+      const urlCheckForUpdate = pluginUpdateUrl;
+
+      try {
+        const response = await fetch(urlCheckForUpdate, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`[AudioMetrix] setup update HTTP error: ${response.status}`);
+        }
+
+        const text  = await response.text();
+        const lines = text.split("\n");
+        let version = null;
+
+        if (lines.length > 2) {
+          const versionLine = lines.find(line =>
+            line.includes("const pluginVersion") ||
+            line.includes("const plugin_version") ||
+            line.includes("const PLUGIN_VERSION")
+          );
+          if (versionLine) {
+            const match = versionLine.match(
+              /const\s+(?:pluginVersion|plugin_version|PLUGIN_VERSION)\s*=\s*["']([^"']+)["']/
+            );
+            if (match && match[1]) {
+              version = match[1].trim();
+            }
+          }
+        }
+
+        // Fallback
+        if (!version) {
+          const firstLine = lines[0].trim();
+          version = /^\d/.test(firstLine) ? firstLine : "Unknown";
+        }
+
+        return version;
+      } catch (e) {
+        if (AMX_DEBUG) {
+          console.warn("[AudioMetrix] error fetching setup update file:", e);
+        }
+        return null;
+      }
+    }
+
+    function notifySetup(pluginVersionCheck, newVersion) {
+      if (window.location.pathname !== "/setup") return;
+
+      const pluginSettings = document.getElementById("plugin-settings");
+      if (pluginSettings) {
+        const currentText = pluginSettings.textContent.trim();
+        const linkHtml =
+          `<a href="${pluginHomepageUrl}" target="_blank">` +
+          `[${pluginName}] Update available: ${pluginVersionCheck} → ${newVersion}` +
+          `</a><br>`;
+
+        if (currentText === "No plugin settings are available.") {
+          pluginSettings.innerHTML = linkHtml;
+        } else {
+          pluginSettings.innerHTML += " " + linkHtml;
+        }
+      }
+
+      const updateIcon =
+        document.querySelector(".wrapper-outer #navigation .sidenav-content .fa-puzzle-piece") ||
+        document.querySelector(".wrapper-outer .sidenav-content") ||
+        document.querySelector(".sidenav-content");
+
+      if (updateIcon) {
+        const redDot = document.createElement("span");
+        redDot.style.display = "block";
+        redDot.style.width = "12px";
+        redDot.style.height = "12px";
+        redDot.style.borderRadius = "50%";
+        redDot.style.backgroundColor = "#FE0830";
+        redDot.style.marginLeft = "82px";
+        redDot.style.marginTop = "-12px";
+        updateIcon.appendChild(redDot);
+      }
+    }
+
+    fetchRemoteVersion().then(newVersion => {
+      if (!newVersion) return;
+
+      if (newVersion === pluginVersionCheck) {
+        if (AMX_DEBUG) {
+          console.log(`[AudioMetrix] Setup up-to-date (${pluginVersionCheck})`);
+        }
+        return;
+      }
+
+      console.log(
+        `[AudioMetrix] Setup update available: ${pluginVersionCheck} → ${newVersion}`
+      );
+      notifySetup(pluginVersionCheck, newVersion);
+    });
   }
 
   // LOCAL STORAGE SANITIZER — PREVENTS LOCKOUT
@@ -6506,25 +6615,11 @@
       // Log + internal update check (panel + console)
       console.log(`[AudioMetrix] Loaded v${AMX_VERSION}`);
       checkAudioMetrixUpdate();
-
-      // /setup update notification (FM-DX Webserver convention)
-      if (CHECK_FOR_UPDATES && typeof checkUpdate === "function") {
-        try {
-          checkUpdate(
-            pluginSetupOnlyNotify,
-            pluginName,
-            pluginHomepageUrl,
-            pluginUpdateUrl
-          );
-        } catch (e) {
-          if (AMX_DEBUG) {
-            console.warn("[AudioMetrix] setup update check failed:", e);
-          }
-        }
-      }
+      runAMXSetupUpdateCheck();
 
       // Start system
       initAudioSystem();
+
     } catch (e) {
       console.error("[AudioMetrix] DOMContentLoaded init failed:", e);
     }

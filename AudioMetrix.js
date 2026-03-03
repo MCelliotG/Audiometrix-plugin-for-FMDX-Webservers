@@ -1,5 +1,5 @@
 var pluginConfig = {
-  name: 'Audio Metrix - Advanced Audio Indicators',
+  name: 'AudioMetrix - Advanced Audio Indicators',
   version: '3.2',
   author: 'MCelliotG',
   frontEndPath: 'AudioMetrix/audiometrix.js',

@@ -13,6 +13,14 @@
   const AMX_HOMEPAGE_URL       =
     "https://github.com/MCelliotG/Audiometrix-plugin-for-FMDX-Webservers";
 
+  // Generic plugin metadata for /setup updater (FM-DX Webserver convention)
+  const pluginVersion         = "3.2";
+  const pluginName            = AMX_PLUGIN_NAME;
+  const pluginHomepageUrl     = AMX_HOMEPAGE_URL;
+  const pluginUpdateUrl       = AMX_UPDATE_URL;
+  const pluginSetupOnlyNotify = true;
+  const CHECK_FOR_UPDATES     = true;
+
   // GLOBAL HARDENED CONSTANTS
   const VALID_THEMES = [
     "automatic", "aegean", "aurora", "emerald", "escapade", "goldenbrown",
@@ -137,7 +145,7 @@
     const m = STATE.meta || {};
 
     if (m.updateAvailable && m.remoteVersion) {
-      banner.textContent = `Update available: v${m.remoteVersion} (you have v${AMX_VERSION})`;
+      banner.textContent = `Update available: v${m.remoteVersion}`;
       banner.style.display = "block";
     } else {
       banner.style.display = "none";
@@ -6495,9 +6503,25 @@
         } catch (e) {}
       }, 1000);
 
-      // Log + check for update once when loading
+      // Log + internal update check (panel + console)
       console.log(`[AudioMetrix] Loaded v${AMX_VERSION}`);
       checkAudioMetrixUpdate();
+
+      // /setup update notification (FM-DX Webserver convention)
+      if (CHECK_FOR_UPDATES && typeof checkUpdate === "function") {
+        try {
+          checkUpdate(
+            pluginSetupOnlyNotify,
+            pluginName,
+            pluginHomepageUrl,
+            pluginUpdateUrl
+          );
+        } catch (e) {
+          if (AMX_DEBUG) {
+            console.warn("[AudioMetrix] setup update check failed:", e);
+          }
+        }
+      }
 
       // Start system
       initAudioSystem();

@@ -4,11 +4,28 @@
   // THEME ENGINE • SETTINGS UI • RENDER ENGINE • AUDIO ENGINE
   // ─────────────────────────────────────────────────────────
 
+  // PLUGIN METADATA
+  const AMX_PLUGIN_NAME        = "AudioMetrix";
+  const AMX_VERSION            = "3.3";
+  const AMX_CHECK_FOR_UPDATES  = true;
+  const AMX_UPDATE_URL         =
+    "https://raw.githubusercontent.com/MCelliotG/Audiometrix-plugin-for-FMDX-Webservers/main/AudioMetrix/audiometrix.js";
+  const AMX_HOMEPAGE_URL       =
+    "https://github.com/MCelliotG/Audiometrix-plugin-for-FMDX-Webservers";
+
+  // Generic plugin metadata for /setup updater (FM-DX Webserver convention)
+  const pluginVersion         = AMX_VERSION;
+  const pluginName            = AMX_PLUGIN_NAME;
+  const pluginHomepageUrl     = AMX_HOMEPAGE_URL;
+  const pluginUpdateUrl       = AMX_UPDATE_URL;
+  const pluginSetupOnlyNotify = true;
+  const CHECK_FOR_UPDATES     = AMX_CHECK_FOR_UPDATES;
+
   // GLOBAL HARDENED CONSTANTS
   const VALID_THEMES = [
-    "automatic", "aegean", "aurora", "emerald", "escapade", "goldenbrown",
-    "iceblue", "neonlights", "pastel", "prism", "redvelvet", "retrospect",
-    "secretgarden", "solar", "spaceship", "tangerine", "wicked", "vesper", "vintage"
+    "automatic", "aegean", "aurora", "emerald", "escapade", "galactica", "goldenbrown", "heatmap",
+    "iceblue", "neonlights", "pastel", "prism", "redvelvet", "retrospect", "scarlet",
+    "secretgarden", "solar", "spaceship", "wicked", "valentines", "vesper", "vintage"
   ];
 
   const VALID_STYLES = [
@@ -54,16 +71,19 @@
     STATE.cache.pillar.height = 0;
   }
 
-  const STORAGE_ENABLE = "amx_enabled_state";
-  const STORAGE_THEME = "AMX_THEME";
-  const STORAGE_GLOW_ENABLED = "AMX_GLOW_ENABLED";
-  const STORAGE_SHOW_PEAKS = "AMX_SHOW_PEAKS";
+  const STORAGE_ENABLE        = "amx_enabled_state";
+  const STORAGE_THEME         = "AMX_THEME";
+  const STORAGE_GLOW_ENABLED  = "AMX_GLOW_ENABLED";
+  const STORAGE_SHOW_PEAKS    = "AMX_SHOW_PEAKS";
   const STORAGE_SHOW_READOUTS = "AMX_SHOW_READOUTS";
-  const STORAGE_BARSTYLE = "AMX_BAR_STYLE";
-  const STORAGE_GAIN = "AMX_GAIN";
-  const STORAGE_LAYOUT = "AMX_LAYOUT_MODE"; // lr, sa, full
-  const STORAGE_RENDER = "AMX_RENDER_MODE"; // bars, gauges, mirrored
-  const AMX_DEBUG = false;
+  const STORAGE_BARSTYLE      = "AMX_BAR_STYLE";
+  const STORAGE_GAIN          = "AMX_GAIN";
+  const STORAGE_LAYOUT        = "AMX_LAYOUT_MODE"; // lr, sa, full
+  const STORAGE_RENDER        = "AMX_RENDER_MODE"; // bars, gauges, mirrored
+  const STORAGE_ATTACK        = "AMX_ATTACK_SPEED";
+  const STORAGE_RELEASE       = "AMX_RELEASE_SPEED";
+  const STORAGE_PEAK_HOLD     = "AMX_PEAK_HOLD_MS";
+  const AMX_DEBUG             = false;
 
   // HARDENED LOCAL STORAGE HELPERS
   function safeLSGet(key) {
@@ -84,6 +104,218 @@
     try {
       localStorage.removeItem(key);
     } catch (e) {}
+  }
+
+  function loadLSFloat(key, def, min = null, max = null) {
+    const raw = safeLSGet(key);
+    const v = parseFloat(raw);
+    if (isNaN(v)) return def;
+    let x = v;
+    if (min !== null) x = Math.max(min, x);
+    if (max !== null) x = Math.min(max, x);
+    return x;
+  }
+
+  function loadLSInt(key, def, min = null, max = null) {
+    const raw = safeLSGet(key);
+    const v = parseInt(raw, 10);
+    if (isNaN(v)) return def;
+    let x = v;
+    if (min !== null) x = Math.max(min, x);
+    if (max !== null) x = Math.min(max, x);
+    return x;
+  }
+
+  function loadLSBool(key, def) {
+    const raw = safeLSGet(key);
+    if (raw === null) return def;
+    return raw === "true";
+  }
+
+  function loadLSEnum(key, def, allowed) {
+    const raw = safeLSGet(key);
+    if (!raw) return def;
+    return allowed.includes(raw) ? raw : def;
+  }
+
+  function applyAMXUpdateBanner() {
+    if (!STATE || !STATE.dom || !STATE.dom.updateBanner) return;
+
+    const banner = STATE.dom.updateBanner;
+    const m = STATE.meta || {};
+
+    if (m.updateAvailable && m.remoteVersion) {
+      banner.textContent = `Update available: v${m.remoteVersion}`;
+      banner.style.display = "block";
+    } else {
+      banner.style.display = "none";
+    }
+  }
+
+  // PANEL UPDATE CHECK
+  function checkAudioMetrixUpdate() {
+    if (!AMX_CHECK_FOR_UPDATES) return;
+    if (typeof fetch !== "function") return;
+
+    try {
+      // Bypass cache
+      const url =
+        AMX_UPDATE_URL +
+        (AMX_UPDATE_URL.includes("?") ? "&" : "?") +
+        "_=" +
+        Date.now();
+
+      fetch(url, { cache: "no-store" })
+        .then(resp => {
+          if (!resp || !resp.ok) return null;
+          return resp.text();
+        })
+        .then(text => {
+          if (!text) return;
+
+          const match = text.match(/AMX_VERSION\s*=\s*["']([^"']+)["']/);
+          if (!match || !match[1]) return;
+
+          const remoteVersion = match[1].trim();
+
+          if (!STATE.meta) {
+            STATE.meta = { updateAvailable: false, remoteVersion: null };
+          }
+
+          if (remoteVersion && remoteVersion !== AMX_VERSION) {
+            STATE.meta.updateAvailable = true;
+            STATE.meta.remoteVersion   = remoteVersion;
+
+            console.log(
+              `[AudioMetrix] Update available: v${remoteVersion} (current v${AMX_VERSION}). ` +
+              `See: ${AMX_HOMEPAGE_URL}`
+            );
+          } else {
+            STATE.meta.updateAvailable = false;
+            STATE.meta.remoteVersion   = remoteVersion || null;
+
+            if (AMX_DEBUG) {
+              console.log(`[AudioMetrix] Up to date (v${AMX_VERSION})`);
+            }
+          }
+
+          applyAMXUpdateBanner();
+        })
+        .catch(e => {
+          if (AMX_DEBUG) {
+            console.warn("[AudioMetrix] Update check failed:", e);
+          }
+        });
+    } catch (e) {
+      if (AMX_DEBUG) {
+        console.warn("[AudioMetrix] Update check init failed:", e);
+      }
+    }
+  }
+
+  // SETUP UPDATE CHECK
+  function runAMXSetupUpdateCheck() {
+    if (!CHECK_FOR_UPDATES) return;
+    if (pluginSetupOnlyNotify && window.location.pathname !== "/setup") return;
+    if (typeof fetch !== "function") return;
+
+    const pluginVersionCheck = pluginVersion;
+
+    async function fetchRemoteVersion() {
+      const urlCheckForUpdate = pluginUpdateUrl;
+
+      try {
+        const response = await fetch(urlCheckForUpdate, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`[AudioMetrix] setup update HTTP error: ${response.status}`);
+        }
+
+        const text  = await response.text();
+        const lines = text.split("\n");
+        let version = null;
+
+        if (lines.length > 2) {
+          const versionLine = lines.find(line =>
+            line.includes("const pluginVersion") ||
+            line.includes("const plugin_version") ||
+            line.includes("const PLUGIN_VERSION")
+          );
+          if (versionLine) {
+            const match = versionLine.match(
+              /const\s+(?:pluginVersion|plugin_version|PLUGIN_VERSION)\s*=\s*["']([^"']+)["']/
+            );
+            if (match && match[1]) {
+              version = match[1].trim();
+            }
+          }
+        }
+
+        // Fallback
+        if (!version) {
+          const firstLine = lines[0].trim();
+          version = /^\d/.test(firstLine) ? firstLine : "Unknown";
+        }
+
+        return version;
+      } catch (e) {
+        if (AMX_DEBUG) {
+          console.warn("[AudioMetrix] error fetching setup update file:", e);
+        }
+        return null;
+      }
+    }
+
+    function notifySetup(pluginVersionCheck, newVersion) {
+      if (window.location.pathname !== "/setup") return;
+
+      const pluginSettings = document.getElementById("plugin-settings");
+      if (pluginSettings) {
+        const currentText = pluginSettings.textContent.trim();
+        const linkHtml =
+          `<a href="${pluginHomepageUrl}" target="_blank">` +
+          `[${pluginName}] Update available: ${pluginVersionCheck} → ${newVersion}` +
+          `</a><br>`;
+
+        if (currentText === "No plugin settings are available.") {
+          pluginSettings.innerHTML = linkHtml;
+        } else {
+          pluginSettings.innerHTML += " " + linkHtml;
+        }
+      }
+
+      const updateIcon =
+        document.querySelector(".wrapper-outer #navigation .sidenav-content .fa-puzzle-piece") ||
+        document.querySelector(".wrapper-outer .sidenav-content") ||
+        document.querySelector(".sidenav-content");
+
+      if (updateIcon) {
+        const redDot = document.createElement("span");
+        redDot.style.display = "block";
+        redDot.style.width = "12px";
+        redDot.style.height = "12px";
+        redDot.style.borderRadius = "50%";
+        redDot.style.backgroundColor = "#FE0830";
+        redDot.style.marginLeft = "82px";
+        redDot.style.marginTop = "-12px";
+        updateIcon.appendChild(redDot);
+      }
+    }
+
+    fetchRemoteVersion().then(newVersion => {
+      if (!newVersion) return;
+
+      if (newVersion === pluginVersionCheck) {
+        if (AMX_DEBUG) {
+          console.log(`[AudioMetrix] Setup up-to-date (${pluginVersionCheck})`);
+        }
+        return;
+      }
+
+      console.log(
+        `[AudioMetrix] Setup update available: ${pluginVersionCheck} → ${newVersion}`
+      );
+      notifySetup(pluginVersionCheck, newVersion);
+    });
   }
 
   // LOCAL STORAGE SANITIZER — PREVENTS LOCKOUT
@@ -116,7 +348,7 @@
       // GAIN (dB)
       let gRaw = safeLSGet(STORAGE_GAIN);
       let g = parseInt(gRaw, 10);
-      if (isNaN(g) || g < -12 || g > 12) {
+      if (isNaN(g) || g < -15 || g > 15) {
         safeLSSet(STORAGE_GAIN, "0");
       }
 
@@ -142,15 +374,6 @@
   // ─────────────────────────────────────────────────────
 
   // UTILITIES
-  function darkenColor(rgb, percent) {
-    try {
-      const vals = rgb.match(/\d+/g).map(Number);
-      const [r, g, b] = vals;
-      const p = (100 - percent) / 100;
-      return `rgb(${Math.round(r * p)},${Math.round(g * p)},${Math.round(b * p)})`;
-    } catch (e) {}
-  }
-
   // RGB blend
   function mixRGB(c1, c2, ratio) {
     try {
@@ -273,7 +496,7 @@
     ctx.fillStyle = ACTIVE_THEME.colors.peak;
 
     if (!gauge) {
-      // BAR DRAW 
+      // BAR DRAW
       ctx.fillRect(Math.round(p), y, 2, height);
 
     } else {
@@ -518,13 +741,13 @@
   function getPixelFillXs(width) {
     // uniform geometry cache
     const cache = GEOMETRY_CACHE.pixelfill;
-    
+
     let xs = cache.get(width);
     if (xs) return xs;
-  
+
     xs = new Array(width);
     for (let i = 0; i < width; i++) xs[i] = i;
-  
+
     cache.set(width, xs);
     return xs;
   }
@@ -599,9 +822,9 @@
     aurora: {
       name: "aurora",
       colors: {
-        low: "hsl(333, 100%, 65%)",
-        mid: "hsl(75, 91%, 66%)",
-        high: "hsl(195, 100%, 50%)",
+        low: "hsl(205, 99%, 42%)",
+        mid: "hsl(283, 62%, 54%)",
+        high: "hsl(91, 100%, 40%)",
         peak: "hsl(60, 100%, 82%)"
       }
     },
@@ -619,9 +842,9 @@
     emerald: {
       name: "emerald",
       colors: {
-        low: "hsl(128, 100%, 25%)",
-        mid: "hsl(132, 100%, 50%)",
-        high: "hsl(156, 100%, 50%)",
+        low: "hsl(180 100% 22%)",
+        mid: "hsl(140, 52%, 55%)",
+        high: "hsl(160 100% 50%)",
         peak: "hsl(120, 100%, 80%)"
       }
     },
@@ -636,6 +859,16 @@
       }
     },
 
+    galactica: {
+      name: "galactica",
+      colors: {
+        low: "hsl(250 100% 62%)",
+        mid: "hsl(270 100% 66%)",
+        high: "hsl(290 100% 67%)",
+        peak: "hsl(240 100% 62%)"
+      }
+    },
+
     goldenbrown: {
       name: "goldenbrown",
       colors: {
@@ -646,11 +879,21 @@
       }
     },
 
+    heatmap: {
+      name: "heatmap",
+      colors: {
+        low: "hsl(30 100% 50%)",
+        mid: "hsl(330 100% 50%)",
+        high: "hsl(300 100% 50%)",
+        peak: "hsl(60 100% 50%)"
+      }
+    },
+
     iceblue: {
       name: "iceblue",
       colors: {
         low: "hsl(182, 100%, 50%)",
-        mid: "hsl(210, 100%, 64%)",
+        mid: "hsl(190 100% 88%)",
         high: "hsl(222, 100%, 69%)",
         peak: "hsl(187, 100%, 86%)"
       }
@@ -660,7 +903,7 @@
       name: "neonlights",
       colors: {
         low: "hsl(250, 53%, 46%)",
-        mid: "hsl(277, 67%, 67%)",
+        mid: "hsl(17 100% 59%)",
         high: "hsl(96, 57%, 76%)",
         peak: "hsl(38, 90%, 60%)"
       }
@@ -681,7 +924,7 @@
       colors: {
         low: "hsl(212, 100%, 50%)",
         mid: "hsl(61, 95%, 71%)",
-        high: "hsl(338, 100%, 50%)",
+        high: "hsl(284, 91%, 37%)",
         peak: "hsl(159, 100%, 44%)"
       }
     },
@@ -689,10 +932,10 @@
     redvelvet: {
       name: "redvelvet",
       colors: {
-        low: "hsl(0, 100%, 33%)",
-        mid: "hsl(0, 100%, 53%)",
-        high: "hsl(0, 100%, 65%)",
-        peak: "hsl(0, 100%, 84%)"
+        low: "hsl(356, 77%, 76%)",
+        mid: "hsl(57, 100%, 91%)",
+        high: "hsl(358, 97%, 31%)",
+        peak: "hsl(359, 64%, 35%)"
       }
     },
 
@@ -703,6 +946,16 @@
         mid: "hsl(28, 94%, 54%)",
         high: "hsl(71, 41%, 73%)",
         peak: "hsl(0, 0%, 93%)"
+      }
+    },
+
+    scarlet: {
+      name: "scarlet",
+      colors: {
+        low: "hsl(0 100% 18%)",
+        mid: "hsl(360 83% 41%)",
+        high: "hsl(0 100% 25%)",
+        peak: "hsl(0 100% 60%)"
       }
     },
 
@@ -719,7 +972,7 @@
     solar: {
       name: "solar",
       colors: {
-        low: "hsl(40, 100%, 57%)",
+        low: "hsl(43 77% 50%)",
         mid: "hsl(7, 97%, 38%)",
         high: "hsl(51, 90%, 51%)",
         peak: "hsl(53, 59%, 64%)"
@@ -736,13 +989,13 @@
       }
     },
 
-    tangerine: {
-      name: "tangerine",
+    valentines: {
+      name: "valentines",
       colors: {
-        low: "hsl(0, 100%, 41%)",
-        mid: "hsl(28, 100%, 50%)",
-        high: "hsl(41, 100%, 48%)",
-        peak: "hsl(42, 100%, 73%)"
+        low: "hsl(330 81% 29%)",
+        mid: "hsl(340 82% 76%)",
+        high: "hsl(340 81% 85%)",
+        peak: "hsl(350 70% 59%)"
       }
     },
 
@@ -829,50 +1082,29 @@
   const CONFIG = {
     audio: {
       minThreshold: 0.0015,
-      riseRate: 1.2,
-      amplification: 1.0,
+      riseRate: 1.25,
+      amplification: 1.05,
       bassReduction: -2,
       highPassCutoff: 1200,
       lowPassCutoff: 2000,
-      attackSpeed: 0.45,
-      releaseSpeed: 0.65,
-      peakHoldMs: 1000,
       peakDecayDbPerFrame: 0.7,
       peakMinVolumeThreshold: 0.5,
       peakFftSize: 256,
-      minDb: -40,
-      maxDb: +3,
-      dbGain: (() => {
-        const raw = safeLSGet(STORAGE_GAIN);
-        const n = parseInt(raw, 10);
-        if (isNaN(n)) return 0;
-        return Math.min(12, Math.max(-12, n));
-      })()
+      minDb: -35,
+      maxDb: 5,
+      calibrationDb: 9,
+      attackSpeed: loadLSFloat(STORAGE_ATTACK,  0.45, 0.05, 1.0),
+      releaseSpeed: loadLSFloat(STORAGE_RELEASE, 0.65, 0.05, 1.0),
+      peakHoldMs: loadLSInt  (STORAGE_PEAK_HOLD, 1000, 50, 2000),
+      dbGain: loadLSInt(STORAGE_GAIN, 0, -15, 15)
     },
     display: {
-      glowIntensity: (() => (safeLSGet(STORAGE_GLOW_ENABLED) === "true" ? 1 : 0))(),
-      barStyle: (() => {
-        const raw = safeLSGet(STORAGE_BARSTYLE) || "simple";
-        return VALID_STYLES.includes(raw) ? raw : "simple";
-      })(),
-      layoutMode: (() => {
-        const raw = safeLSGet("AMX_LAYOUT_MODE") || "lr";
-        return ["lr", "sa", "full"].includes(raw) ? raw : "lr";
-      })(),
-      renderMode: (() => {
-        const raw = safeLSGet("AMX_RENDER_MODE") || "bars";
-        return ["bars", "gauges", "mirrored"].includes(raw) ? raw : "bars";
-      })(),
-      showPeaks: (() => {
-        const raw = safeLSGet(STORAGE_SHOW_PEAKS);
-        if (raw === null) return false;
-        return raw === "true";
-      })(),
-      showReadouts: (() => {
-        const raw = safeLSGet(STORAGE_SHOW_READOUTS);
-        if (raw === null) return false;
-        return raw === "true";
-      })(),
+      glowIntensity: loadLSBool(STORAGE_GLOW_ENABLED, false) ? 1 : 0,
+      barStyle: loadLSEnum(STORAGE_BARSTYLE, "simple", VALID_STYLES),
+      layoutMode: loadLSEnum(STORAGE_LAYOUT, "lr", ["lr", "sa", "full"]),
+      renderMode: loadLSEnum(STORAGE_RENDER, "bars", ["bars", "gauges", "mirrored"]),
+      showPeaks: loadLSBool(STORAGE_SHOW_PEAKS, false),
+      showReadouts: loadLSBool(STORAGE_SHOW_READOUTS, false),
       dimensions: {
         barHeight: 20,
         spacing: 10,
@@ -970,7 +1202,12 @@
       left: null,
       right: null,
       audio: null
-    }
+    },
+
+    meta: {
+      updateAvailable: false,
+      remoteVersion: null
+    },
   };
 
   // ─────────────────────────────────────────
@@ -1119,10 +1356,10 @@
   function ensureAMXSettingsLayer() {
     let layer = document.getElementById("amx-settings-layer");
     if (layer) return layer;
-  
+
     layer = document.createElement("div");
     layer.id = "amx-settings-layer";
-  
+
     // Base overlay (does NOT block the page)
     layer.style.position = "fixed";
     layer.style.top = "0";
@@ -1131,20 +1368,20 @@
     layer.style.height = "100vh";
     layer.style.zIndex = "99999";
     layer.style.pointerEvents = "none";
-  
+
     // IMPORTANT → prevent external scrolling completely
     layer.style.overflow = "hidden";
-  
+
     // Optional safety for mobile browsers
     layer.style.touchAction = "none";
     layer.style.webkitTapHighlightColor = "transparent";
-  
+
     document.body.appendChild(layer);
-  
+
     // Mobile touch guard: allow interaction inside floating panel
     if (!layer._touchGuardInstalled) {
       layer._touchGuardInstalled = true;
-  
+
       document.addEventListener(
         "touchmove",
         function (e) {
@@ -1156,36 +1393,36 @@
         { passive: false }
       );
     }
-  
+
     return layer;
   }
 
   function createAMXFloatingPanel() {
     const panel = document.createElement("div");
     panel.id = "amx-floating-panel";
-  
+
     // REAL floating overlay
     panel.style.position = "fixed";
     panel.style.zIndex = "100000";
     panel.style.display = "none";
     panel.style.pointerEvents = "auto";
-  
+
     // Touch & selection safety (mobile + desktop)
     panel.style.touchAction = "manipulation";
     panel.style.userSelect = "none";
     panel.style.webkitUserSelect = "none";
-  
+
     // Sizing
     panel.style.width = "280px";
-  
+
     // padding and appearance
     panel.style.padding = "12px";
     panel.style.borderRadius = "14px";
-  
+
     panel.style.background = "rgba(18, 20, 22, 0.72)";
     panel.style.backdropFilter = "blur(18px) saturate(140%)";
     panel.style.webkitBackdropFilter = "blur(18px) saturate(140%)";
-  
+
     panel.style.border = "1px solid rgba(255,255,255,0.15)";
     panel.style.boxShadow = `
       0 8px 32px rgba(0,0,0,0.45),
@@ -1199,11 +1436,11 @@
     ) {
       panel.style.background = "rgba(18, 20, 22, 0.92)";
     }
-  
+
     // Attach to overlay layer
     const layer = ensureAMXSettingsLayer();
     layer.appendChild(panel);
-  
+
     return panel;
   }
 
@@ -1311,30 +1548,30 @@
 
   function positionAMXFloatingPanel(panel, container) {
     if (!panel || !container) return;
-  
+
     const vw = window.innerWidth;
     const vh = window.innerHeight;
     const margin = 8;
-  
+
     const panelW = parseInt(panel.style.width, 10) || 320;
     const tileRect = container.getBoundingClientRect();
-  
+
     const ps = document.getElementById("ps-container");
     const psRect = ps ? ps.getBoundingClientRect() : null;
     const anchorTop = psRect ? Math.round(psRect.top) : 12;
-  
+
     // reset
     panel.style.top = "auto";
     panel.style.left = "auto";
     panel.style.right = "auto";
     panel.style.bottom = "auto";
-  
+
     const isPortrait = vh > vw || vw < 520;
-  
+
     if (isPortrait) {
       const top = Math.round(tileRect.bottom + margin);
       const left = Math.max(margin, Math.round((vw - panelW) / 2));
-  
+
       panel.style.top = top + "px";
       panel.style.left = left + "px";
       panel.style.maxHeight = Math.round(vh * 0.7) + "px";
@@ -1342,7 +1579,7 @@
     } else {
       let left = Math.round(tileRect.left - panelW - margin);
       if (left < margin) left = margin;
-  
+
       panel.style.top = anchorTop + "px";
       panel.style.left = left + "px";
       panel.style.maxHeight = Math.round(vh - anchorTop - margin) + "px";
@@ -1354,7 +1591,7 @@
       const topBarHeight = 36;
       const paddingVertical = 24;
       const panelMax = parseInt(panel.style.maxHeight, 10);
-  
+
       const contentMax = panelMax - topBarHeight - paddingVertical;
       panel._amxContentArea.style.maxHeight = contentMax + "px";
     }
@@ -1369,9 +1606,12 @@
     function requestReposition() {
       if (panel.style.display === "none") return;
 
+      // store user position and size
+      if (panel._amxUserMoved || panel._amxUserResized) return;
+
       if (!ticking) {
         ticking = true;
-        requestAnimationFrame(() => {
+        requestAnimationFrame(function () {
           positionAMXFloatingPanel(panel, container);
           ticking = false;
         });
@@ -1383,6 +1623,197 @@
     window.addEventListener("orientationchange", requestReposition);
   }
 
+  function enableAMXPanelDragging(panel, handle) {
+    if (!panel || !handle || panel._amxDragEnabled) return;
+    panel._amxDragEnabled = true;
+
+    handle.style.cursor = "move";
+
+    let isDragging = false;
+    let startX = 0;
+    let startY = 0;
+    let startLeft = 0;
+    let startTop = 0;
+
+    function getPoint(e) {
+      if (e.touches && e.touches.length) return e.touches[0];
+      return e;
+    }
+
+    function onDown(e) {
+      if (e.type === "mousedown" && e.button !== 0) return;
+      const pt = getPoint(e);
+      e.preventDefault();
+
+      isDragging = true;
+      panel._amxUserMoved = true;
+
+      const rect = panel.getBoundingClientRect();
+      startX = pt.clientX;
+      startY = pt.clientY;
+      startLeft = rect.left;
+      startTop = rect.top;
+
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+      document.addEventListener("touchmove", onMove, { passive: false });
+      document.addEventListener("touchend", onUp);
+      document.addEventListener("touchcancel", onUp);
+    }
+
+    function onMove(e) {
+      if (!isDragging) return;
+      const pt = getPoint(e);
+      e.preventDefault();
+
+      const dx = pt.clientX - startX;
+      const dy = pt.clientY - startY;
+
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const margin = 8;
+
+      const rect = panel.getBoundingClientRect();
+      const w = rect.width;
+      const h = rect.height;
+
+      let newLeft = startLeft + dx;
+      let newTop = startTop + dy;
+
+      if (newLeft < margin) newLeft = margin;
+      if (newTop < margin) newTop = margin;
+      if (newLeft + w > vw - margin) newLeft = vw - margin - w;
+      if (newTop + h > vh - margin) newTop = vh - margin - h;
+
+      panel.style.left = newLeft + "px";
+      panel.style.top = newTop + "px";
+      panel.style.right = "auto";
+      panel.style.bottom = "auto";
+    }
+
+    function onUp() {
+      if (!isDragging) return;
+      isDragging = false;
+
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.removeEventListener("touchmove", onMove);
+      document.removeEventListener("touchend", onUp);
+      document.removeEventListener("touchcancel", onUp);
+    }
+
+    handle.addEventListener("mousedown", onDown);
+    handle.addEventListener("touchstart", onDown, { passive: false });
+  }
+
+  function enableAMXPanelResize(panel) {
+    if (!panel || panel._amxResizeEnabled) return;
+    panel._amxResizeEnabled = true;
+
+    const handle = document.createElement("div");
+    handle.id = "amx-resize-handle";
+
+    handle.style.position = "absolute";
+    handle.style.right = "6px";
+    handle.style.bottom = "6px";
+    handle.style.width = "14px";
+    handle.style.height = "14px";
+    handle.style.borderRadius = "4px";
+    handle.style.cursor = "se-resize";
+    handle.style.background = "rgba(255,255,255,0.32)";
+    handle.style.boxShadow =
+      "0 0 4px rgba(0,0,0,0.6), inset 0 0 2px rgba(0,0,0,0.4)";
+
+    handle.style.zIndex = "100001";
+
+    panel.appendChild(handle);
+
+    let isResizing = false;
+    let startX = 0;
+    let startY = 0;
+    let startW = 0;
+    let startH = 0;
+
+    function getPoint(e) {
+      if (e.touches && e.touches.length) return e.touches[0];
+      return e;
+    }
+
+    function onDown(e) {
+      if (e.type === "mousedown" && e.button !== 0) return;
+      const pt = getPoint(e);
+      e.preventDefault();
+
+      isResizing = true;
+      panel._amxUserResized = true;
+
+      const rect = panel.getBoundingClientRect();
+      startX = pt.clientX;
+      startY = pt.clientY;
+      startW = rect.width;
+      startH = rect.height;
+
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+      document.addEventListener("touchmove", onMove, { passive: false });
+      document.addEventListener("touchend", onUp);
+      document.addEventListener("touchcancel", onUp);
+    }
+
+    function onMove(e) {
+      if (!isResizing) return;
+      const pt = getPoint(e);
+      e.preventDefault();
+
+      const dx = pt.clientX - startX;
+      const dy = pt.clientY - startY;
+
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const margin = 40;
+
+      let newW = startW + dx;
+      let newH = startH + dy;
+
+      const minW = 260;
+      const maxW = Math.max(minW, vw - margin);
+      const minH = 220;
+      const maxH = Math.max(minH, vh - margin);
+
+      if (newW < minW) newW = minW;
+      if (newW > maxW) newW = maxW;
+      if (newH < minH) newH = minH;
+      if (newH > maxH) newH = maxH;
+
+      panel.style.width = newW + "px";
+      panel.style.maxHeight = newH + "px";
+      panel.style.height = newH + "px";
+
+      if (panel._amxContentArea) {
+        const topBarHeight = 36;
+        const paddingVertical = 24;
+        const contentMax = newH - topBarHeight - paddingVertical;
+        if (contentMax > 80) {
+          panel._amxContentArea.style.maxHeight = contentMax + "px";
+        }
+      }
+    }
+
+    function onUp() {
+      if (!isResizing) return;
+      isResizing = false;
+
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.removeEventListener("touchmove", onMove);
+      document.removeEventListener("touchend", onUp);
+      document.removeEventListener("touchcancel", onUp);
+    }
+
+    handle.addEventListener("mousedown", onDown);
+    handle.addEventListener("touchstart", onDown, { passive: false });
+  }
+
   function buildAMXFloatingSettings(panel) {
     try {
       // Clean panel content
@@ -1390,7 +1821,7 @@
 
       // FIXED TOP BAR (Title + Close X)
       const topBar = document.createElement("div");
-  
+
       topBar.style.width = "100%";
       topBar.style.height = "30px";
       topBar.style.display = "flex";
@@ -1399,17 +1830,22 @@
       topBar.style.boxSizing = "border-box";
       topBar.style.padding = "0 8px 0 10px";
       topBar.style.marginBottom = "6px";
-  
+
       // No dark overlay – uses panel background
       topBar.style.background = "transparent";
-  
+
       const title = document.createElement("div");
-      title.textContent = "AUDIOMETRIX SETTINGS";
-      title.style.fontSize = "18px";
-      title.style.fontWeight = "700";
+      title.id = "amx-panel-title";
+      title.innerHTML = `<div style="font-size:18px; font-weight:700;">
+          AUDIOMETRIX SETTINGS</div>
+        <div style="font-size:16px; font-weight:600; margin-top:2px;">
+          v${AMX_VERSION}</div>`;
+      title.style.display = "flex";
+      title.style.flexDirection = "column";
+      title.style.lineHeight = "1.1";
       title.style.color = "var(--color-4)";
       title.style.textShadow = "0 0 4px rgba(0,0,0,0.55)";
-  
+
       const closeBtn = document.createElement("div");
       closeBtn.innerHTML = `<i class="fa-solid fa-xmark"></i>`;
       closeBtn.style.width = "28px";
@@ -1419,30 +1855,30 @@
       closeBtn.style.justifyContent = "center";
       closeBtn.style.borderRadius = "50%";
       closeBtn.style.cursor = "pointer";
-  
+
       closeBtn.style.background = "var(--color-1)";
       closeBtn.style.border = "2px solid var(--color-4)";
       closeBtn.style.color = "var(--color-4)";
       closeBtn.style.boxShadow =
         "0 0 4px rgba(0,0,0,0.45), inset 0 0 4px rgba(255,255,255,0.08)";
-  
+
       closeBtn.onmouseenter = () => {
         closeBtn.style.background = "var(--color-2)";
         closeBtn.style.boxShadow =
           "0 0 6px var(--color-4), inset 0 0 6px rgba(255,255,255,0.12)";
       };
-  
+
       closeBtn.onmouseleave = () => {
         closeBtn.style.background = "var(--color-1)";
         closeBtn.style.boxShadow =
           "0 0 4px rgba(0,0,0,0.45), inset 0 0 4px rgba(255,255,255,0.08)";
       };
-  
+
       closeBtn.onclick = (e) => {
         e.stopPropagation();
         panel.style.display = "none";
       };
-  
+
       topBar.appendChild(title);
       topBar.appendChild(closeBtn);
       panel.appendChild(topBar);
@@ -1450,22 +1886,53 @@
       // SCROLLABLE CONTENT AREA
       const content = document.createElement("div");
       content.id = "amx-panel-content";
-      
+
       content.style.width = "100%";
       content.style.boxSizing = "border-box";
       content.style.padding = "4px 0 0 0";
-      
+
       // ONLY inner scrolling allowed
       content.style.overflowY = "auto";
-      
+
       // Temporary height, will be updated by positionAMXFloatingPanel()
       content.style.maxHeight = "200px";
-      
-      // Attach content block
+
+      // Update banner
+      const updateBanner = document.createElement("div");
+      updateBanner.id = "amx-update-banner";
+      updateBanner.style.display = "none";
+      updateBanner.style.width = "100%";
+      updateBanner.style.boxSizing = "border-box";
+      updateBanner.style.padding = "4px 8px 6px 10px";
+      updateBanner.style.margin = "0 0 6px 0";
+      updateBanner.style.fontSize = "12px";
+      updateBanner.style.fontWeight = "600";
+      updateBanner.style.color = "var(--color-5)";
+      updateBanner.style.textShadow = "0 0 3px rgba(0,0,0,0.55)";
+      updateBanner.style.background = "rgba(0,0,0,0.25)";
+      updateBanner.style.borderRadius = "8px";
+      updateBanner.style.border = "1px solid var(--color-3)";
+      updateBanner.style.boxShadow =
+        "0 0 6px rgba(0,0,0,0.45), inset 0 0 4px rgba(255,255,255,0.15)";
+
+      content.appendChild(updateBanner);
+
+      // Store reference for update system
+      STATE.dom.updateBanner = updateBanner;
+
+      // Attach content block to panel
       panel.appendChild(content);
-      
+
       // Store reference for dynamic resizing
       panel._amxContentArea = content;
+      panel._amxTopBar = topBar;
+
+      // Show update banner if available
+      applyAMXUpdateBanner();
+
+      // Enable dragging + resize
+      enableAMXPanelDragging(panel, title);
+      enableAMXPanelResize(panel);
 
     // SHARED SLIDER CSS (inject ONCE)
     if (!document.getElementById("amx-sliders-css")) {
@@ -1575,18 +2042,21 @@
             <div class="option" data-value="aurora">Aurora</div>
             <div class="option" data-value="emerald">Emerald</div>
             <div class="option" data-value="escapade">Escapade</div>
+            <div class="option" data-value="galactica">Galactica</div>
             <div class="option" data-value="goldenbrown">Golden Brown</div>
+            <div class="option" data-value="heatmap">Heatmap</div>
             <div class="option" data-value="iceblue">Ice Blue</div>
             <div class="option" data-value="neonlights">Neon Lights</div>
             <div class="option" data-value="pastel">Pastel</div>
             <div class="option" data-value="prism">Prism</div>
             <div class="option" data-value="redvelvet">Red Velvet</div>
             <div class="option" data-value="retrospect">Retrospect</div>
+            <div class="option" data-value="scarlet">Scarlet</div>
             <div class="option" data-value="secretgarden">Secret Garden</div>
             <div class="option" data-value="solar">Solar</div>
             <div class="option" data-value="spaceship">Spaceship</div>
-            <div class="option" data-value="tangerine">Tangerine</div>
             <div class="option" data-value="wicked">Wicked</div>
+            <div class="option" data-value="valentines">Valentines</div>
             <div class="option" data-value="vesper">Vesper</div>
             <div class="option" data-value="vintage">Vintage</div>
           </div>
@@ -1883,10 +2353,10 @@
           </div>
         `;
         content.appendChild(readoutsDiv);
-        
+
         const readoutsCb = document.getElementById("amx-show-readouts");
         readoutsCb.checked = CONFIG.display.showReadouts;
-        
+
         readoutsCb.addEventListener("change", () => {
           CONFIG.display.showReadouts = readoutsCb.checked;
           safeLSSet(
@@ -1922,7 +2392,7 @@
 
             <div class="audio-row">
               <span class="text-small">Gain (dB)</span>
-              <input id="gain-slider" type="range" min="-12" max="12" step="1" />
+              <input id="gain-slider" type="range" min="-15" max="15" step="1" />
               <span id="gain-value" class="text-small"></span>
             </div>
           `;
@@ -1935,8 +2405,10 @@
       peakHoldValue.textContent = CONFIG.audio.peakHoldMs;
       peakHoldSlider.oninput = () => {
         const v = parseInt(peakHoldSlider.value, 10);
-        peakHoldValue.textContent = v;
-        CONFIG.audio.peakHoldMs = v;
+        const clamped = Math.min(2000, Math.max(50, isNaN(v) ? 1000 : v));
+        peakHoldValue.textContent = clamped;
+        CONFIG.audio.peakHoldMs = clamped;
+        safeLSSet(STORAGE_PEAK_HOLD, String(clamped));
       };
 
       // Attack
@@ -1946,8 +2418,10 @@
       attackValue.textContent = Number(CONFIG.audio.attackSpeed).toFixed(2);
       attackSlider.oninput = () => {
         const v = parseFloat(attackSlider.value);
-        attackValue.textContent = v.toFixed(2);
-        CONFIG.audio.attackSpeed = v;
+        const clamped = Math.min(1.0, Math.max(0.05, isNaN(v) ? 0.45 : v));
+        attackValue.textContent = clamped.toFixed(2);
+        CONFIG.audio.attackSpeed = clamped;
+        safeLSSet(STORAGE_ATTACK, String(clamped));
       };
 
       // Release
@@ -1957,8 +2431,10 @@
       releaseValue.textContent = Number(CONFIG.audio.releaseSpeed).toFixed(2);
       releaseSlider.oninput = () => {
         const v = parseFloat(releaseSlider.value);
-        releaseValue.textContent = v.toFixed(2);
-        CONFIG.audio.releaseSpeed = v;
+        const clamped = Math.min(1.0, Math.max(0.05, isNaN(v) ? 0.65 : v));
+        releaseValue.textContent = clamped.toFixed(2);
+        CONFIG.audio.releaseSpeed = clamped;
+        safeLSSet(STORAGE_RELEASE, String(clamped));
       };
 
       // Gain
@@ -1967,8 +2443,8 @@
       gainSlider.value = CONFIG.audio.dbGain;
       gainValue.textContent = CONFIG.audio.dbGain;
       gainSlider.oninput = () => {
-        const v = parseInt(gainSlider.value, 10);
-        const nv = isNaN(v) ? 0 : Math.min(12, Math.max(-12, v));
+        const v  = parseInt(gainSlider.value, 10);
+        const nv = isNaN(v) ? 0 : Math.min(15, Math.max(-15, v));
         CONFIG.audio.dbGain = nv;
         gainValue.textContent = nv;
         safeLSSet(STORAGE_GAIN, String(nv));
@@ -2033,7 +2509,7 @@
     }
   }
 
-  let READOUT_FRAME_SKIP = 25;
+  let READOUT_FRAME_SKIP = 5;
   let _readoutFrame = 0;
   let _lastVisualStateKey = null;
 
@@ -2044,14 +2520,21 @@
 
   function requestRender() {
     RENDER_GATE.dirty = true;
+
+    // If audio loop is not running yet (idle / stop state),
+    // redraw immediately so visual style changes appear at once.
+    if (!STATE.audio.analyserLeft || !STATE.audio.analyserRight) {
+      renderMeters();
+      RENDER_GATE.dirty = false;
+    }
   }
 
   function shouldRunAudio() {
     const c = STATE.audioCadence;
     c.frame++;
-  
+
     if (c.frame < c.interval) return false;
-  
+
     c.frame = 0;
     return true;
   }
@@ -2059,24 +2542,35 @@
   function readLayoutOnce() {
     if (!STATE.dom.contentWrapper) return;
     if (!STATE.layout.dirty) return;
-  
+
     const rect = STATE.dom.contentWrapper.getBoundingClientRect();
     STATE.layout.width  = rect.width  || 0;
     STATE.layout.height = rect.height || 0;
     STATE.layout.dirty  = false;
   }
 
+  function markLayoutDirty() {
+    STATE.layout.dirty = true;
+  }
+
+  function refreshLayoutAndCanvas() {
+    markLayoutDirty();
+    readLayoutOnce();
+    invalidateVisualCaches();
+    requestRender();
+  }
+
   function resizeCanvasIfNeeded(canvas, w, h) {
     if (!canvas) return;
-  
+
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width  = w;
       canvas.height = h;
     }
-  
+
     const sw = w + "px";
     const sh = h + "px";
-  
+
     if (canvas.style.width !== sw)  canvas.style.width  = sw;
     if (canvas.style.height !== sh) canvas.style.height = sh;
   }
@@ -2136,14 +2630,14 @@
           CONFIG.audio.minDb,
           CONFIG.audio.maxDb
         );
-  
+
       case "R":
         return clamp(
           STATE.levels.right.smoothDb,
           CONFIG.audio.minDb,
           CONFIG.audio.maxDb
         );
-  
+
       case "A":
         // Audio Peak
         return clamp(
@@ -2151,7 +2645,7 @@
           CONFIG.audio.minDb,
           CONFIG.audio.maxDb
         );
-  
+
       case "Q":
         // Stereo Quality — 0–120 %
         return clamp(
@@ -2159,7 +2653,7 @@
           0,
           120
         );
-  
+
       default:
         return null;
     }
@@ -2181,16 +2675,16 @@
       });
       return;
     }
-  
+
     const barH = CONFIG.display.dimensions.barHeight;
     const gap  = CONFIG.display.dimensions.spacing;
     const T    = "translate(-100%, -70%)";
-  
+
     const baseY = INNER_BASE_TOP;
     const xOut  = "calc(100% - 6px)";
-  
+
     const useMirrored = (layout === "lr" && render === "mirrored");
-  
+
     // 1) HIDE ALL FIRST (prevents 0,0 bleed)
     Object.entries(STATE.dom.readouts).forEach(([k, el]) => {
       if (!el) return;
@@ -2199,7 +2693,7 @@
       el.style.top = "";
       el.style.transform = "";
     });
-  
+
     // helper: show + set
     function showAt(key, left, top, transform) {
       const el = STATE.dom.readouts[key];
@@ -2220,7 +2714,7 @@
 
     // 3) GAUGES — READOUTS POSITIONING
     if (render === "gauges") {
-    
+
       const TOP = "40%";
       const TOP_FULL = "25%";
       const T   = "translate(-50%, 0)";
@@ -2247,7 +2741,7 @@
         showAt("R", "75%", TOP, T);
         return;
       }
-    
+
       return;
     }
 
@@ -2256,7 +2750,7 @@
       const FULL_GAP = Math.round(gap * 0.35);
       const TOP_PAD  = Math.round(barH * 0.05);
       const step     = barH + FULL_GAP;
-  
+
       ["L", "R", "Q", "A"].forEach((k, i) => {
         showAt(
           k,
@@ -2296,7 +2790,7 @@
       const lDb = STATE.levels.left.smoothDb;
       const rDb = STATE.levels.right.smoothDb;
 
-      const AMX_GAUGE_GAIN = 1.10; // 1.25–1.45 ρυθμιζόμενο
+      const AMX_GAUGE_GAIN = 1.10; // 1.25–1.45
 
       return [
         {
@@ -2679,22 +3173,22 @@
 
   // 1) SIMPLE — Unified Gradient + Unified Glow
   function renderSimple(ctx, levelX, peakX, y, height, width, gcache) {
-  
+
     const effectiveW = getEffectiveBarWidth(width);
     const barW       = Math.max(0, effectiveW - 5);
     const hasSignal  = levelX > 0;
-  
+
     if (!gcache || !gcache.colors || !gcache.colors.length) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
     }
-  
+
     const minLevel = Math.min(levelX, barW);
     if (!hasSignal || minLevel <= 0) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
     }
-  
+
     const h      = Math.floor(height);
     const w      = Math.min(Math.floor(minLevel), gcache.colors.length);
     const colors = gcache.colors;
@@ -2713,15 +3207,15 @@
 
     // SIMPLE GLOW — rim + soft fade (NO BLUR)
     if (CONFIG.display.glowIntensity > 0) {
-  
+
       const rimExpand  = 1.5;
       const fadeExpand = 3.5;
-  
+
       const rimAlpha  = 0.14 * CONFIG.display.glowIntensity;
       const fadeAlpha = 0.02 * CONFIG.display.glowIntensity;
-  
+
       ctx.save();
-  
+
       // rim
       ctx.globalAlpha = rimAlpha;
       for (let i = 0; i < maxX; i++) {
@@ -2734,7 +3228,7 @@
           h + rimExpand * 2
         );
       }
-  
+
       // soft fade
       ctx.globalAlpha = fadeAlpha;
       for (let i = 0; i < maxX; i++) {
@@ -2747,7 +3241,7 @@
           h + fadeExpand * 2
         );
       }
-  
+
       ctx.restore();
     }
 
@@ -2757,12 +3251,12 @@
 
   // 2) SEGMENTED RECTANGLES — unified gradient + unified glow
   function renderSegment(ctx, levelX, peakX, y, height, width, gcache) {
-  
+
     const effectiveW = getEffectiveBarWidth(width);
     const barW       = Math.max(0, effectiveW - 5);
     const hasSignal  = levelX > 0;
     const segGap     = 2;
-  
+
     if (!gcache || !gcache.colors || !gcache.colors.length) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
@@ -2773,52 +3267,52 @@
       CONFIG.display.layoutMode === "lr" &&
       CONFIG.display.renderMode === "mirrored"
     ) {
-  
+
       const rows   = 2;
       const rowGap = 8;
       const rowH   = Math.floor((height - rowGap) / 2);
-  
+
       const segW     = Math.max(2, Math.floor(rowH / 3.2));
       const minLevel = Math.min(levelX, barW);
-  
+
       for (let r = 0; r < rows; r++) {
         const ry = y + r * (rowH + rowGap);
-  
+
         // static glass layer
         drawSegmentGlassLayer(ctx, ry, rowH, barW, segW, segGap);
-  
+
         if (hasSignal) {
-  
+
           // cached segment geometry
           const SEG_KEY = barW + "|" + segW + "|" + segGap;
           let xs = GEOMETRY_CACHE.segment.get(SEG_KEY);
-  
+
           if (!xs) {
             xs = [];
             for (let x = 0; x < barW; x += segW + segGap) xs.push(x);
             GEOMETRY_CACHE.segment.set(SEG_KEY, xs);
           }
-  
+
           for (let i = 0; i < xs.length; i++) {
             const x = xs[i];
             if (x > minLevel) break;
-  
+
             const colorIndex = Math.min(x, gcache.colors.length - 1);
             const segColor   = gcache.colors[colorIndex];
-  
+
             // segment fill
             ctx.fillStyle = segColor;
             ctx.fillRect(x, ry, segW, rowH);
-  
+
             // unified glow (stronger around segment)
             if (CONFIG.display.glowIntensity > 0) {
-  
+
               const rimExpand  = 1.2;
               const fadeExpand = 3.8;
-  
+
               const rimAlpha  = 0.22 * CONFIG.display.glowIntensity;
               const fadeAlpha = 0.07 * CONFIG.display.glowIntensity;
-  
+
               // rim glow
               ctx.save();
               ctx.globalAlpha = rimAlpha;
@@ -2830,7 +3324,7 @@
                 rowH + rimExpand * 2
               );
               ctx.restore();
-  
+
               // soft fade
               ctx.save();
               ctx.globalAlpha = fadeAlpha;
@@ -2846,7 +3340,7 @@
           }
         }
       }
-  
+
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
     }
@@ -2855,42 +3349,42 @@
     const segH     = height;
     const segW     = Math.max(2, Math.floor(segH / 2.9));
     const minLevel = Math.min(levelX, barW);
-  
+
     // static glass layer
     drawSegmentGlassLayer(ctx, y, segH, barW, segW, segGap);
-  
+
     if (hasSignal) {
-  
+
       // cached segment geometry
       const SEG_KEY = barW + "|" + segW + "|" + segGap;
       let xs = GEOMETRY_CACHE.segment.get(SEG_KEY);
-  
+
       if (!xs) {
         xs = [];
         for (let x = 0; x < barW; x += segW + segGap) xs.push(x);
         GEOMETRY_CACHE.segment.set(SEG_KEY, xs);
       }
-  
+
       for (let i = 0; i < xs.length; i++) {
         const x = xs[i];
         if (x > minLevel) break;
-  
+
         const colorIndex = Math.min(x, gcache.colors.length - 1);
         const segColor   = gcache.colors[colorIndex];
-  
+
         // segment fill
         ctx.fillStyle = segColor;
         ctx.fillRect(x, y, segW, segH);
-  
+
         // unified glow (same profile as mirrored)
         if (CONFIG.display.glowIntensity > 0) {
-  
+
           const rimExpand  = 1.2;
           const fadeExpand = 3.8;
-  
+
           const rimAlpha  = 0.22 * CONFIG.display.glowIntensity;
           const fadeAlpha = 0.07 * CONFIG.display.glowIntensity;
-  
+
           // rim glow
           ctx.save();
           ctx.globalAlpha = rimAlpha;
@@ -2902,7 +3396,7 @@
             segH + rimExpand * 2
           );
           ctx.restore();
-  
+
           // soft fade
           ctx.save();
           ctx.globalAlpha = fadeAlpha;
@@ -2917,17 +3411,17 @@
         }
       }
     }
-  
+
     drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
   }
 
   // 3) CIRCLE DOTS — unified gradient + geometry cache + unified glow
   function renderCircledots(ctx, levelX, peakX, y, height, width, gcache) {
-  
+
     if (levelX <= 0) return;
-  
+
     const effectiveW = getEffectiveBarWidth(width);
-  
+
     if (!gcache || !gcache.colors || !gcache.colors.length) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
@@ -2938,56 +3432,56 @@
       CONFIG.display.layoutMode === "lr" &&
       CONFIG.display.renderMode === "mirrored"
     ) {
-  
+
       const padding = 2;
       const radius  = Math.max(2, (height / 4) - (padding + 3));
       const gapX    = radius * 2 + 4;
-  
+
       const row1Y = y + height * 0.40;
       const row2Y = y + height * 0.80;
-  
+
       const minLevel = Math.min(levelX, effectiveW);
-  
+
       // cache geometry
       const KEY = `${effectiveW}|${radius}|${gapX}|mirrored`;
       if (!GEOMETRY_CACHE.circledots) GEOMETRY_CACHE.circledots = new Map();
       let xs = GEOMETRY_CACHE.circledots.get(KEY);
-  
+
       if (!xs) {
         xs = [];
         for (let x = radius; x < effectiveW; x += gapX) xs.push(x);
         GEOMETRY_CACHE.circledots.set(KEY, xs);
       }
-  
+
       for (let row = 0; row < 2; row++) {
         const cy = (row === 0 ? row1Y : row2Y);
         const offset = row === 0 ? 0 : radius;
-  
+
         for (let i = 0; i < xs.length; i++) {
-  
+
           const x = xs[i] + offset;
           if (x > minLevel) break;
-  
+
           if (x + radius > effectiveW) break;
-  
+
           const idx = Math.min(x, gcache.colors.length - 1);
           const c   = gcache.colors[idx];
-  
+
           // DOT
           ctx.fillStyle = c;
           ctx.beginPath();
           ctx.arc(x, cy, radius, 0, Math.PI * 2);
           ctx.fill();
-  
+
           // UNIFIED GLOW
           if (CONFIG.display.glowIntensity > 0) {
-  
+
             const rimExpand  = 3.0;
             const fadeExpand = 3.2;
-  
+
             const rimAlpha  = 1.00 * CONFIG.display.glowIntensity;
             const fadeAlpha = 1.80 * CONFIG.display.glowIntensity;
-  
+
             // rim
             ctx.save();
             ctx.globalAlpha = rimAlpha;
@@ -2996,7 +3490,7 @@
             ctx.arc(x, cy, radius + rimExpand, 0, Math.PI * 2);
             ctx.fill();
             ctx.restore();
-  
+
             // soft fade
             ctx.save();
             ctx.globalAlpha = fadeAlpha;
@@ -3008,7 +3502,7 @@
           }
         }
       }
-  
+
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
     }
@@ -3018,43 +3512,43 @@
     const gap     = 4;
     const stepX   = radius * 2 + gap;
     const cy      = y + height / 2;
-  
+
     const minLevel = Math.min(levelX, effectiveW);
-  
+
     const KEY = `${effectiveW}|${radius}|${stepX}|normal`;
     if (!GEOMETRY_CACHE.circledots) GEOMETRY_CACHE.circledots = new Map();
     let xs = GEOMETRY_CACHE.circledots.get(KEY);
-  
+
     if (!xs) {
       xs = [];
       for (let x = radius; x < effectiveW; x += stepX) xs.push(x);
       GEOMETRY_CACHE.circledots.set(KEY, xs);
     }
-  
+
     for (let i = 0; i < xs.length; i++) {
       const x = xs[i];
       if (x > minLevel) break;
-  
+
       if (x + radius > effectiveW) break;
-  
+
       const idx = Math.min(x, gcache.colors.length - 1);
       const c   = gcache.colors[idx];
-  
+
       // DOT
       ctx.fillStyle = c;
       ctx.beginPath();
       ctx.arc(x, cy, radius, 0, Math.PI * 2);
       ctx.fill();
-  
+
       // UNIFIED GLOW
       if (CONFIG.display.glowIntensity > 0) {
-  
+
         const rimExpand  = 1.4;
         const fadeExpand = 4.5;
-  
+
         const rimAlpha  = 0.24 * CONFIG.display.glowIntensity;
         const fadeAlpha = 0.08 * CONFIG.display.glowIntensity;
-  
+
         // rim
         ctx.save();
         ctx.globalAlpha = rimAlpha;
@@ -3063,7 +3557,7 @@
         ctx.arc(x, cy, radius + rimExpand, 0, Math.PI * 2);
         ctx.fill();
         ctx.restore();
-  
+
         // soft fade
         ctx.save();
         ctx.globalAlpha = fadeAlpha;
@@ -3074,24 +3568,24 @@
         ctx.restore();
       }
     }
-  
+
     drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
   }
 
   // 4) MATRIX dots — unified gradient + optimized geometry + precomputed counts
   function renderMatrixdots(ctx, levelX, peakX, y, height, width, gcache) {
-  
+
     if (levelX <= 0) return;
-  
+
     const effectiveW  = getEffectiveBarWidth(width);
     const glow        = CONFIG.display.glowIntensity;
     const isAudioPeak = (STATE._audioPeakGradient === true);
-  
+
     if (!gcache || !gcache.colors || !gcache.colors.length) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
     }
-  
+
     const minLevel = Math.min(levelX, effectiveW);
 
     // MIRRORED MODE (WEDGE)
@@ -3099,21 +3593,21 @@
       CONFIG.display.layoutMode === "lr" &&
       CONFIG.display.renderMode === "mirrored"
     ) {
-  
+
       const padY   = 2;
       const maxR   = Math.max(2, Math.floor((height - padY * 2) / 20));
       const radius = Math.max(2, Math.min(maxR, Math.floor(height * 0.085)));
       const stepX  = radius * 2 + 2;
       const stepY  = radius * 2 + 2;
-  
+
       const centerY = y + height * 0.5;
-  
+
       const KEY = `${effectiveW}|${radius}|${stepX}|mirrored_matrix`;
 
       // Precompute X positions
       if (!GEOMETRY_CACHE.matrixdots) GEOMETRY_CACHE.matrixdots = new Map();
       let xs = GEOMETRY_CACHE.matrixdots.get(KEY);
-  
+
       if (!xs) {
         xs = [];
         for (let x = radius; x < effectiveW; x += stepX) xs.push(x);
@@ -3123,20 +3617,20 @@
       // Precompute counts for each column (only once per KEY)
       let counts = GEOMETRY_CACHE.matrixCount.get(KEY);
       if (!counts) {
-  
+
         const maxCountRaw = Math.floor((height - padY * 2 + stepY) / stepY);
         const maxCount =
           Math.max(2, (maxCountRaw % 2 === 0) ? maxCountRaw : maxCountRaw - 1);
-  
+
         counts = new Array(xs.length);
         for (let i = 0; i < xs.length; i++) {
           const desired = 2 + 2 * i;
           counts[i] = Math.min(maxCount, desired);
         }
-  
+
         GEOMETRY_CACHE.matrixCount.set(KEY, counts);
       }
-  
+
       // Glow constants precomputed
       const doGlow = glow > 0;
       const glowAlpha = 0.38 * glow;
@@ -3145,34 +3639,34 @@
 
       // DRAW
       for (let i = 0; i < xs.length; i++) {
-  
+
         const x = xs[i];
         if (x > minLevel) break;
         if (x + radius > effectiveW) break;
-  
+
         const gx = (isAudioPeak && x >= gcache.peakThresholdX)
           ? gcache.peakThresholdX
           : x;
-  
+
         const idx = Math.min(gx, gcache.colors.length - 1);
         const c = gcache.colors[idx];
-  
+
         const count = counts[i];
-  
+
         for (let j = 0; j < count; j++) {
-  
+
           const offset = j - (count - 1) / 2;
           const cy = centerY + offset * stepY;
-  
+
           if (cy < y + radius + padY) continue;
           if (cy > y + height - radius - padY) continue;
-  
+
           // dot
           ctx.fillStyle = c;
           ctx.beginPath();
           ctx.arc(x, cy, radius, 0, Math.PI * 2);
           ctx.fill();
-  
+
           if (doGlow) {
             ctx.save();
             ctx.globalAlpha = glowAlpha;
@@ -3185,7 +3679,7 @@
           }
         }
       }
-  
+
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
     }
@@ -3193,21 +3687,21 @@
     // NORMAL MODE (2 ROWS — ORIGINAL GEOMETRY)
     const radius = Math.max(2, Math.round(height * 0.19));
     const gapX   = radius * 2 + 2;
-    
+
     const row1Y = y + height * 0.28;  // ORIGINAL POSITIONS
     const row2Y = y + height * 0.72;
-    
+
     const KEY = `${effectiveW}|${radius}|${gapX}|normal_matrix`;
-    
+
     if (!GEOMETRY_CACHE.matrixdots) GEOMETRY_CACHE.matrixdots = new Map();
     let xs2 = GEOMETRY_CACHE.matrixdots.get(KEY);
-    
+
     if (!xs2) {
       xs2 = [];
       for (let x = radius; x < effectiveW; x += gapX) xs2.push(x);
       GEOMETRY_CACHE.matrixdots.set(KEY, xs2);
     }
-    
+
     // Glow constants precomputed
     const doGlow2 = glow > 0;
     const glowAlpha2 = 0.38 * glow;
@@ -3216,15 +3710,15 @@
 
     // DRAW — EXACTLY LIKE THE ORIGINAL: 2 FIXED ROWS
     for (let i = 0; i < xs2.length; i++) {
-    
+
       const x = xs2[i];
       if (x > minLevel) break;
       if (x + radius > effectiveW) break;
-    
+
       const gx = (isAudioPeak && x >= gcache.peakThresholdX)
         ? gcache.peakThresholdX
         : x;
-    
+
       const idx = Math.min(gx, gcache.colors.length - 1);
       const c   = gcache.colors[idx];
 
@@ -3233,7 +3727,7 @@
       ctx.beginPath();
       ctx.arc(x, row1Y, radius, 0, Math.PI * 2);
       ctx.fill();
-    
+
       if (doGlow2) {
         ctx.save();
         ctx.globalAlpha = glowAlpha2;
@@ -3250,7 +3744,7 @@
       ctx.beginPath();
       ctx.arc(x, row2Y, radius, 0, Math.PI * 2);
       ctx.fill();
-    
+
       if (doGlow2) {
         ctx.save();
         ctx.globalAlpha = glowAlpha2;
@@ -3262,22 +3756,22 @@
         ctx.restore();
       }
     }
-    
+
     drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
   }
 
   // 5) TRIANGLE PILLARS — UNIFIED GRADIENT + GLASS + CACHED GLOW
   function renderPillars(ctx, levelX, peakX, y, height, width, gcache) {
-  
+
     const effectiveW = getEffectiveBarWidth(width);
     const hasSignal = levelX > 1;
     const fillX = hasSignal ? Math.min(levelX, effectiveW) : 0;
-  
+
     if (!gcache || !gcache.colors || !gcache.colors.length) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
     }
-  
+
     const topY = y;
     const h = Math.floor(height);
     const W = Math.floor(effectiveW);
@@ -3285,7 +3779,7 @@
     // TRIANGLE PATH
     const midY = topY + h * 0.5;
     const bottomY = topY + h;
-  
+
     const path = new Path2D();
     path.moveTo(0, midY);
     path.lineTo(W, topY);
@@ -3295,10 +3789,10 @@
     // BASE GLASS BODY
     ctx.save();
     ctx.clip(path);
-  
+
     ctx.fillStyle = "rgba(80,80,80,0.22)";
     ctx.fillRect(0, topY, W, h);
-  
+
     const glass = ctx.createLinearGradient(0, topY, 0, topY + h);
     glass.addColorStop(0.00, "rgba(255,255,255,0.38)");
     glass.addColorStop(0.10, "rgba(255,255,255,0.22)");
@@ -3307,10 +3801,10 @@
     glass.addColorStop(0.70, "rgba(0,0,0,0.08)");
     glass.addColorStop(0.88, "rgba(0,0,0,0.18)");
     glass.addColorStop(1.00, "rgba(0,0,0,0.26)");
-  
+
     ctx.fillStyle = glass;
     ctx.fillRect(0, topY, W, h);
-  
+
     ctx.globalAlpha = 0.55;
     ctx.strokeStyle = "rgba(255,255,255,0.45)";
     ctx.lineWidth = 1;
@@ -3318,14 +3812,14 @@
     ctx.moveTo(1, topY + 1);
     ctx.lineTo(1, topY + h - 1);
     ctx.stroke();
-  
+
     ctx.globalAlpha = 0.45;
     ctx.strokeStyle = "rgba(0,0,0,0.35)";
     ctx.beginPath();
     ctx.moveTo(W - 1.2, topY + 1);
     ctx.lineTo(W - 1.2, topY + h - 1);
     ctx.stroke();
-  
+
     ctx.restore();
     ctx.globalAlpha = 1;
 
@@ -3338,7 +3832,7 @@
       const glassColor = gcache.colors[sampleX];
       const fillRatio = Math.min(fillX / effectiveW, 1);
       const tintA = 0.05 + fillRatio * 0.10;
-  
+
       ctx.save();
       ctx.clip(path);
       ctx.globalAlpha = tintA;
@@ -3350,46 +3844,46 @@
     // SIGNAL FILL (pixel fill) — CACHED GEOMETRY
     if (fillX > 0) {
       const fx = Math.min(Math.floor(fillX), gcache.colors.length);
-  
+
       // geometry
       const xs = getPixelFillXs(W);
 
       ctx.save();
       ctx.clip(path);
-  
+
       // draw only until fx
       for (let i = 0; i < fx; i++) {
         const x = xs[i];
         ctx.fillStyle = gcache.colors[i];
         ctx.fillRect(x, topY, 1, h);
       }
-  
+
       ctx.restore();
     }
 
     // TRIANGLE GLOW — rim + soft fade + ultra-soft outer haze
     if (CONFIG.display.glowIntensity > 0 && fillX > 1) {
-    
+
       const fx = Math.min(Math.floor(fillX), gcache.colors.length);
       if (fx > 0) {
-    
+
         // glow profile
         const rimExpand   = 1.0;
         const fadeExpand  = 2.5;
         const hazeExpand  = 8.0;
-    
+
         const rimAlpha   = 0.18 * CONFIG.display.glowIntensity;
         const fadeAlpha  = 0.06 * CONFIG.display.glowIntensity;
         const hazeAlpha  = 0.003 * CONFIG.display.glowIntensity;
         const edgeAlpha  = 1.10 * CONFIG.display.glowIntensity;
-    
+
         function yTopAt(x) {
           return midY + (topY - midY) * (x / W);
         }
         function yBotAt(x) {
           return midY + (bottomY - midY) * (x / W);
         }
-    
+
         ctx.save();
 
         // RIM GLOW
@@ -3440,7 +3934,7 @@
             (yBotAt(x) - yTopAt(x)) + fadeExpand * 2 + 2
           );
         }
-    
+
         ctx.restore();
       }
     }
@@ -3448,33 +3942,33 @@
     // REFLECTION
     ctx.save();
     ctx.clip(path);
-  
+
     const refl = ctx.createLinearGradient(0, topY, 0, topY + h);
     refl.addColorStop(0.00, "rgba(255,255,255,0.14)");
     refl.addColorStop(0.18, "rgba(255,255,255,0.08)");
     refl.addColorStop(0.55, "rgba(255,255,255,0.02)");
     refl.addColorStop(0.85, "rgba(0,0,0,0.05)");
     refl.addColorStop(1.00, "rgba(0,0,0,0.10)");
-  
+
     ctx.fillStyle = refl;
     ctx.fillRect(0, topY, W, h);
     ctx.restore();
-  
+
     // PEAK
     drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
   }
 
   // 6) BEVELED 3D — unified gradient + 3D bar + lighter glass + external glow
   function renderBeveled3D(ctx, levelX, peakX, y, height, width, gcache) {
-  
+
     const effectiveW =
       (CONFIG.display.layoutMode === "lr" &&
        CONFIG.display.renderMode === "mirrored")
         ? width
         : getEffectiveBarWidth(width);
-  
+
     const fillW = Math.max(0, Math.min(levelX, effectiveW));
-  
+
     if (!gcache || !gcache.colors || !gcache.colors.length) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
@@ -3484,7 +3978,7 @@
     function buildOuterInner(ry, rh) {
       const radius = Math.min(rh * 0.42, 12);
       const inset  = Math.max(4, Math.floor(rh * 0.20));
-  
+
       // OUTER GLASS SHAPE
       const outer = new Path2D();
       outer.moveTo(radius, ry);
@@ -3496,12 +3990,12 @@
       outer.quadraticCurveTo(0, ry + rh, 0, ry + rh - radius);
       outer.lineTo(0, ry + radius);
       outer.quadraticCurveTo(0, ry, radius, ry);
-  
+
       // INNER 3D BAR SHAPE
       const innerY = ry + inset;
       const innerH = rh - inset * 2;
       const r2 = Math.max(3, radius - inset * 0.65);
-  
+
       const inner = new Path2D();
       inner.moveTo(r2, innerY);
       inner.lineTo(effectiveW - r2, innerY);
@@ -3512,31 +4006,31 @@
       inner.quadraticCurveTo(0, innerY + innerH, 0, innerY + innerH - r2);
       inner.lineTo(0, innerY + r2);
       inner.quadraticCurveTo(0, innerY, r2, innerY);
-  
+
       return { outer, inner, innerY, innerH };
     }
 
     // 1 ROW beveled bar
     function drawRow(ry, rh) {
-  
+
       const { outer, inner, innerY, innerH } = buildOuterInner(ry, rh);
       const xs = getPixelFillXs(effectiveW);
       const maxFillX = Math.min(Math.floor(fillW), xs.length, gcache.colors.length);
-  
+
       // INNER 3D BAR FILL
       if (maxFillX > 0) {
         ctx.save();
         ctx.clip(inner);
-  
+
         for (let i = 0; i < maxFillX; i++) {
           const x = xs[i];
           ctx.fillStyle = gcache.colors[i];
           ctx.fillRect(x, innerY, 1, innerH);
         }
-  
+
         ctx.restore();
       }
-  
+
       // GLASS TINT από max color
       if (fillW > 0) {
         const sampleX = Math.max(
@@ -3546,7 +4040,7 @@
         const glassColor = gcache.colors[sampleX];
         const fillRatio  = Math.min(fillW / effectiveW, 1);
         const tintA = 0.06 + fillRatio * 0.22;
-  
+
         ctx.save();
         ctx.clip(outer);
         ctx.globalAlpha = tintA;
@@ -3554,25 +4048,25 @@
         ctx.fillRect(0, ry, effectiveW, rh);
         ctx.restore();
       }
-  
+
       // bar glow
       if (CONFIG.display.glowIntensity > 0 && maxFillX > 0) {
         const gi = CONFIG.display.glowIntensity;
-  
+
         const rimAlpha  = 0.16 * gi;
         const fadeAlpha = 0.05 * gi;
-  
+
         // rim
         const yRim = innerY - 2;
         const hRim = innerH + 8;
-  
+
         // fade
         const yFade = innerY - 6;
         const hFade = innerH + 14;
-  
+
         ctx.save();
         ctx.globalCompositeOperation = "source-over";
-  
+
         // rim around
         if (rimAlpha > 0.001) {
           ctx.globalAlpha = rimAlpha;
@@ -3582,7 +4076,7 @@
             ctx.fillRect(x - 1, yRim, 2, hRim);
           }
         }
-  
+
         // fade further out
         if (fadeAlpha > 0.001) {
           ctx.globalAlpha = fadeAlpha;
@@ -3592,45 +4086,45 @@
             ctx.fillRect(x - 2, yFade, 4, hFade);
           }
         }
-  
+
         ctx.restore();
       }
-  
+
       // GLASS OVERLAY / HIGHLIGHT
       ctx.save();
       ctx.clip(outer);
-  
+
       const glass = ctx.createLinearGradient(0, ry, 0, ry + rh);
       glass.addColorStop(0.00, "rgba(255,255,255,0.58)");
       glass.addColorStop(0.18, "rgba(255,255,255,0.30)");
       glass.addColorStop(0.42, "rgba(255,255,255,0.12)");
       glass.addColorStop(0.72, "rgba(0,0,0,0.14)");
       glass.addColorStop(1.00, "rgba(0,0,0,0.32)");
-  
+
       ctx.fillStyle = glass;
       ctx.fillRect(0, ry, effectiveW, rh);
-  
+
       // Bevel stroke
       ctx.strokeStyle = "rgba(255,255,255,0.58)";
       ctx.lineWidth   = 1.1;
       ctx.stroke(outer);
-  
+
       ctx.restore();
     }
 
     // MIRRORED MODE → 2 ROWS
     if (CONFIG.display.layoutMode === "lr" &&
         CONFIG.display.renderMode === "mirrored") {
-  
+
       const gap = 8;
       const rowH = Math.floor((height - gap) / 2);
-  
+
       drawRow(y, rowH);
       drawRow(y + rowH + gap, rowH);
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
     }
-  
+
     // NORMAL MODE
     drawRow(y, height);
     drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
@@ -3638,18 +4132,18 @@
 
   // 7) GLASS TUBE — Unified Gradient + Bar 3D + Glass + Glow Under Bar-3D
   function renderGlassTube(ctx, levelX, peakX, y, height, width, gcache) {
-  
+
     const effectiveW =
       (CONFIG.display.layoutMode === "lr" &&
        CONFIG.display.renderMode === "mirrored")
         ? width
         : getEffectiveBarWidth(width);
-  
+
     const drawTubeRow = (ry, rh) => {
-  
+
       const radius = Math.max(4, rh * 0.18);
       const fillW  = Math.max(0, Math.min(levelX, effectiveW));
-  
+
       // TUBE SHAPE
       const tubePath = new Path2D();
       tubePath.moveTo(radius, ry);
@@ -3661,17 +4155,17 @@
       tubePath.quadraticCurveTo(0, ry + rh, 0, ry + rh - radius);
       tubePath.lineTo(0, ry + radius);
       tubePath.quadraticCurveTo(0, ry, radius, ry);
-  
+
       // ------------------------------------------------------------
       // 1) LIQUID FILL — EXACTLY AS NOW
       // ------------------------------------------------------------
       if (fillW > 0) {
-  
+
         const xs = getPixelFillXs(effectiveW);
-  
+
         ctx.save();
         ctx.clip(tubePath);
-  
+
         const maxX = Math.min(fillW, xs.length);
         for (let i = 0; i < maxX; i++) {
           const x = xs[i];
@@ -3681,26 +4175,26 @@
         }
         ctx.restore();
       }
-  
+
       // ------------------------------------------------------------
       // 2) GLOW — NOW UNDER THE 3D BAR SHADING
       // ------------------------------------------------------------
       if (CONFIG.display.glowIntensity > 0 && fillW > 1) {
-  
+
         const fx = Math.min(Math.floor(fillW), gcache.colors.length);
-  
+
         const rimExpand  = 1.5;
         const fadeExpand = 4.5;
         const hazeExpand = 2.5;
-  
+
         const rimAlpha  = 0.16 * CONFIG.display.glowIntensity;
         const fadeAlpha = 0.035 * CONFIG.display.glowIntensity;
         const hazeAlpha = 0.02 * CONFIG.display.glowIntensity;
-  
+
         const xs = getPixelFillXs(effectiveW);
-  
+
         ctx.save(); // NO CLIP — free halo
-  
+
         // RIM
         ctx.globalAlpha = rimAlpha;
         for (let i = 0; i < fx; i++) {
@@ -3713,7 +4207,7 @@
             rh + rimExpand * 2
           );
         }
-  
+
         // FADE
         ctx.globalAlpha = fadeAlpha;
         for (let i = 0; i < fx; i++) {
@@ -3726,7 +4220,7 @@
             rh + fadeExpand * 2
           );
         }
-  
+
         // HAZE
         ctx.globalAlpha = hazeAlpha;
         for (let i = 0; i < fx; i++) {
@@ -3739,43 +4233,43 @@
             rh + hazeExpand * 2
           );
         }
-  
+
         ctx.restore();
       }
-  
+
       // ------------------------------------------------------------
       // 3) NEW BAR 3D SHADING — always above glow, inside tube
       // ------------------------------------------------------------
       if (fillW > 0) {
         ctx.save();
         ctx.clip(tubePath);
-  
+
         const barShade = ctx.createLinearGradient(0, ry, 0, ry + rh);
         barShade.addColorStop(0.00, "rgba(255,255,255,0.32)");
         barShade.addColorStop(0.28, "rgba(255,255,255,0.14)");
         barShade.addColorStop(0.52, "rgba(0,0,0,0.10)");
         barShade.addColorStop(1.00, "rgba(0,0,0,0.20)");
-  
+
         ctx.globalAlpha = 0.55;
         ctx.fillStyle = barShade;
         ctx.fillRect(0, ry, fillW, rh);
         ctx.restore();
       }
-  
+
       // ------------------------------------------------------------
       // 4) GLASS TINT (slightly stronger)
       // ------------------------------------------------------------
       if (fillW > 0) {
-  
+
         const sampleX = Math.max(
           1,
           Math.min(Math.floor(fillW) - 1, gcache.colors.length - 1)
         );
         const glassColor = gcache.colors[sampleX];
         const fillRatio  = Math.min(fillW / effectiveW, 1);
-  
+
         const tintA = 0.08 + fillRatio * 0.16;   // slightly stronger
-  
+
         ctx.save();
         ctx.clip(tubePath);
         ctx.globalAlpha = tintA;
@@ -3783,13 +4277,13 @@
         ctx.fillRect(0, ry, effectiveW, rh);
         ctx.restore();
       }
-  
+
       // ------------------------------------------------------------
       // 5) GLASS SHELL (unchanged, light 3D)
       // ------------------------------------------------------------
       ctx.save();
       ctx.clip(tubePath);
-  
+
       const glass = ctx.createLinearGradient(0, ry, 0, ry + rh);
       glass.addColorStop(0.00, "rgba(255,255,255,0.38)");
       glass.addColorStop(0.12, "rgba(255,255,255,0.22)");
@@ -3797,17 +4291,17 @@
       glass.addColorStop(0.55, "rgba(255,255,255,0.03)");
       glass.addColorStop(0.75, "rgba(0,0,0,0.12)");
       glass.addColorStop(1.00, "rgba(0,0,0,0.26)");
-  
+
       ctx.fillStyle = glass;
       ctx.fillRect(0, ry, effectiveW, rh);
-  
+
       ctx.restore();
-  
+
       // ------------------------------------------------------------
       // 6) SIDE GLOSS STROKES — topmost layer
       // ------------------------------------------------------------
       ctx.save();
-  
+
       ctx.globalAlpha = 0.55;
       ctx.strokeStyle = "rgba(255,255,255,0.40)";
       ctx.lineWidth   = 0.8;
@@ -3815,31 +4309,31 @@
       ctx.moveTo(1.0, ry + 1);
       ctx.lineTo(1.0, ry + rh - 1);
       ctx.stroke();
-  
+
       ctx.globalAlpha = 0.45;
       ctx.strokeStyle = "rgba(0,0,0,0.35)";
       ctx.beginPath();
       ctx.moveTo(effectiveW - 1.2, ry + 1);
       ctx.lineTo(effectiveW - 1.2, ry + rh - 1);
       ctx.stroke();
-  
+
       ctx.restore();
     };
-  
+
     // MIRRORED MODE
     if (CONFIG.display.layoutMode === "lr" &&
         CONFIG.display.renderMode === "mirrored") {
-  
+
       const gap = 8;
       const rowH = Math.floor((height - gap) / 2);
-  
+
       drawTubeRow(y, rowH);
       drawTubeRow(y + rowH + gap, rowH);
-  
+
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
     }
-  
+
     // NORMAL MODE
     drawTubeRow(y, height);
     drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
@@ -3909,7 +4403,7 @@
       CONFIG.display.renderMode + "|" +
       CONFIG.display.barStyle + "|" +
       CONFIG.display.showReadouts;
-    
+
     if (visualStateKey !== _lastVisualStateKey) {
       _lastVisualStateKey = visualStateKey;
       applyVisualState();
@@ -3968,8 +4462,12 @@
         height_mirrored = barH * 2 + gap + 15;
       }
 
-      canvas.height       = height_mirrored;
-      canvas.style.height = height_mirrored + "px";
+      if (canvas.height !== height_mirrored) {
+        canvas.height = height_mirrored;
+      }
+      if (canvas.style.height !== height_mirrored + "px") {
+        canvas.style.height = height_mirrored + "px";
+      }
 
       ctx.clearRect(0, 0, width, canvas.height);
 
@@ -4214,23 +4712,23 @@
 
   function renderNumericScale(el, opts) {
     if (!el || !opts) return;
-  
+
     const {
       type,    // "percent" | "db"
       min,
       max,
       values
     } = opts;
-  
+
     const LEFT_PAD  = PERCENT_SCALE_PAD.left || 0;
     const RIGHT_PAD = PERCENT_SCALE_PAD.right || 0;
-  
+
     el.innerHTML = "";
 
     // measure current width
     let rect = el.getBoundingClientRect();
     let refWidth = rect.width;
-    
+
     // CASE 1 — layout not ready at all (0 px width)
     // try exactly ONE microtask later (no recursion, no animation-frame loops)
     if (refWidth === 0) {
@@ -4242,7 +4740,7 @@
       });
       return;
     }
-    
+
     // CASE 2 — width extremely small (e.g. 1–20px)
     // do NOT render yet (prevents crazy overlaps)
     // next applyVisualState() will call again with proper layout
@@ -4255,31 +4753,31 @@
     track.style.width = "100%";
     track.style.height = "100%";
     track.style.pointerEvents = "none";
-  
+
     const usableWidth = refWidth - LEFT_PAD - RIGHT_PAD;
-  
+
     values.forEach(v => {
       const span = document.createElement("span");
-  
+
       if (type === "percent") {
         span.textContent = (v === max) ? `${v} %` : String(v);
       } else {
         span.textContent = (v > 0 ? `+${v}` : String(v));
       }
-  
+
       const ratio = (v - min) / (max - min);
       const x = LEFT_PAD + ratio * usableWidth;
-  
+
       span.style.position = "absolute";
       span.style.left = x + "px";
       span.style.transform = "translateX(-50%)";
       span.style.whiteSpace = "nowrap";
       span.style.userSelect = "none";
       span.style.fontSize = "13px";
-  
+
       track.appendChild(span);
     });
-  
+
     el.appendChild(track);
   }
 
@@ -4497,6 +4995,12 @@
   // VISUAL STATES
   // ───────────────
   function applyVisualState() {
+    if (!STATE.dom) return;
+
+    const gaugeLabelLeft  = STATE.dom.gaugeLabelLeft;
+    const gaugeLabelRight = STATE.dom.gaugeLabelRight;
+    const gaugeLabelQ     = STATE.dom.gaugeLabelQ;
+    const gaugeLabelA     = STATE.dom.gaugeLabelA;
 
     const layout = CONFIG.display.layoutMode;
     const render = CONFIG.display.renderMode;
@@ -4507,7 +5011,7 @@
     // READOUTS — VISIBILITY (GLOBAL, SINGLE AUTHORITY)
     if (STATE.dom.readouts) {
       const show = CONFIG.display.showReadouts;
-    
+
       Object.values(STATE.dom.readouts).forEach(el => {
         if (!el) return;
         el.style.display = show ? "" : "none";
@@ -4629,32 +5133,40 @@
         const TRANSFORM = "translate(-50%, 30%)";
 
         // L
-        STATE.dom.gaugeLabelLeft.textContent = "L";
-        STATE.dom.gaugeLabelLeft.style.left = "12.5%";
-        STATE.dom.gaugeLabelLeft.style.top = TOP;
-        STATE.dom.gaugeLabelLeft.style.transform = TRANSFORM;
-        STATE.dom.gaugeLabelLeft.style.display = "";
+        if (gaugeLabelLeft) {
+          gaugeLabelLeft.textContent = "L";
+          gaugeLabelLeft.style.left = "12.5%";
+          gaugeLabelLeft.style.top = TOP;
+          gaugeLabelLeft.style.transform = TRANSFORM;
+          gaugeLabelLeft.style.display = "";
+        }
 
         // R
-        STATE.dom.gaugeLabelRight.textContent = "R";
-        STATE.dom.gaugeLabelRight.style.left = "39%";
-        STATE.dom.gaugeLabelRight.style.top = TOP;
-        STATE.dom.gaugeLabelRight.style.transform = TRANSFORM;
-        STATE.dom.gaugeLabelRight.style.display = "";
+        if (gaugeLabelRight) {
+          gaugeLabelRight.textContent = "R";
+          gaugeLabelRight.style.left = "39%";
+          gaugeLabelRight.style.top = TOP;
+          gaugeLabelRight.style.transform = TRANSFORM;
+          gaugeLabelRight.style.display = "";
+        }
 
         // Q
-        STATE.dom.gaugeLabelQ.textContent = "Q";
-        STATE.dom.gaugeLabelQ.style.left = "65.5%";
-        STATE.dom.gaugeLabelQ.style.top = TOP;
-        STATE.dom.gaugeLabelQ.style.transform = TRANSFORM;
-        STATE.dom.gaugeLabelQ.style.display = "";
+        if (gaugeLabelQ) {
+          gaugeLabelQ.textContent = "Q";
+          gaugeLabelQ.style.left = "65.5%";
+          gaugeLabelQ.style.top = TOP;
+          gaugeLabelQ.style.transform = TRANSFORM;
+          gaugeLabelQ.style.display = "";
+        }
 
         // A
-        STATE.dom.gaugeLabelA.textContent = "A";
-        STATE.dom.gaugeLabelA.style.left = "92%";
-        STATE.dom.gaugeLabelA.style.top = TOP;
-        STATE.dom.gaugeLabelA.style.transform = TRANSFORM;
-        STATE.dom.gaugeLabelA.style.display = "";
+        if (gaugeLabelA) {
+          gaugeLabelA.textContent = "A";
+          gaugeLabelA.style.left = "92%";
+          gaugeLabelA.style.top = TOP;
+          gaugeLabelA.style.transform = TRANSFORM;
+          gaugeLabelA.style.display = "";
+        }
 
         if (STATE.dom.title) {
           STATE.dom.title.textContent = "AUDIO LEVELS";
@@ -4668,30 +5180,35 @@
         const TRANSFORM = "translate(-50%, 60%)";
 
         // hide FULL-only labels
-        STATE.dom.gaugeLabelQ.style.display = "none";
-        STATE.dom.gaugeLabelA.style.display = "none";
+        if (gaugeLabelQ) gaugeLabelQ.style.display = "none";
+        if (gaugeLabelA) gaugeLabelA.style.display = "none";
 
         // restore correct 2-gauge positions
-        STATE.dom.gaugeLabelLeft.style.left  = "calc(25% - 6px)";
-        STATE.dom.gaugeLabelRight.style.left = "calc(75% + 16px)";
-        STATE.dom.gaugeLabelLeft.style.top = TOP;
-        STATE.dom.gaugeLabelRight.style.top = TOP;
-        STATE.dom.gaugeLabelLeft.style.transform = TRANSFORM;
-        STATE.dom.gaugeLabelRight.style.transform = TRANSFORM;
-        STATE.dom.gaugeLabelLeft.style.display = "";
-        STATE.dom.gaugeLabelRight.style.display = "";
+        if (gaugeLabelLeft) {
+          gaugeLabelLeft.style.left = "calc(25% - 6px)";
+          gaugeLabelLeft.style.top = TOP;
+          gaugeLabelLeft.style.transform = TRANSFORM;
+          gaugeLabelLeft.style.display = "";
+        }
+
+        if (gaugeLabelRight) {
+          gaugeLabelRight.style.left = "calc(75% + 16px)";
+          gaugeLabelRight.style.top = TOP;
+          gaugeLabelRight.style.transform = TRANSFORM;
+          gaugeLabelRight.style.display = "";
+        }
 
         if (layout === "sa") {
-          STATE.dom.gaugeLabelLeft.textContent  = "Q";
-          STATE.dom.gaugeLabelRight.textContent = "A";
+          if (gaugeLabelLeft)  gaugeLabelLeft.textContent = "Q";
+          if (gaugeLabelRight) gaugeLabelRight.textContent = "A";
 
           if (STATE.dom.title) {
             STATE.dom.title.textContent = "ST. QUALITY / AUDIO PEAK";
             STATE.dom.title.style.display = "";
           }
         } else {
-          STATE.dom.gaugeLabelLeft.textContent  = "L";
-          STATE.dom.gaugeLabelRight.textContent = "R";
+          if (gaugeLabelLeft)  gaugeLabelLeft.textContent = "L";
+          if (gaugeLabelRight) gaugeLabelRight.textContent = "R";
 
           if (STATE.dom.title) {
             STATE.dom.title.textContent = "STEREO LEVELS";
@@ -4707,10 +5224,10 @@
           const g = STATE.dom["gaugeNums" + side];
           if (!g) return;
 
-          g.start.textContent = "-40";
+          g.start.textContent = "-35";
           g.mid.textContent   = "-25";
           g.high.textContent  = "-15";
-          g.end.textContent   = "+3";
+          g.end.textContent   = "+5";
 
           g.start.style.display =
           g.mid.style.display   =
@@ -4743,10 +5260,10 @@
     // FULL MODE — BARS (LAYOUT ONLY)
     if (layout === "full" && render === "bars") {
 
-    if (STATE.dom.title) {
-      STATE.dom.title.textContent = "AUDIO LEVELS";
-      STATE.dom.title.style.display = "";
-    }
+      if (STATE.dom.title) {
+        STATE.dom.title.textContent = "AUDIO LEVELS";
+        STATE.dom.title.style.display = "";
+      }
 
       // hide scales
       if (STATE.dom.scales.left)  STATE.dom.scales.left.style.display  = "none";
@@ -4784,6 +5301,7 @@
         STATE.dom.labels.a.style.top =
           (baseY + 3 * (barH + FULL_GAP) + barH / 2 - 12) + "px";
       }
+
       positionReadouts(layout, render);
       return;
     }
@@ -4798,16 +5316,17 @@
 
       if (STATE.dom.mirrorLabel)     STATE.dom.mirrorLabel.style.display     = "block";
       if (STATE.dom.mirrorScaleWrap) STATE.dom.mirrorScaleWrap.style.display = "block";
+
       positionReadouts(layout, render);
       return;
     }
 
     // SA / NORMAL MODES
     if (layout === "sa") {
-    
+
       if (STATE.dom.labels.left)  STATE.dom.labels.left.textContent  = "Q";
       if (STATE.dom.labels.right) STATE.dom.labels.right.textContent = "A";
-    
+
       if (STATE.dom.scales.left) {
         renderNumericScale(STATE.dom.scales.left, {
           type: "percent",
@@ -4816,7 +5335,7 @@
           values: [0, 10, 30, 50, 70, 100, 120]
         });
       }
-    
+
       if (STATE.dom.scales.right) {
         renderNumericScale(STATE.dom.scales.right, {
           type: "percent",
@@ -4825,40 +5344,40 @@
           values: [0, 10, 30, 50, 70, 100, 120]
         });
       }
-    
+
       if (STATE.dom.title) {
         STATE.dom.title.textContent = "ST. QUALITY / AUDIO PEAK";
       }
-    
+
       positionReadouts(layout, render);
-    
+
     } else {
-    
+
       if (STATE.dom.labels.left)  STATE.dom.labels.left.textContent  = "L";
       if (STATE.dom.labels.right) STATE.dom.labels.right.textContent = "R";
-    
+
       if (STATE.dom.scales.left) {
         renderNumericScale(STATE.dom.scales.left, {
           type: "db",
-          min: -40,
-          max: 3,
-          values: [-40, -30, -20, -10, -5, 0,  3]
+          min: -35,
+          max: 5,
+          values: [-35, -30, -25, -20, -15, -10, -5, 0, 5]
         });
       }
-    
+
       if (STATE.dom.scales.right) {
         renderNumericScale(STATE.dom.scales.right, {
           type: "db",
-          min: -40,
-          max: 3,
-          values: [-40, -30, -20, -10, -5, 0,  3]
+          min: -35,
+          max: 5,
+          values: [-35, -30, -25, -20, -15, -10, -5, 0, 5]
         });
       }
-    
+
       if (STATE.dom.title) {
         STATE.dom.title.textContent = CONFIG.display.defaultTitle;
       }
-    
+
       positionReadouts(layout, render);
     }
   }
@@ -4943,16 +5462,15 @@
       STATE.dom.contentWrapper.appendChild(STATE.dom.canvasGauges);
 
       // INITIAL CANVAS INTRINSIC SIZE SYNC (CRITICAL)
-
       // Default active canvas
       STATE.dom.canvas = STATE.dom.canvasNormal;
-      
+
       readLayoutOnce();
-      
+
       const w = STATE.layout.width;
       const barH = CONFIG.display.dimensions.barHeight;
       const gap = CONFIG.display.dimensions.spacing;
-      
+
       const safeWidth = w && w > 40 ? w : 300;
       const normalHeight = barH * 2 + gap;
 
@@ -4965,7 +5483,7 @@
       );
       requestRender();
 
-      // GAUGES canvas — initial intrinsic size
+      // GAUGES canvas
       if (STATE.dom.canvasGauges) {
         const gaugesHeight = WRAPPER_HEIGHT - 20;
 
@@ -4979,10 +5497,22 @@
       window.addEventListener("resize", () => {
         const panel = document.getElementById("amx-floating-panel");
         const container = STATE.dom.container;
+
+        refreshLayoutAndCanvas();
+
         if (panel && panel.style.display !== "none") {
           positionAMXFloatingPanel(panel, container);
         }
       });
+
+      window.addEventListener("orientationchange", refreshLayoutAndCanvas);
+
+      if (typeof ResizeObserver === "function" && STATE.dom.contentWrapper) {
+        const ro = new ResizeObserver(() => {
+          refreshLayoutAndCanvas();
+        });
+        ro.observe(STATE.dom.contentWrapper);
+      }
 
       // NATIVE LABELS L/R (normal mode only)
       function createLabel(text, top) {
@@ -5010,10 +5540,9 @@
       STATE.dom.labels.q.style.display = "none";
       STATE.dom.labels.a.style.display = "none";
 
-      // NATIVE SCALE ROWS (normal mode only)
-      function createScale(text, top) {
+      // SCALE ROWS — containers for numeric scales
+      function createScale(top) {
         const el = document.createElement("div");
-        el.textContent = text;
         el.style.cssText = `
           position:absolute;
           left:20px;
@@ -5028,21 +5557,12 @@
         return el;
       }
 
-      const NB = "\u00A0";
-      const scaleText =
-        NB + NB + "-40" + NB.repeat(10) + "-30" + NB.repeat(10) +
-        "-20" + NB.repeat(10) + "-10" + NB.repeat(5) + "-5" +
-        NB.repeat(2) + "-3" + NB.repeat(2) + "-1" + NB.repeat(1) +
-        "0" + NB.repeat(1) + "+1" + NB.repeat(2) + "+3";
-
-      STATE.dom.scales.left = createScale(scaleText, INNER_BASE_TOP - 24);
+      STATE.dom.scales.left = createScale(INNER_BASE_TOP - 24);
       STATE.dom.scales.right = createScale(
-        scaleText,
-        INNER_BASE_TOP + CONFIG.display.dimensions.barHeight * 2 + CONFIG.display.dimensions.spacing - 0
+        INNER_BASE_TOP + CONFIG.display.dimensions.barHeight * 2 + CONFIG.display.dimensions.spacing
       );
 
       // MIRRORED MODE — CLEAN, FINAL DOM ELEMENTS
-
       // FIXED CENTRAL L|R LABEL
       STATE.dom.mirrorLabel = document.createElement("div");
       STATE.dom.mirrorLabel.textContent = "L | R";
@@ -5092,10 +5612,10 @@
       `;
       STATE.dom.mirrorScaleLeft.innerHTML = `
         <div style="position:relative;width:95%; display:inline-flex;justify-content:space-between;">
-          <span data-db="3">+3</span>
+          <span data-db="5">+5</span>
           <span data-db="-10">-10</span>
           <span data-db="-20">-20</span>
-          <span data-db="-40">-40</span>
+          <span data-db="-35">-35</span>
         </div>
       `;
       STATE.dom.mirrorScaleWrap.appendChild(STATE.dom.mirrorScaleLeft);
@@ -5116,10 +5636,10 @@
       `;
       STATE.dom.mirrorScaleRight.innerHTML = `
         <div style="position:relative;width:95%; display:inline-flex;justify-content:space-between;">
-          <span data-db="-40">-40</span>
+          <span data-db="-35">-35</span>
           <span data-db="-20">-20</span>
           <span data-db="-10">-10</span>
-          <span data-db="+3">+3</span>
+          <span data-db="+5">+5</span>
         </div>
       `;
       STATE.dom.mirrorScaleWrap.appendChild(STATE.dom.mirrorScaleRight);
@@ -5198,7 +5718,7 @@
         Q: createReadoutEl(),
         A: createReadoutEl()
       };
-      
+
       STATE.dom.contentWrapper.appendChild(STATE.dom.readouts.L);
       STATE.dom.contentWrapper.appendChild(STATE.dom.readouts.R);
       STATE.dom.contentWrapper.appendChild(STATE.dom.readouts.Q);
@@ -5267,7 +5787,7 @@
       function createReadoutEl() {
         const el = document.createElement("div");
         el.className = "stereo-readout";
-      
+
         el.style.cssText = `
           position:absolute;
           pointer-events:none;
@@ -5279,7 +5799,7 @@
           display:none;
           z-index:40;
         `;
-      
+
         return el;
       }
 
@@ -5428,33 +5948,78 @@
       // ──────────────
       // AUDIO ENGINE
       // ──────────────
+  function safeDisconnect(node) {
+    try {
+      if (node && typeof node.disconnect === "function") {
+        node.disconnect();
+      }
+    } catch (e) {}
+  }
+
+  function cleanupAudioGraph() {
+    const a = STATE.audio || {};
+
+    [
+      a.splitter,
+      a.analyserLeft,
+      a.analyserRight,
+      a.analyserMid,
+      a.analyserSide,
+      a.analyserPeak,
+      a.bassFilter,
+      a.highPassFilter,
+      a.lowPassFilter,
+      a.mergerMS
+    ].forEach(safeDisconnect);
+
+    ["left", "right", "audio"].forEach(k => {
+      try {
+        clearTimeout(STATE.peakTimeout[k]);
+        STATE.peakTimeout[k] = null;
+      } catch (e) {}
+    });
+  }
+
+  function stopRenderingLoop() {
+    if (RENDER_GATE.rafId != null) {
+      cancelAnimationFrame(RENDER_GATE.rafId);
+      RENDER_GATE.rafId = null;
+    }
+
+    RENDER_GATE.dirty = false;
+  }
+
       function resetAudioState() {
+        cleanupAudioGraph();
+
         STATE.audio = {
-          context: null,
-          splitter: null,
+                  context: null,
+                  splitter: null,
 
-          // L / R
-          analyserLeft: null,
-          analyserRight: null,
-          dataLeft: null,
-          dataRight: null,
+                  // L / R
+                  analyserLeft: null,
+                  analyserRight: null,
+                  dataLeft: null,
+                  dataRight: null,
+                  timeLeft: null,
+                  timeRight: null,
 
-          // Mid / Side (NEW – not wired yet)
-          mergerMS: null,
-          analyserMid: null,
-          analyserSide: null,
-          dataMid: null,
-          dataSide: null,
+                  // Mid / Side (NEW – not wired yet)
+                  mergerMS: null,
+                  analyserMid: null,
+                  analyserSide: null,
+                  dataMid: null,
+                  dataSide: null,
 
-          // Audio Peak
-          analyserPeak: null,
-          bassFilter: null,
-          highPassFilter: null,
-          lowPassFilter: null,
-          dataPeak: null,
+                  // Audio Peak
+                  analyserPeak: null,
+                  bassFilter: null,
+                  highPassFilter: null,
+                  lowPassFilter: null,
+                  dataPeak: null,
 
-          source: null
-        };
+                  source: null
+                };
       }
 
       function linearToDb(x) {
@@ -5462,27 +6027,32 @@
         return 20 * Math.log10(x);
       }
 
-      function processChannel(data, prevSmoothDb) {
-        let sum = 0;
-        for (let i = 0; i < data.length; i++) {
-          const v = data[i] / 255;
-          sum += v * v;
+      function processChannel(timeData, prevSmoothDb) {
+        // RMS from time-domain samples (0..255 → -1..+1)
+        let sumSq = 0;
+        for (let i = 0; i < timeData.length; i++) {
+          const v = (timeData[i] - 128) / 128;
+          sumSq += v * v;
         }
-        const linear = Math.sqrt(sum / data.length);
 
-        if (linear < CONFIG.audio.minThreshold) {
+        const rms = Math.sqrt(sumSq / timeData.length);
+
+        if (rms < CONFIG.audio.minThreshold) {
           return { instantDb: -120, smoothDb: -120 };
         }
 
-        const shaped = Math.min(
-          Math.pow(linear * CONFIG.audio.amplification, CONFIG.audio.riseRate),
-          1
-        );
+        // RMS → dBFS + user gain + calibration
+        let instantDb =
+          linearToDb(rms) +
+          CONFIG.audio.dbGain +
+          (CONFIG.audio.calibrationDb || 0);
 
-        let instantDb = linearToDb(shaped) + CONFIG.audio.dbGain;
         let smoothDb;
 
-        if (instantDb > prevSmoothDb) {
+        // smoothing
+        if (!isFinite(prevSmoothDb) || prevSmoothDb === -999) {
+          smoothDb = instantDb;
+        } else if (instantDb > prevSmoothDb) {
           smoothDb = prevSmoothDb + (instantDb - prevSmoothDb) * CONFIG.audio.attackSpeed;
         } else {
           smoothDb = prevSmoothDb + (instantDb - prevSmoothDb) * CONFIG.audio.releaseSpeed;
@@ -5534,6 +6104,14 @@
             );
             STATE.audio.dataRight = new Uint8Array(
               STATE.audio.analyserRight.frequencyBinCount
+            );
+
+            // TIME-DOMAIN BUFFERS L / R
+            STATE.audio.timeLeft = new Uint8Array(
+              STATE.audio.analyserLeft.fftSize
+            );
+            STATE.audio.timeRight = new Uint8Array(
+              STATE.audio.analyserRight.fftSize
             );
 
             // AUDIO PIPELINE
@@ -5639,47 +6217,48 @@
 
       // RENDER LOOP HOOK
       function startRendering() {
-        if (!STATE.dom.contentWrapper) return;
-      
+        if (!STATE.dom.contentWrapper || RENDER_GATE.rafId != null) return;
+
         // --- layout read (gated) ---
         readLayoutOnce();
-      
-        const w = STATE.layout.width;
+
         const barH = CONFIG.display.dimensions.barHeight;
         const gap  = CONFIG.display.dimensions.spacing;
-      
-        const safeWidth  = w && w > 40 ? w : 300;
         const safeHeight = barH * 2 + gap;
-      
-        // Do not decide active canvas/visibility here.
-        // renderMeters() is the single authority for that.
+
+        // Keep existing width; only ensure the normal canvas has a valid height.
         if (STATE.dom.canvasNormal) {
+          const currentWidth =
+            STATE.dom.canvasNormal.width && STATE.dom.canvasNormal.width > 40
+              ? STATE.dom.canvasNormal.width
+              : 300;
+
           resizeCanvasIfNeeded(
             STATE.dom.canvasNormal,
-            safeWidth,
+            currentWidth,
             safeHeight
           );
         }
 
         // ctx is set by renderMeters()
         renderMeters();
-        requestAnimationFrame(updateMetersFrame);
+        RENDER_GATE.rafId = requestAnimationFrame(updateMetersFrame);
       }
 
       // Resize canvas
       function forceResizeCanvas() {
         if (!STATE.dom.contentWrapper) return;
-      
+
         // --- layout read ---
         readLayoutOnce();
-      
+
         const w = STATE.layout.width;
         const safeW = w && w > 40 ? Math.floor(w) : 300;
-      
+
         const barH = CONFIG.display.dimensions.barHeight;
         const gap  = CONFIG.display.dimensions.spacing;
         const baseH = barH * 2 + gap;
-      
+
         // NORMAL canvas — force intrinsic reset
         if (STATE.dom.canvasNormal) {
           resizeCanvasIfNeeded(
@@ -5688,7 +6267,7 @@
             baseH
           );
         }
-      
+
         // MIRRORED canvas — MUST also be reset, or it dies on rotate
         if (STATE.dom.canvasMirror) {
           resizeCanvasIfNeeded(
@@ -5707,38 +6286,42 @@
         try {
           // Wait for stereo
           if (!STATE.audio.analyserLeft || !STATE.audio.analyserRight) {
-            requestAnimationFrame(updateMetersFrame);
+            RENDER_GATE.rafId = requestAnimationFrame(updateMetersFrame);
             return;
           }
-      
+
           // Adaptive audio cadence (single decision point)
           const runAudio = shouldRunAudio();
-      
+
           if (runAudio) {
 
             // READ TRUE STEREO DATA (L / R)
             STATE.audio.analyserLeft.getByteFrequencyData(STATE.audio.dataLeft);
             STATE.audio.analyserRight.getByteFrequencyData(STATE.audio.dataRight);
 
+            // READ TIME DOMAIN FOR L / R
+            STATE.audio.analyserLeft.getByteTimeDomainData(STATE.audio.timeLeft);
+            STATE.audio.analyserRight.getByteTimeDomainData(STATE.audio.timeRight);
+
             // READ MID / SIDE DATA
             if (STATE.audio.analyserMid && STATE.audio.dataMid) {
               STATE.audio.analyserMid.getByteFrequencyData(STATE.audio.dataMid);
             }
-      
+
             if (STATE.audio.analyserSide && STATE.audio.dataSide) {
               STATE.audio.analyserSide.getByteFrequencyData(STATE.audio.dataSide);
             }
 
             // PROCESS LEFT / RIGHT SEPARATELY
             const L = processChannel(
-              STATE.audio.dataLeft,
+              STATE.audio.timeLeft,
               STATE.levels.left.smoothDb
             );
             const R = processChannel(
-              STATE.audio.dataRight,
+              STATE.audio.timeRight,
               STATE.levels.right.smoothDb
             );
-      
+
             STATE.levels.left.smoothDb = L.smoothDb;
             STATE.levels.right.smoothDb = R.smoothDb;
 
@@ -5757,7 +6340,7 @@
             // AUDIO PEAK (A) — RMS BAR + PPM PEAK
             // Uses ONLY existing CONFIG.audio parameters
             if (STATE.audio.analyserPeak) {
-      
+
               if (!STATE.audioPeak) {
                 STATE.audioPeak = {
                   lastTs: 0,
@@ -5765,16 +6348,16 @@
                   ppm: 0
                 };
               }
-      
+
               const now =
                 (typeof performance !== "undefined" && performance.now)
                   ? performance.now()
                   : Date.now();
-      
+
               const INTERVAL_MS = 75;
               const SILENCE_EPS = 0.015;
               const SCALE = 5.5; // visual calibration (same role as before)
-      
+
               if (now - STATE.audioPeak.lastTs >= INTERVAL_MS) {
                 STATE.audioPeak.lastTs = now;
 
@@ -5785,13 +6368,13 @@
                 // RMS + TRUE PEAK
                 let sumSq = 0;
                 let instPeak = 0;
-      
+
                 for (let i = 0; i < buf.length; i++) {
                   const v = (buf[i] - 128) / 128;
                   sumSq += v * v;
                   instPeak = Math.max(instPeak, Math.abs(v));
                 }
-      
+
                 const rms = Math.sqrt(sumSq / buf.length);
 
                 // RMS BAR (average energy)
@@ -5799,7 +6382,7 @@
                 if (rms > SILENCE_EPS) {
                   targetBar = Math.min(255, rms * 255 * SCALE);
                 }
-      
+
                 // smooth bar (attack + release already agreed)
                 if (targetBar > STATE.audioPeak.bar) {
                   STATE.audioPeak.bar +=
@@ -5807,7 +6390,7 @@
                 } else {
                   STATE.audioPeak.bar *= CONFIG.audio.releaseSpeed;
                 }
-      
+
                 STATE.levels.audio.smooth = STATE.audioPeak.bar;
 
                 // PPM PEAK (ballistic, no hold timeout)
@@ -5822,32 +6405,32 @@
                   STATE.audioPeak.ppm +=
                     (targetPeak - STATE.audioPeak.ppm) * CONFIG.audio.releaseSpeed;
                 }
-                
+
                 STATE.levels.audio.peak = STATE.audioPeak.ppm;
-                
+
               }
             }
 
             // STEREO QUALITY (Q) — calibrated + gated + richer debug
             if (STATE.audio.dataMid && STATE.audio.dataSide) {
-      
+
               const midArr  = STATE.audio.dataMid;
               const sideArr = STATE.audio.dataSide;
               const len = midArr.length || 1;
-      
+
               let sumMid = 0;
               let sumSide = 0;
-      
+
               for (let i = 0; i < len; i++) {
                 const m = midArr[i] / 255;
                 const s = sideArr[i] / 255;
                 sumMid  += m * m;
                 sumSide += s * s;
               }
-      
+
               const rmsMid  = Math.sqrt(sumMid  / len);
               const rmsSide = Math.sqrt(sumSide / len);
-      
+
               const pMid  = rmsMid  * rmsMid;
               const pSide = rmsSide * rmsSide;
               const pTot  = pMid + pSide;
@@ -5858,62 +6441,62 @@
               const POWER_GATE = 0.0030;
               // 2) Mid must exist (avoid "side dominates when mid ~ 0")
               const MID_GATE   = 0.0012;
-      
+
               // 3) Optional: side should not be almost equal to total in noise
               // (keeps absurd ratios from random correlation artifacts)
               const MAX_RATIO_HARD = 0.85;
-      
+
               let stereoRatio = 0;
               let qInstant = 0;
-      
+
               if (pTot > POWER_GATE && pMid > MID_GATE) {
-      
+
                 stereoRatio = pSide / (pTot + 1e-9);
                 stereoRatio = Math.max(0, Math.min(MAX_RATIO_HARD, stereoRatio));
 
                 // MAPPING: 0.40→75%, 0.50→100%, 0.60→120%
                 // with smooth piecewise segments
                 const mapStereoRatioToQ = (r) => {
-      
+
                   // Noise / mono collapse
                   if (r <= 0.05) {
                     return (r / 0.05) * 5;              // 0 .. 5 %
                   }
-      
+
                   // Very weak stereo
                   if (r <= 0.10) {
                     return 5 + ((r - 0.05) / 0.05) * 10; // 5 .. 15 %
                   }
-      
+
                   // Weak stereo
                   if (r <= 0.20) {
                     return 15 + ((r - 0.10) / 0.10) * 20; // 15 .. 35 %
                   }
-      
+
                   // Moderate / acceptable stereo
                   if (r <= 0.30) {
                     return 35 + ((r - 0.20) / 0.10) * 25; // 35 .. 60 %
                   }
-      
+
                   // Good stereo
                   if (r <= 0.40) {
                     return 60 + ((r - 0.30) / 0.10) * 25; // 60 .. 85 %
                   }
-      
+
                   // Very good stereo
                   if (r <= 0.50) {
                     return 85 + ((r - 0.40) / 0.10) * 15; // 85 .. 100 %
                   }
-      
+
                   // Wide / exaggerated stereo
                   if (r <= 0.60) {
                     return 100 + ((r - 0.50) / 0.10) * 20; // 100 .. 120 %
                   }
-      
+
                   // Clamp
                   return 120;
                 };
-      
+
                 qInstant = mapStereoRatioToQ(stereoRatio);
               } else {
                 // If gated out, we treat as no reliable stereo quality
@@ -5924,12 +6507,12 @@
               const prev = STATE.levels.stereoQuality.smooth;
               const atk  = CONFIG.audio.attackSpeed;
               const rel  = CONFIG.audio.releaseSpeed;
-      
+
               const qSmooth =
                 qInstant > prev
                   ? prev + (qInstant - prev) * atk
                   : prev + (qInstant - prev) * rel;
-      
+
               STATE.levels.stereoQuality.instant = qInstant;
               STATE.levels.stereoQuality.smooth  = qSmooth;
 
@@ -5951,41 +6534,41 @@
             // ADAPTIVE INTERVAL UPDATE (cheap)
             {
               const c = STATE.audioCadence;
-      
+
               // Activity proxy (no extra audio reads):
               // - stronger LR instant levels
               // - audio bar (A)
               // - stereo quality (Q)
               const minDb = CONFIG.audio.minDb;
-      
+
               const lDb = (typeof L.instantDb === "number") ? L.instantDb : minDb;
               const rDb = (typeof R.instantDb === "number") ? R.instantDb : minDb;
-      
+
               const lAct = Math.max(0, lDb - (minDb + 0.5)); // 0..~range
               const rAct = Math.max(0, rDb - (minDb + 0.5));
-      
+
               const aRaw = (STATE.levels?.audio && typeof STATE.levels.audio.smooth === "number")
                 ? STATE.levels.audio.smooth
                 : 0;
               const qRaw = (STATE.levels?.stereoQuality && typeof STATE.levels.stereoQuality.smooth === "number")
                 ? STATE.levels.stereoQuality.smooth
                 : 0;
-      
+
               // Normalize into a single scalar
               const energy =
                 (Math.min(1, Math.max(lAct, rAct) / 40) * 0.60) +   // LR activity
                 (Math.min(1, Math.max(0, Math.min(255, aRaw)) / 255) * 0.25) + // A
                 (Math.min(1, Math.max(0, Math.min(120, qRaw)) / 120) * 0.15);  // Q
-      
+
               const delta = Math.abs(energy - (c.lastEnergy || 0));
               c.lastEnergy = energy;
-      
+
               // Decision:
               // - big change => run often
               // - high energy => run often
               // - silence/stable => run less often
               let next = 2;
-      
+
               if (delta > 0.10 || energy > 0.55) {
                 next = 1; // 60Hz
               } else if (delta > 0.05 || energy > 0.30) {
@@ -5995,7 +6578,7 @@
               } else {
                 next = 4; // 15Hz
               }
-      
+
               // Clamp to configured bounds
               next = Math.max(c.min || 1, Math.min(c.max || 4, next));
               c.interval = next;
@@ -6006,7 +6589,7 @@
           // FRAME THROTTLING
           const __now = performance.now();
           if (__now - _lastRenderTime < FRAME_INTERVAL) {
-            requestAnimationFrame(updateMetersFrame);
+            RENDER_GATE.rafId = requestAnimationFrame(updateMetersFrame);
             return;
           }
           _lastRenderTime = __now;
@@ -6015,20 +6598,20 @@
           const Rs = STATE.levels.right.smoothDb;
           const Qs = STATE.levels.stereoQuality.smooth;
           const As = STATE.levels.audio.smooth;
-          
+
           const EPS_DB = 0.05;
           const EPS_PCT = 0.5;
-          
+
           const dirtyValues =
             _lastDrawn.L === null ||
             Math.abs(Ls - _lastDrawn.L) > EPS_DB ||
             Math.abs(Rs - _lastDrawn.R) > EPS_DB ||
             Math.abs(Qs - _lastDrawn.Q) > EPS_PCT ||
             Math.abs(As - _lastDrawn.A) > EPS_PCT;
-          
-          if (!dirtyValues) {
-            RENDER_GATE.dirty = false;
-          } else {
+
+          const manualDirty = (RENDER_GATE.dirty === true);
+
+          if (dirtyValues) {
             _lastDrawn.L = Ls;
             _lastDrawn.R = Rs;
             _lastDrawn.Q = Qs;
@@ -6036,7 +6619,7 @@
           }
 
           // DRAW EVERYTHING (GATED)
-          if (RENDER_GATE.dirty) {
+          if (manualDirty || dirtyValues) {
             renderMeters();
             RENDER_GATE.dirty = false;
           }
@@ -6045,97 +6628,91 @@
           _readoutFrame++;
           if (_readoutFrame >= READOUT_FRAME_SKIP) {
             _readoutFrame = 0;
-      
+
             if (CONFIG.display.showReadouts && STATE.dom.readouts) {
-      
+
               const layout = CONFIG.display.layoutMode;
-              const minDb = CONFIG.audio.minDb;
-      
+              const minDb  = CONFIG.audio.minDb;
+
               const lNow = getCurrentReadout("L");
               const rNow = getCurrentReadout("R");
+
               const aRaw = (STATE.levels?.audio && typeof STATE.levels.audio.smooth === "number")
                 ? STATE.levels.audio.smooth
                 : 0;
+
               const qRaw = (STATE.levels?.stereoQuality && typeof STATE.levels.stereoQuality.smooth === "number")
                 ? STATE.levels.stereoQuality.smooth
                 : 0;
-      
-              const active =
-                (lNow !== null && lNow > minDb + 0.5) ||
-                (rNow !== null && rNow > minDb + 0.5) ||
-                (aRaw > 1) ||
-                (qRaw > 0.5);
 
-              // LR — Stereo Levels
+              // Real transport state from FM-DX 3LAS frontend
+              const streamIsRunning =
+                (typeof Stream !== "undefined" && Stream !== null);
+
+              const active = streamIsRunning;
+
+              // Helper for dB formatting on minDb
+              const formatDb = (val) => {
+                if (val === null) return "";
+                const v = (val < minDb ? minDb : val);
+                return `${v.toFixed(1)} dB`;
+              };
+
+              // ─────────────────────────
+              // LR — Stereo Levels layout
+              // ─────────────────────────
               if (layout === "lr") {
-                const l = lNow;
-                const r = rNow;
-      
-                STATE.dom.readouts.L.textContent =
-                  (l !== null && l > minDb + 0.5) ? `${l.toFixed(1)} dB` : "";
-      
-                STATE.dom.readouts.R.textContent =
-                  (r !== null && r > minDb + 0.5) ? `${r.toFixed(1)} dB` : "";
-              }
 
-              // SA — Stereo Quality / Audio Peak
-              else if (layout === "sa") {
-      
                 if (!active) {
-                  STATE.dom.readouts.Q.textContent = "";
-                  STATE.dom.readouts.A.textContent = "";
+                  // STOP → hide all
+                  STATE.dom.readouts.L.textContent = "";
+                  STATE.dom.readouts.R.textContent = "";
                 } else {
-                  const q = getCurrentReadout("Q");
-      
-                  // Q
-                  STATE.dom.readouts.Q.textContent =
-                    (q !== null && q > 0.5) ? `${q.toFixed(0)} %` : "";
-      
-                  // A
-                  const aClamped = Math.max(0, Math.min(255, aRaw));
-                  const aPct = (aClamped / 255) * 100;
-      
-                  STATE.dom.readouts.A.textContent =
-                    (aRaw > 1) ? `${Math.round(aPct)} %` : "";
+                  // PLAY → show all
+                  STATE.dom.readouts.L.textContent = formatDb(lNow);
+                  STATE.dom.readouts.R.textContent = formatDb(rNow);
                 }
               }
 
-              // FULL — L / R / Q / A
-              else if (layout === "full") {
-      
+              // ───────────────────────────────
+              // SA / FULL — Q / A (and L/R on FULL)
+              // ───────────────────────────────
+              else if (layout === "sa" || layout === "full") {
+
                 if (!active) {
-                  STATE.dom.readouts.L.textContent = "";
-                  STATE.dom.readouts.R.textContent = "";
+                  // STOP → hide Q/A
                   STATE.dom.readouts.Q.textContent = "";
                   STATE.dom.readouts.A.textContent = "";
+
+                  // On FULL hide L/R
+                  if (layout === "full") {
+                    STATE.dom.readouts.L.textContent = "";
+                    STATE.dom.readouts.R.textContent = "";
+                  }
                 } else {
-                  const l = lNow;
-                  const r = rNow;
+                  // PLAYING
                   const q = getCurrentReadout("Q");
-      
-                  STATE.dom.readouts.L.textContent =
-                    (l !== null && l > minDb + 0.5) ? `${l.toFixed(1)} dB` : "";
-      
-                  STATE.dom.readouts.R.textContent =
-                    (r !== null && r > minDb + 0.5) ? `${r.toFixed(1)} dB` : "";
-      
                   STATE.dom.readouts.Q.textContent =
-                    (q !== null && q > 0.5) ? `${q.toFixed(0)} %` : "";
-      
+                    (q !== null && q > 0.5) ? `${q.toFixed(0)} %` : "0%";
+
                   const aClamped = Math.max(0, Math.min(255, aRaw));
                   const aPct = (aClamped / 255) * 100;
-      
                   STATE.dom.readouts.A.textContent =
-                    (aRaw > 1) ? `${Math.round(aPct)} %` : "";
+                    (aRaw > 1) ? `${Math.round(aPct)} %` : "0%";
+
+                  // FULL layout
+                  if (layout === "full") {
+                    STATE.dom.readouts.L.textContent = formatDb(lNow);
+                    STATE.dom.readouts.R.textContent = formatDb(rNow);
+                  }
                 }
               }
             }
           }
-      
         } catch (e) {
           console.error("[AudioMetrix] updateMetersFrame failed:", e);
         }
-        requestAnimationFrame(updateMetersFrame);
+        RENDER_GATE.rafId = requestAnimationFrame(updateMetersFrame);
       }
 
       // AUTO REBIND WHEN FM-DX RECREATES AUDIO NODES
@@ -6150,6 +6727,7 @@
             const node = Stream.Fallback.Player.Amplification;
             if (node !== last) {
               last = node;
+              stopRenderingLoop();
               resetAudioState();
               initAudioSystem();
             }
@@ -6157,8 +6735,14 @@
         } catch (e) {}
       }, 1000);
 
+      // Log + internal update check (panel + console)
+      console.log(`[AudioMetrix] Loaded v${AMX_VERSION}`);
+      checkAudioMetrixUpdate();
+      runAMXSetupUpdateCheck();
+
       // Start system
       initAudioSystem();
+
     } catch (e) {
       console.error("[AudioMetrix] DOMContentLoaded init failed:", e);
     }

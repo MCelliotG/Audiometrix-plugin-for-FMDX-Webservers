@@ -6,7 +6,7 @@
 
   // PLUGIN METADATA
   const AMX_PLUGIN_NAME        = "AudioMetrix";
-  const AMX_VERSION            = "3.3";
+  const AMX_VERSION            = "3.5";
   const AMX_CHECK_FOR_UPDATES  = true;
   const AMX_UPDATE_URL         =
     "https://raw.githubusercontent.com/MCelliotG/Audiometrix-plugin-for-FMDX-Webservers/main/AudioMetrix/audiometrix.js";
@@ -42,6 +42,14 @@
     hash: ""
   };
 
+  const GRADIENT_CACHE_MAP = new Map();
+
+  const GRADIENT_TEMP = {
+    canvas: document.createElement("canvas"),
+    ctx: null
+  };
+  GRADIENT_TEMP.ctx = GRADIENT_TEMP.canvas.getContext("2d");
+
   const GEOMETRY_CACHE = {
     segment: new Map(),
     pixelfill: new Map(),
@@ -61,8 +69,14 @@
 
   function invalidateVisualCaches() {
     // Gradient cache
+    GRADIENT_CACHE.mode = null;
     GRADIENT_CACHE.width = 0;
+    GRADIENT_CACHE.colors = [];
+    GRADIENT_CACHE.stops = [];
+    GRADIENT_CACHE.peakThresholdX = -1;
+    GRADIENT_CACHE.hash = "";
     GRADIENT_CACHE.ctx = null;
+    GRADIENT_CACHE_MAP.clear();
 
     // Pillars geometry
     STATE.cache.pillar.path = null;
@@ -152,67 +166,6 @@
     }
   }
 
-  // PANEL UPDATE CHECK
-  function checkAudioMetrixUpdate() {
-    if (!AMX_CHECK_FOR_UPDATES) return;
-    if (typeof fetch !== "function") return;
-
-    try {
-      // Bypass cache
-      const url =
-        AMX_UPDATE_URL +
-        (AMX_UPDATE_URL.includes("?") ? "&" : "?") +
-        "_=" +
-        Date.now();
-
-      fetch(url, { cache: "no-store" })
-        .then(resp => {
-          if (!resp || !resp.ok) return null;
-          return resp.text();
-        })
-        .then(text => {
-          if (!text) return;
-
-          const match = text.match(/AMX_VERSION\s*=\s*["']([^"']+)["']/);
-          if (!match || !match[1]) return;
-
-          const remoteVersion = match[1].trim();
-
-          if (!STATE.meta) {
-            STATE.meta = { updateAvailable: false, remoteVersion: null };
-          }
-
-          if (remoteVersion && remoteVersion !== AMX_VERSION) {
-            STATE.meta.updateAvailable = true;
-            STATE.meta.remoteVersion   = remoteVersion;
-
-            console.log(
-              `[AudioMetrix] Update available: v${remoteVersion} (current v${AMX_VERSION}). ` +
-              `See: ${AMX_HOMEPAGE_URL}`
-            );
-          } else {
-            STATE.meta.updateAvailable = false;
-            STATE.meta.remoteVersion   = remoteVersion || null;
-
-            if (AMX_DEBUG) {
-              console.log(`[AudioMetrix] Up to date (v${AMX_VERSION})`);
-            }
-          }
-
-          applyAMXUpdateBanner();
-        })
-        .catch(e => {
-          if (AMX_DEBUG) {
-            console.warn("[AudioMetrix] Update check failed:", e);
-          }
-        });
-    } catch (e) {
-      if (AMX_DEBUG) {
-        console.warn("[AudioMetrix] Update check init failed:", e);
-      }
-    }
-  }
-
   // SETUP UPDATE CHECK
   function runAMXSetupUpdateCheck() {
     if (!CHECK_FOR_UPDATES) return;
@@ -238,11 +191,12 @@
           const versionLine = lines.find(line =>
             line.includes("const pluginVersion") ||
             line.includes("const plugin_version") ||
-            line.includes("const PLUGIN_VERSION")
+            line.includes("const PLUGIN_VERSION") ||
+            line.includes("const AMX_VERSION")
           );
           if (versionLine) {
             const match = versionLine.match(
-              /const\s+(?:pluginVersion|plugin_version|PLUGIN_VERSION)\s*=\s*["']([^"']+)["']/
+              /const\s+(?:pluginVersion|plugin_version|PLUGIN_VERSION|AMX_VERSION)\s*=\s*["']([^"']+)["']/
             );
             if (match && match[1]) {
               version = match[1].trim();
@@ -253,7 +207,7 @@
         // Fallback
         if (!version) {
           const firstLine = lines[0].trim();
-          version = /^\d/.test(firstLine) ? firstLine : "Unknown";
+          version = /^\d/.test(firstLine) ? firstLine : null;
         }
 
         return version;
@@ -279,7 +233,7 @@
         if (currentText === "No plugin settings are available.") {
           pluginSettings.innerHTML = linkHtml;
         } else {
-          pluginSettings.innerHTML += " " + linkHtml;
+          pluginSettings.innerHTML += "<br>" + linkHtml;
         }
       }
 
@@ -288,8 +242,9 @@
         document.querySelector(".wrapper-outer .sidenav-content") ||
         document.querySelector(".sidenav-content");
 
-      if (updateIcon) {
+      if (updateIcon && !updateIcon.querySelector(".amx-update-dot")) {
         const redDot = document.createElement("span");
+        redDot.className = "amx-update-dot";
         redDot.style.display = "block";
         redDot.style.width = "12px";
         redDot.style.height = "12px";
@@ -303,6 +258,7 @@
 
     fetchRemoteVersion().then(newVersion => {
       if (!newVersion) return;
+      if (newVersion === "Unknown") return;
 
       if (newVersion === pluginVersionCheck) {
         if (AMX_DEBUG) {
@@ -423,20 +379,39 @@
   }
 
   // External peak
-  function drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW, gauge) {
+  function drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW, gauge, barPeakWidth, barPeakStep) {
     // GLOBAL TOGGLE
     if (!CONFIG.display.showPeaks) return;
 
     // STATE INIT (separate for bars / gauges)
     if (!STATE.render) STATE.render = {};
 
-    const peakState = gauge
+    const tf =
+      (ctx && typeof ctx.getTransform === "function")
+        ? ctx.getTransform()
+        : null;
+
+    const tx = tf ? Math.round(tf.e) : 0;
+    const ty = tf ? Math.round(tf.f) : 0;
+
+    const bucket = gauge
       ? (STATE.render.gaugePeak ??= {})
-      : (STATE.render.barPeak   ??= {});
+      : (STATE.render.barPeak ??= {});
+
+    const stateKey = gauge
+      ? `g:${tx}:${ty}:${Math.round((gauge.cx || 0) * 10)}:${Math.round((gauge.cy || 0) * 10)}:${Math.round((gauge.r || 0) * 10)}:${Math.round((gauge.startAngle || 0) * 1000)}:${Math.round((gauge.sweepAngle || 0) * 1000)}`
+      : `b:${tx}:${ty}:${Math.round(y)}:${Math.round(effectiveW)}`;
+
+    const peakState = (bucket[stateKey] ??= {});
 
     if (typeof peakState.pos !== "number") {
       peakState.pos = gauge ? gauge.startAngle : peakX;
+    }
+    if (typeof peakState.vel !== "number") {
       peakState.vel = 0;
+    }
+    if (typeof peakState.lastPeak !== "number") {
+      peakState.lastPeak = gauge ? gauge.startAngle : peakX;
     }
 
     // DOMAIN SETUP
@@ -446,14 +421,29 @@
       // BAR DOMAIN
       if (peakX <= 0) return;
 
-      const fillX = Math.max(0, Math.min(levelX, effectiveW));
-      base = Math.min(effectiveW - 2, fillX + 1);
+      const BAR_EDGE_INSET = 5;
+      const PEAK_THROW_PX = 8;
+
+      const barW = Math.max(0, effectiveW - BAR_EDGE_INSET);
+      const fillX = Math.max(0, Math.min(levelX, barW));
+      const peakBarX = Math.max(0, Math.min(peakX, barW));
+
+      base = Math.min(barW - 2, fillX + 1);
       min  = base;
-      max  = effectiveW - 1;
-      target = peakX;
+      max  = barW + PEAK_THROW_PX;
+
+      // Throw outward only on a true new peak rise.
+      // Held peak values should NOT keep the indicator stuck away from the bar.
+      const isNewPeak = peakBarX > (peakState.lastPeak + 0.5);
+
+      target = isNewPeak
+        ? Math.min(max, peakBarX + PEAK_THROW_PX)
+        : base;
+
+      peakState.lastPeak = peakBarX;
 
     } else {
-      //GAUGE DOMAIN
+      // GAUGE DOMAIN
       const fillAngle =
         gauge.startAngle + gauge.normLevel * gauge.sweepAngle;
 
@@ -471,23 +461,32 @@
           ? gauge.peakNorm
           : gauge.normLevel;
 
-      target =
+      const peakAngle =
         gauge.startAngle + pn * gauge.sweepAngle;
+
+      const isNewPeak =
+        peakAngle > (peakState.lastPeak + gauge.sweepAngle * 0.0025);
+
+      target = isNewPeak ? peakAngle : base;
+      peakState.lastPeak = peakAngle;
     }
 
-    // PHYSICS (same as bars)
-    const IMPULSE = 0.45;
-    const DAMPING = 0.15;
-    const RETURN  = 0.05;
+    // PHYSICS (strong throw / faster soft return)
+    const RETURN = 0.28;
+    const DAMPING = 0.78;
 
     const delta = target - peakState.pos;
-    if (delta > 0) {
-      peakState.vel += delta * IMPULSE;
-    }
 
-    peakState.vel += (base - peakState.pos) * RETURN;
-    peakState.vel *= DAMPING;
-    peakState.pos += peakState.vel;
+    if (delta > 0) {
+      // Snap outward immediately on new peak
+      peakState.pos = Math.min(max, target);
+      peakState.vel = 0;
+    } else {
+      // Return quickly but smoothly toward the current bar/gauge edge
+      peakState.vel += (base - peakState.pos) * RETURN;
+      peakState.vel *= DAMPING;
+      peakState.pos += peakState.vel;
+    }
 
     const p = Math.max(min, Math.min(max, peakState.pos));
 
@@ -497,7 +496,16 @@
 
     if (!gauge) {
       // BAR DRAW
-      ctx.fillRect(Math.round(p), y, 2, height);
+      const peakW = Math.max(3, Math.round(barPeakWidth || 3));
+
+      let drawX = Math.round(p);
+
+      // Optional horizontal snap to bar grid (used by renderSegment)
+      if (barPeakStep && barPeakStep > 0) {
+        drawX = Math.round(drawX / barPeakStep) * barPeakStep;
+      }
+
+      ctx.fillRect(drawX, y, peakW, height);
 
     } else {
       // GAUGE DRAW (DOT INSIDE RING)
@@ -549,24 +557,38 @@
 
     // 3) Cache signature
     const hash = `${mode}|${width}|${low}|${mid}|${high}|${RED_ZONE_COLOR}|${YELLOW_ZONE_COLOR}|${THR}`;
-    if (GRADIENT_CACHE.hash === hash) {
+
+    let cache = GRADIENT_CACHE_MAP.get(hash);
+    if (cache) {
+      GRADIENT_CACHE.mode = cache.mode;
+      GRADIENT_CACHE.width = cache.width;
+      GRADIENT_CACHE.colors = cache.colors;
+      GRADIENT_CACHE.stops = cache.stops;
+      GRADIENT_CACHE.peakThresholdX = cache.peakThresholdX;
+      GRADIENT_CACHE.hash = cache.hash;
       return GRADIENT_CACHE;
     }
 
-    // 4) Init cache
-    GRADIENT_CACHE.hash   = hash;
-    GRADIENT_CACHE.mode   = mode;
-    GRADIENT_CACHE.width  = width;
-    GRADIENT_CACHE.colors = new Array(width);
-    GRADIENT_CACHE.stops  = [];
-    GRADIENT_CACHE.peakThresholdX = THR_px;
+    cache = {
+      mode: mode,
+      width: width,
+      colors: new Array(width),
+      stops: [],
+      peakThresholdX: THR_px,
+      hash: hash
+    };
 
-    // 5) Temp canvas
-    const tempCanvas = document.createElement("canvas");
-    tempCanvas.width  = width;
-    tempCanvas.height = 1;
+    // 5) Reused temp canvas
+    const tempCanvas = GRADIENT_TEMP.canvas;
+    const tctx = GRADIENT_TEMP.ctx;
 
-    const tctx = tempCanvas.getContext("2d");
+    if (tempCanvas.width !== width) {
+      tempCanvas.width = width;
+    }
+    if (tempCanvas.height !== 1) {
+      tempCanvas.height = 1;
+    }
+
     tctx.clearRect(0, 0, width, 1);
 
     // 6) Build gradient
@@ -618,28 +640,37 @@
     const img = tctx.getImageData(0, 0, width, 1).data;
     for (let x = 0; x < width; x++) {
       const i = x * 4;
-      GRADIENT_CACHE.colors[x] =
+      cache.colors[x] =
         `rgba(${img[i]},${img[i+1]},${img[i+2]},${img[i+3]/255})`;
     }
 
     // 8) Stops (for glow)
-    GRADIENT_CACHE.stops.push({ pos: 0.00, color: low });
-    GRADIENT_CACHE.stops.push({ pos: mid_pos, color: mid });
-    GRADIENT_CACHE.stops.push({ pos: high_pos, color: high });
+    cache.stops.push({ pos: 0.00, color: low });
+    cache.stops.push({ pos: mid_pos, color: mid });
+    cache.stops.push({ pos: high_pos, color: high });
 
     if (mode === 1) {
-      GRADIENT_CACHE.stops.push({ pos: THR, color: RED_ZONE_COLOR });
+      cache.stops.push({ pos: THR, color: RED_ZONE_COLOR });
     }
 
     if (mode === 2) {
-      GRADIENT_CACHE.stops.push({ pos: THR, color: YELLOW_ZONE_COLOR });
+      cache.stops.push({ pos: THR, color: YELLOW_ZONE_COLOR });
     }
 
-    GRADIENT_CACHE.stops.push({
+    cache.stops.push({
       pos: 1.00,
       color: (mode === 1 ? RED_ZONE_COLOR :
               mode === 2 ? YELLOW_ZONE_COLOR : high)
     });
+
+    GRADIENT_CACHE_MAP.set(hash, cache);
+
+    GRADIENT_CACHE.mode = cache.mode;
+    GRADIENT_CACHE.width = cache.width;
+    GRADIENT_CACHE.colors = cache.colors;
+    GRADIENT_CACHE.stops = cache.stops;
+    GRADIENT_CACHE.peakThresholdX = cache.peakThresholdX;
+    GRADIENT_CACHE.hash = cache.hash;
 
     return GRADIENT_CACHE;
   }
@@ -835,7 +866,7 @@
         low: "hsl(229, 100%, 36%)",
         mid: "hsl(226, 100%, 50%)",
         high: "hsl(24, 100%, 62%)",
-        peak: "hsl(48, 48%, 90%)"
+        peak: "hsl(200, 100%, 60%)"
       }
     },
 
@@ -862,10 +893,10 @@
     galactica: {
       name: "galactica",
       colors: {
-        low: "hsl(250 100% 62%)",
-        mid: "hsl(270 100% 66%)",
-        high: "hsl(290 100% 67%)",
-        peak: "hsl(240 100% 62%)"
+        low: "hsl(250, 100%, 62%)",
+        mid: "hsl(270, 100%, 66%)",
+        high: "hsl(290, 100%, 67%)",
+        peak: "hsl(240, 100%, 62%)"
       }
     },
 
@@ -882,10 +913,10 @@
     heatmap: {
       name: "heatmap",
       colors: {
-        low: "hsl(30 100% 50%)",
-        mid: "hsl(330 100% 50%)",
-        high: "hsl(300 100% 50%)",
-        peak: "hsl(60 100% 50%)"
+        low: "hsl(30, 100%, 50%)",
+        mid: "hsl(330, 100%, 50%)",
+        high: "hsl(300, 100%, 50%)",
+        peak: "hsl(60, 100%, 50%)"
       }
     },
 
@@ -893,9 +924,9 @@
       name: "iceblue",
       colors: {
         low: "hsl(182, 100%, 50%)",
-        mid: "hsl(190 100% 88%)",
+        mid: "hsl(190, 100%, 88%)",
         high: "hsl(222, 100%, 69%)",
-        peak: "hsl(187, 100%, 86%)"
+        peak: "hsl(200, 100%, 33%)"
       }
     },
 
@@ -903,9 +934,9 @@
       name: "neonlights",
       colors: {
         low: "hsl(250, 53%, 46%)",
-        mid: "hsl(17 100% 59%)",
+        mid: "hsl(17, 100%, 59%)",
         high: "hsl(96, 57%, 76%)",
-        peak: "hsl(38, 90%, 60%)"
+        peak: "hsl(305, 100%, 59%)"
       }
     },
 
@@ -915,7 +946,7 @@
         low: "hsl(332, 88%, 73%)",
         mid: "hsl(0, 67%, 93%)",
         high: "hsl(204, 90%, 80%)",
-        peak: "hsl(136, 100%, 97%)"
+        peak: "hsl(326, 100%, 67%)"
       }
     },
 
@@ -932,7 +963,7 @@
     redvelvet: {
       name: "redvelvet",
       colors: {
-        low: "hsl(356, 77%, 76%)",
+        low: "hsl(360, 100%, 57%)",
         mid: "hsl(57, 100%, 91%)",
         high: "hsl(358, 97%, 31%)",
         peak: "hsl(359, 64%, 35%)"
@@ -945,17 +976,17 @@
         low: "hsl(223, 63%, 19%)",
         mid: "hsl(28, 94%, 54%)",
         high: "hsl(71, 41%, 73%)",
-        peak: "hsl(0, 0%, 93%)"
+        peak: "hsl(223, 100%, 67%)"
       }
     },
 
     scarlet: {
       name: "scarlet",
       colors: {
-        low: "hsl(0 100% 18%)",
-        mid: "hsl(360 83% 41%)",
-        high: "hsl(0 100% 25%)",
-        peak: "hsl(0 100% 60%)"
+        low: "hsl(0, 100%, 18%)",
+        mid: "hsl(360, 83%, 41%)",
+        high: "hsl(0, 100%, 25%)",
+        peak: "hsl(0, 100%, 60%)"
       }
     },
 
@@ -972,7 +1003,7 @@
     solar: {
       name: "solar",
       colors: {
-        low: "hsl(43 77% 50%)",
+        low: "hsl(43, 77%, 50%)",
         mid: "hsl(7, 97%, 38%)",
         high: "hsl(51, 90%, 51%)",
         peak: "hsl(53, 59%, 64%)"
@@ -992,10 +1023,10 @@
     valentines: {
       name: "valentines",
       colors: {
-        low: "hsl(330 81% 29%)",
-        mid: "hsl(340 82% 76%)",
-        high: "hsl(340 81% 85%)",
-        peak: "hsl(350 70% 59%)"
+        low: "hsl(330, 81%, 29%)",
+        mid: "hsl(340, 82%, 76%)",
+        high: "hsl(340, 81%, 85%)",
+        peak: "hsl(350, 70%, 59%)"
       }
     },
 
@@ -1012,10 +1043,10 @@
     vesper: {
       name: "vesper",
       colors: {
-        low: "hsl(28, 97.6%, 50%)",
-        mid: "hsl(274, 97.6%, 50%)",
-        high: "hsl(181.9, 97.6%, 50%)",
-        peak: "hsl(0, 0%, 100%)"
+        low: "hsl(28, 98%, 50%)",
+        mid: "hsl(274, 98%, 50%)",
+        high: "hsl(182, 98%, 50%)",
+        peak: "hsl(296, 100%, 72%)"
       }
     },
 
@@ -1025,7 +1056,7 @@
         low: "hsl(38, 26%, 47%)",
         mid: "hsl(35, 43%, 78%)",
         high: "hsl(55, 40%, 76%)",
-        peak: "hsl(69, 22%, 67%)"
+        peak: "hsl(33, 100%, 44%)"
       }
     }
   };
@@ -1198,10 +1229,10 @@
 
     fullBarsFrameSkip: 0,
 
-    peakTimeout: {
-      left: null,
-      right: null,
-      audio: null
+    peakHoldUntil: {
+      left: 0,
+      right: 0,
+      audio: 0
     },
 
     meta: {
@@ -2145,7 +2176,6 @@
           styleInput.value = opt.textContent;
           invalidateVisualCaches();
           updateMirroredCanvasHeight();
-          applyVisualState();
           requestRender();
 
           const opts = document.getElementById("amx-barstyle-options");
@@ -2197,8 +2227,6 @@
 
           invalidateVisualCaches();
           updateMirroredCanvasHeight();
-          applyVisualState();
-          renderMeters();
           requestRender();
 
           const opts = document.getElementById("amx-layout-options");
@@ -2252,8 +2280,6 @@
           renderInput.value = opt.textContent;
           invalidateVisualCaches();
           updateMirroredCanvasHeight();
-          applyVisualState();
-          renderMeters();
           requestRender();
 
           const opts = document.getElementById("amx-render-options");
@@ -2521,11 +2547,14 @@
   function requestRender() {
     RENDER_GATE.dirty = true;
 
-    // If audio loop is not running yet (idle / stop state),
-    // redraw immediately so visual style changes appear at once.
-    if (!STATE.audio.analyserLeft || !STATE.audio.analyserRight) {
+    // If audio RAF isn't running yet (idle/stop state), redraw immediately
+    if (
+      !STATE.audio ||
+      !STATE.audio.analyserLeft ||
+      !STATE.audio.analyserRight ||
+      !STATE.audio.analyserPeak
+    ) {
       renderMeters();
-      RENDER_GATE.dirty = false;
     }
   }
 
@@ -2555,6 +2584,12 @@
 
   function refreshLayoutAndCanvas() {
     markLayoutDirty();
+
+    if (STATE.dom.contentWrapper) {
+      forceResizeCanvas();
+      return;
+    }
+
     readLayoutOnce();
     invalidateVisualCaches();
     requestRender();
@@ -2641,7 +2676,7 @@
       case "A":
         // Audio Peak
         return clamp(
-          STATE.levels.audio.smoothDb ?? STATE.levels.audio.smooth,
+          STATE.levels.audio.smooth,
           CONFIG.audio.minDb,
           CONFIG.audio.maxDb
         );
@@ -3177,6 +3212,7 @@
     const effectiveW = getEffectiveBarWidth(width);
     const barW       = Math.max(0, effectiveW - 5);
     const hasSignal  = levelX > 0;
+    const glowIntensity = CONFIG.display.glowIntensity;
 
     if (!gcache || !gcache.colors || !gcache.colors.length) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
@@ -3206,13 +3242,13 @@
     }
 
     // SIMPLE GLOW — rim + soft fade (NO BLUR)
-    if (CONFIG.display.glowIntensity > 0) {
+    if (glowIntensity > 0) {
 
       const rimExpand  = 1.5;
       const fadeExpand = 3.5;
 
-      const rimAlpha  = 0.14 * CONFIG.display.glowIntensity;
-      const fadeAlpha = 0.02 * CONFIG.display.glowIntensity;
+      const rimAlpha  = 0.14 * glowIntensity;
+      const fadeAlpha = 0.02 * glowIntensity;
 
       ctx.save();
 
@@ -3252,13 +3288,15 @@
   // 2) SEGMENTED RECTANGLES — unified gradient + unified glow
   function renderSegment(ctx, levelX, peakX, y, height, width, gcache) {
 
-    const effectiveW = getEffectiveBarWidth(width);
+    const effectiveW = width;
     const barW       = Math.max(0, effectiveW - 5);
     const hasSignal  = levelX > 0;
     const segGap     = 2;
+    const glowIntensity = CONFIG.display.glowIntensity;
 
     if (!gcache || !gcache.colors || !gcache.colors.length) {
-      drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
+      drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW, null,
+        Math.max(2, Math.floor(height / 2.9)), Math.max(2, Math.floor(height / 2.9)) + segGap);
       return;
     }
 
@@ -3305,13 +3343,13 @@
             ctx.fillRect(x, ry, segW, rowH);
 
             // unified glow (stronger around segment)
-            if (CONFIG.display.glowIntensity > 0) {
+            if (glowIntensity > 0) {
 
               const rimExpand  = 1.2;
               const fadeExpand = 3.8;
 
-              const rimAlpha  = 0.22 * CONFIG.display.glowIntensity;
-              const fadeAlpha = 0.07 * CONFIG.display.glowIntensity;
+              const rimAlpha  = 0.22 * glowIntensity ;
+              const fadeAlpha = 0.07 * glowIntensity ;
 
               // rim glow
               ctx.save();
@@ -3341,7 +3379,10 @@
         }
       }
 
-      drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
+      for (let r = 0; r < rows; r++) {
+        const ry = y + r * (rowH + rowGap);
+        drawExternalPeak(ctx, levelX, peakX, ry, rowH, effectiveW, null, segW, segW + segGap);
+      }
       return;
     }
 
@@ -3377,13 +3418,13 @@
         ctx.fillRect(x, y, segW, segH);
 
         // unified glow (same profile as mirrored)
-        if (CONFIG.display.glowIntensity > 0) {
+        if (glowIntensity > 0) {
 
           const rimExpand  = 1.2;
           const fadeExpand = 3.8;
 
-          const rimAlpha  = 0.22 * CONFIG.display.glowIntensity;
-          const fadeAlpha = 0.07 * CONFIG.display.glowIntensity;
+          const rimAlpha  = 0.22 * glowIntensity;
+          const fadeAlpha = 0.07 * glowIntensity;
 
           // rim glow
           ctx.save();
@@ -3412,15 +3453,19 @@
       }
     }
 
-    drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
+    drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW, null, segW, segW + segGap);
   }
 
   // 3) CIRCLE DOTS — unified gradient + geometry cache + unified glow
   function renderCircledots(ctx, levelX, peakX, y, height, width, gcache) {
 
-    if (levelX <= 0) return;
-
     const effectiveW = getEffectiveBarWidth(width);
+    const glowIntensity = CONFIG.display.glowIntensity;
+
+    if (levelX <= 0) {
+      drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
+      return;
+    }
 
     if (!gcache || !gcache.colors || !gcache.colors.length) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
@@ -3474,13 +3519,13 @@
           ctx.fill();
 
           // UNIFIED GLOW
-          if (CONFIG.display.glowIntensity > 0) {
+          if (glowIntensity > 0) {
 
-            const rimExpand  = 3.0;
-            const fadeExpand = 3.2;
+            const rimExpand  = 1.4;
+            const fadeExpand = 4.5;
 
-            const rimAlpha  = 1.00 * CONFIG.display.glowIntensity;
-            const fadeAlpha = 1.80 * CONFIG.display.glowIntensity;
+            const rimAlpha  = 0.24 * glowIntensity;
+            const fadeAlpha = 0.08 * glowIntensity;
 
             // rim
             ctx.save();
@@ -3541,13 +3586,13 @@
       ctx.fill();
 
       // UNIFIED GLOW
-      if (CONFIG.display.glowIntensity > 0) {
+      if (glowIntensity > 0) {
 
         const rimExpand  = 1.4;
         const fadeExpand = 4.5;
 
-        const rimAlpha  = 0.24 * CONFIG.display.glowIntensity;
-        const fadeAlpha = 0.08 * CONFIG.display.glowIntensity;
+        const rimAlpha  = 0.24 * glowIntensity;
+        const fadeAlpha = 0.08 * glowIntensity;
 
         // rim
         ctx.save();
@@ -3575,11 +3620,14 @@
   // 4) MATRIX dots — unified gradient + optimized geometry + precomputed counts
   function renderMatrixdots(ctx, levelX, peakX, y, height, width, gcache) {
 
-    if (levelX <= 0) return;
-
-    const effectiveW  = getEffectiveBarWidth(width);
-    const glow        = CONFIG.display.glowIntensity;
+    const effectiveW = getEffectiveBarWidth(width);
+    const glowIntensity = CONFIG.display.glowIntensity;
     const isAudioPeak = (STATE._audioPeakGradient === true);
+
+    if (levelX <= 0) {
+      drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
+      return;
+    }
 
     if (!gcache || !gcache.colors || !gcache.colors.length) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
@@ -3632,8 +3680,8 @@
       }
 
       // Glow constants precomputed
-      const doGlow = glow > 0;
-      const glowAlpha = 0.38 * glow;
+      const doGlow = glowIntensity > 0;
+      const glowAlpha = 0.38 * glowIntensity;
       const glowBlur  = 5.5;
       const glowR     = radius + 1.9;
 
@@ -3703,8 +3751,8 @@
     }
 
     // Glow constants precomputed
-    const doGlow2 = glow > 0;
-    const glowAlpha2 = 0.38 * glow;
+    const doGlow2 = glowIntensity > 0;
+    const glowAlpha2 = 0.38 * glowIntensity;
     const glowBlur2  = 5.5;
     const glowR2     = radius + 1.9;
 
@@ -3766,6 +3814,7 @@
     const effectiveW = getEffectiveBarWidth(width);
     const hasSignal = levelX > 1;
     const fillX = hasSignal ? Math.min(levelX, effectiveW) : 0;
+    const glowIntensity = CONFIG.display.glowIntensity;
 
     if (!gcache || !gcache.colors || !gcache.colors.length) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
@@ -3862,7 +3911,7 @@
     }
 
     // TRIANGLE GLOW — rim + soft fade + ultra-soft outer haze
-    if (CONFIG.display.glowIntensity > 0 && fillX > 1) {
+    if (glowIntensity > 0 && fillX > 1) {
 
       const fx = Math.min(Math.floor(fillX), gcache.colors.length);
       if (fx > 0) {
@@ -3872,10 +3921,10 @@
         const fadeExpand  = 2.5;
         const hazeExpand  = 8.0;
 
-        const rimAlpha   = 0.18 * CONFIG.display.glowIntensity;
-        const fadeAlpha  = 0.06 * CONFIG.display.glowIntensity;
-        const hazeAlpha  = 0.003 * CONFIG.display.glowIntensity;
-        const edgeAlpha  = 1.10 * CONFIG.display.glowIntensity;
+        const rimAlpha   = 0.18 * glowIntensity;
+        const fadeAlpha  = 0.06 * glowIntensity;
+        const hazeAlpha  = 0.003 * glowIntensity;
+        const edgeAlpha  = 1.10 * glowIntensity;
 
         function yTopAt(x) {
           return midY + (topY - midY) * (x / W);
@@ -3968,6 +4017,7 @@
         : getEffectiveBarWidth(width);
 
     const fillW = Math.max(0, Math.min(levelX, effectiveW));
+    const glowIntensity = CONFIG.display.glowIntensity;
 
     if (!gcache || !gcache.colors || !gcache.colors.length) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
@@ -4050,11 +4100,10 @@
       }
 
       // bar glow
-      if (CONFIG.display.glowIntensity > 0 && maxFillX > 0) {
-        const gi = CONFIG.display.glowIntensity;
+      if (glowIntensity > 0 && maxFillX > 0) {
 
-        const rimAlpha  = 0.16 * gi;
-        const fadeAlpha = 0.05 * gi;
+        const rimAlpha  = 0.16 * glowIntensity;
+        const fadeAlpha = 0.05 * glowIntensity;
 
         // rim
         const yRim = innerY - 2;
@@ -4139,6 +4188,7 @@
         ? width
         : getEffectiveBarWidth(width);
 
+    const glowIntensity = CONFIG.display.glowIntensity;
     const drawTubeRow = (ry, rh) => {
 
       const radius = Math.max(4, rh * 0.18);
@@ -4179,7 +4229,7 @@
       // ------------------------------------------------------------
       // 2) GLOW — NOW UNDER THE 3D BAR SHADING
       // ------------------------------------------------------------
-      if (CONFIG.display.glowIntensity > 0 && fillW > 1) {
+      if (glowIntensity > 0 && fillW > 1) {
 
         const fx = Math.min(Math.floor(fillW), gcache.colors.length);
 
@@ -4187,9 +4237,9 @@
         const fadeExpand = 4.5;
         const hazeExpand = 2.5;
 
-        const rimAlpha  = 0.16 * CONFIG.display.glowIntensity;
-        const fadeAlpha = 0.035 * CONFIG.display.glowIntensity;
-        const hazeAlpha = 0.02 * CONFIG.display.glowIntensity;
+        const rimAlpha  = 0.16 * glowIntensity;
+        const fadeAlpha = 0.035 * glowIntensity;
+        const hazeAlpha = 0.02 * glowIntensity;
 
         const xs = getPixelFillXs(effectiveW);
 
@@ -4340,10 +4390,12 @@
   }
 
   // FULL RENDER CHANNEL — unified + stable
-  function renderChannel(smoothDb, peakDb, y, width, barH) {
+  function renderChannel(smoothDb, peakDb, y, width, barH, effectiveWOverride = null, barStyleOverride = null) {
 
     const ctx   = STATE.dom.ctx;
-    const style = CONFIG.display.barStyle;
+    const style = (barStyleOverride != null)
+      ? barStyleOverride
+      : CONFIG.display.barStyle;
 
     // mode:
     // 0 = normal
@@ -4357,12 +4409,14 @@
       mode = 2;
     }
 
-    const effectiveW = getEffectiveBarWidth(width);
+    const effectiveW = (effectiveWOverride != null)
+      ? effectiveWOverride
+      : getEffectiveBarWidth(width);
     const levelX = mapDbToX(smoothDb, effectiveW);
     const peakX  = mapDbToX(peakDb, effectiveW);
 
     // unified gradient cache
-    const gcache = buildBarsGradient(mode, width);
+    const gcache = buildBarsGradient(mode, effectiveW);
 
     // unified switch (simple included here)
     switch (style) {
@@ -4397,12 +4451,14 @@
   function renderMeters() {
     const layout = CONFIG.display.layoutMode;
     const render = CONFIG.display.renderMode;
+    const barStyle = CONFIG.display.barStyle;
+    const showReadouts = CONFIG.display.showReadouts;
 
     const visualStateKey =
-      CONFIG.display.layoutMode + "|" +
-      CONFIG.display.renderMode + "|" +
-      CONFIG.display.barStyle + "|" +
-      CONFIG.display.showReadouts;
+      layout + "|" +
+      render + "|" +
+      barStyle + "|" +
+      showReadouts;
 
     if (visualStateKey !== _lastVisualStateKey) {
       _lastVisualStateKey = visualStateKey;
@@ -4410,8 +4466,8 @@
     }
 
     const useMirrored =
-      CONFIG.display.layoutMode === "lr" &&
-      CONFIG.display.renderMode === "mirrored";
+      layout === "lr" &&
+      render === "mirrored";
 
     if (useMirrored) {
       updateMirroredCanvasHeight();
@@ -4434,18 +4490,18 @@
           ? (barH * 3 + gap * 2)
           : (barH * 2 + gap);
 
+      const nextHeight = normalHeight + "px";
+
       if (canvas.height !== normalHeight) {
         canvas.height = normalHeight;
-        canvas.style.height = normalHeight + "px";
       }
-
-      // hard clear using the *current* intrinsic size
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (canvas.style.height !== nextHeight) {
+        canvas.style.height = nextHeight;
+      }
     }
 
     // GAUGES MODE
     if (render === "gauges") {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
       renderGauges(ctx, canvas, layout);
       return;
     }
@@ -4454,22 +4510,27 @@
     if (layout === "lr" && render === "mirrored") {
 
       let height_mirrored;
-      if (CONFIG.display.barStyle === "circledots") {
+      if (barStyle === "circledots") {
         height_mirrored = barH * 3.2;
-      } else if (CONFIG.display.barStyle === "matrixdots") {
+      } else if (barStyle=== "matrixdots") {
         height_mirrored = barH * 3.6;
       } else {
         height_mirrored = barH * 2 + gap + 15;
       }
 
+      const nextHeight = height_mirrored + "px";
+
       if (canvas.height !== height_mirrored) {
         canvas.height = height_mirrored;
       }
-      if (canvas.style.height !== height_mirrored + "px") {
-        canvas.style.height = height_mirrored + "px";
+      if (canvas.style.height !== nextHeight) {
+        canvas.style.height = nextHeight;
       }
 
       ctx.clearRect(0, 0, width, canvas.height);
+
+      const leftLevels = STATE.levels.left;
+      const rightLevels = STATE.levels.right;
 
       const BAR_GAP  = 35;
       const usableW  = Math.floor(width - BAR_GAP);
@@ -4485,11 +4546,13 @@
       ctx.translate(Lx + Lw, 0);
       ctx.scale(-1, 1);
       renderChannel(
-        STATE.levels.left.smoothDb,
-        STATE.levels.left.peakDb,
+        leftLevels.smoothDb,
+        leftLevels.peakDb,
         0,
         Lw,
-        height_mirrored
+        height_mirrored,
+        null,
+        barStyle
       );
       ctx.restore();
 
@@ -4497,11 +4560,13 @@
       ctx.save();
       ctx.translate(Rx, 0);
       renderChannel(
-        STATE.levels.right.smoothDb,
-        STATE.levels.right.peakDb,
+        rightLevels.smoothDb,
+        rightLevels.peakDb,
         0,
         Rw,
-        height_mirrored
+        height_mirrored,
+        null,
+        barStyle
       );
       ctx.restore();
 
@@ -4520,49 +4585,71 @@
         barH * 4 +
         FULL_GAP * 3;
 
+      const nextHeight = neededHeight + "px";
+
       if (canvas.height !== neededHeight) {
-        canvas.height       = neededHeight;
-        canvas.style.height = neededHeight + "px";
+        canvas.height = neededHeight;
+      }
+      if (canvas.style.height !== nextHeight) {
+        canvas.style.height = nextHeight;
       }
 
       // Ensure wrapper can contain 4 rows
-      if (STATE.dom.contentWrapper) {
-        STATE.dom.contentWrapper.style.height = neededHeight + "px";
+      const contentWrapper = STATE.dom.contentWrapper;
+      if (contentWrapper) {
+        if (contentWrapper.style.height !== nextHeight) {
+          contentWrapper.style.height = nextHeight;
+        }
       }
 
       ctx.clearRect(0, 0, width, canvas.height);
+      const effectiveWFull = getEffectiveBarWidth(width);
+
+      const minDb = CONFIG.audio.minDb;
+      const maxDb = CONFIG.audio.maxDb;
+      const range = maxDb - minDb;
+
+      const leftLevels = STATE.levels.left;
+      const rightLevels = STATE.levels.right;
+      const stereoQualityLevels = STATE.levels.stereoQuality;
+      const audioLevels = STATE.levels.audio;
+
+      const Q_MAX = 120;
+      const SIGNAL_MAX_RATIO = 0.74;
 
       let y = TOP_PAD;
 
       // L
       renderChannel(
-        STATE.levels.left.smoothDb,
-        STATE.levels.left.peakDb,
+        leftLevels.smoothDb,
+        leftLevels.peakDb,
         y,
         width,
-        barH
+        barH,
+        effectiveWFull,
+        barStyle
       );
 
       y += barH + FULL_GAP;
 
       // R
       renderChannel(
-        STATE.levels.right.smoothDb,
-        STATE.levels.right.peakDb,
+        rightLevels.smoothDb,
+        rightLevels.peakDb,
         y,
         width,
-        barH
+        barH,
+        effectiveWFull,
+        barStyle
       );
 
       y += barH + FULL_GAP;
 
       // Q — Stereo Quality
       {
-        const Q_MAX = 120;
-        const q = STATE.levels.stereoQuality.smooth;
+        const q = stereoQualityLevels.smooth;
         const qClamped = Math.max(0, Math.min(Q_MAX, q));
 
-        const SIGNAL_MAX_RATIO = 0.74;
         let ratio;
         if (qClamped <= 100) {
           ratio = (qClamped / 100) * SIGNAL_MAX_RATIO;
@@ -4572,47 +4659,50 @@
             ((qClamped - 100) / 20) * (1 - SIGNAL_MAX_RATIO);
         }
 
-        const minDb = CONFIG.audio.minDb;
-        const maxDb = CONFIG.audio.maxDb;
-
         const qSmoothDb =
-          minDb + ratio * (maxDb - minDb);
+          minDb + ratio * range;
 
         STATE._stereoQualityGradient = true;
 
-        renderChannel(
-          qSmoothDb,
-          qSmoothDb,
-          y,
-          width,
-          barH
-        );
-
-        STATE._stereoQualityGradient = false;
+        try {
+          renderChannel(
+            qSmoothDb,
+            qSmoothDb,
+            y,
+            width,
+            barH,
+            effectiveWFull,
+            barStyle
+          );
+        } finally {
+          STATE._stereoQualityGradient = false;
+        }
       }
 
       y += barH + FULL_GAP;
 
       // A — Audio
       {
-        const minDb = CONFIG.audio.minDb;
-        const maxDb = CONFIG.audio.maxDb;
-        const range = maxDb - minDb;
-
         const audioSmoothDb =
-          minDb + (STATE.levels.audio.smooth / 255) * range;
+          minDb + (audioLevels.smooth / 255) * range;
+        const audioPeakDb =
+          minDb + (audioLevels.peak / 255) * range;
 
         STATE._audioPeakGradient = true;
 
-        renderChannel(
-          audioSmoothDb,
-          audioSmoothDb,
-          y,
-          width,
-          barH
-        );
-
-        STATE._audioPeakGradient = false;
+        try {
+          renderChannel(
+            audioSmoothDb,
+            audioPeakDb,
+            y,
+            width,
+            barH,
+            effectiveWFull,
+            barStyle
+          );
+        } finally {
+          STATE._audioPeakGradient = false;
+        }
       }
 
       return;
@@ -4624,12 +4714,18 @@
       ? barH * 3 + gap * 2
       : barH * 2 + gap;
 
+    const nextHeight = neededHeight + "px";
+
     if (canvas.height !== neededHeight) {
-      canvas.height       = neededHeight;
-      canvas.style.height = neededHeight + "px";
+      canvas.height = neededHeight;
+    }
+    if (canvas.style.height !== nextHeight) {
+      canvas.style.height = nextHeight;
     }
 
     ctx.clearRect(0, 0, width, canvas.height);
+
+    const effectiveW = getEffectiveBarWidth(width);
 
     // L+R channels
     if (layout === "lr") {
@@ -4639,7 +4735,9 @@
         STATE.levels.left.peakDb,
         0,
         width,
-        barH
+        barH,
+        effectiveW,
+        barStyle
       );
       // R
       renderChannel(
@@ -4647,15 +4745,20 @@
         STATE.levels.right.peakDb,
         barH + gap,
         width,
-        barH
+        barH,
+        effectiveW,
+        barStyle
       );
     }
 
     // Stereo Quality (SA)
     if (layout === "sa") {
 
+      const stereoQualityLevels = STATE.levels.stereoQuality;
+      const audioLevels = STATE.levels.audio;
+
       const Q_MAX = 120;
-      const q = STATE.levels.stereoQuality.smooth;
+      const q = stereoQualityLevels.smooth;
       const qClamped = Math.max(0, Math.min(Q_MAX, q));
 
       const SIGNAL_MAX_RATIO = 0.74;
@@ -4670,43 +4773,48 @@
 
       const minDb = CONFIG.audio.minDb;
       const maxDb = CONFIG.audio.maxDb;
+      const range = maxDb - minDb;
 
       const qSmoothDb =
-        minDb + ratio * (maxDb - minDb);
+        minDb + ratio * range;
 
       STATE._stereoQualityGradient = true;
 
-      renderChannel(
-        qSmoothDb,
-        qSmoothDb,
-        0,
-        width,
-        barH
-      );
-
-      STATE._stereoQualityGradient = false;
+      try {
+        renderChannel(
+          qSmoothDb,
+          qSmoothDb,
+          0,
+          width,
+          barH,
+          effectiveW,
+          barStyle
+        );
+      } finally {
+        STATE._stereoQualityGradient = false;
+      }
 
       // Audio (SA)
-      const minDbA = CONFIG.audio.minDb;
-      const maxDbA = CONFIG.audio.maxDb;
-      const rangeA = maxDbA - minDbA;
-
       const audioSmoothDb =
-        minDbA + (STATE.levels.audio.smooth / 255) * rangeA;
+        minDb + (audioLevels.smooth / 255) * range;
       const audioPeakDb =
-        minDbA + (STATE.levels.audio.peak / 255) * rangeA;
+        minDb + (audioLevels.peak / 255) * range;
 
       STATE._audioPeakGradient = true;
 
-      renderChannel(
-        audioSmoothDb,
-        audioPeakDb,
-        barH + gap,
-        width,
-        barH
-      );
-
-      STATE._audioPeakGradient = false;
+      try {
+        renderChannel(
+          audioSmoothDb,
+          audioPeakDb,
+          barH + gap,
+          width,
+          barH,
+          effectiveW,
+          barStyle
+        );
+      } finally {
+        STATE._audioPeakGradient = false;
+      }
     }
   }
 
@@ -4968,7 +5076,7 @@
         }
 
       } else {
-        // Audio Peak (mode 1), Stereo Quality (mode 2), λοιπά
+        // Audio Peak (mode 1), Stereo Quality (mode 2) etc
         peakFrac = frac;
       }
 
@@ -5004,6 +5112,7 @@
 
     const layout = CONFIG.display.layoutMode;
     const render = CONFIG.display.renderMode;
+    const barStyle = CONFIG.display.barStyle;
 
     const useMirrored =
       layout === "lr" && render === "mirrored";
@@ -5849,14 +5958,23 @@
           const cs = getComputedStyle(ref);
 
           // NORMAL LABELS & SCALES
-          const targets = [
+          const labelScaleTargets = [
             STATE.dom.labels.left,
             STATE.dom.labels.right,
+            STATE.dom.labels.q,
+            STATE.dom.labels.a,
             STATE.dom.scales.left,
-            STATE.dom.scales.right
+            STATE.dom.scales.right,
+            STATE.dom.gaugeLabelLeft,
+            STATE.dom.gaugeLabelRight,
+            STATE.dom.gaugeLabelQ,
+            STATE.dom.gaugeLabelA,
+            STATE.dom.mirrorLabel,
+            STATE.dom.mirrorScaleLeft,
+            STATE.dom.mirrorScaleRight
           ].filter(Boolean);
 
-          targets.forEach((el) => {
+          labelScaleTargets.forEach((el) => {
             const base = parseFloat(cs.fontSize);
 
             el.style.fontFamily = cs.fontFamily;
@@ -5864,11 +5982,18 @@
             el.style.letterSpacing = cs.letterSpacing;
             el.style.textTransform = cs.textTransform;
             el.style.lineHeight = cs.lineHeight;
-            el.style.color = cs.color;
+            el.style.color = "#fff";
 
             if (
-              el === STATE.dom.labels.left ||
-              el === STATE.dom.labels.right
+              el === STATE.dom.labels.left  ||
+              el === STATE.dom.labels.right ||
+              el === STATE.dom.labels.q     ||
+              el === STATE.dom.labels.a     ||
+              el === STATE.dom.gaugeLabelLeft  ||
+              el === STATE.dom.gaugeLabelRight ||
+              el === STATE.dom.gaugeLabelQ     ||
+              el === STATE.dom.gaugeLabelA     ||
+              el === STATE.dom.mirrorLabel
             ) {
               el.style.fontSize = base + 2 + "px";
             } else {
@@ -5876,10 +6001,31 @@
             }
           });
 
-          if (STATE.dom.scales.left)  STATE.dom.scales.left.style.opacity  = 0.7;
-          if (STATE.dom.scales.right) STATE.dom.scales.right.style.opacity = 0.7;
+          if (STATE.dom.scales.left)       STATE.dom.scales.left.style.opacity       = 0.7;
+          if (STATE.dom.scales.right)      STATE.dom.scales.right.style.opacity      = 0.7;
+          if (STATE.dom.mirrorScaleLeft)   STATE.dom.mirrorScaleLeft.style.opacity   = 0.7;
+          if (STATE.dom.mirrorScaleRight)  STATE.dom.mirrorScaleRight.style.opacity  = 0.7;
 
-          // GAUGES — NUMERIC LABELS (inheritance)
+          [
+            ...Array.from(STATE.dom.mirrorScaleLeft?.querySelectorAll("span") || []),
+            ...Array.from(STATE.dom.mirrorScaleRight?.querySelectorAll("span") || [])
+          ].forEach((el) => {
+            el.style.color = "#fff";
+          });
+
+          // READOUTS
+          Object.values(STATE.dom.readouts || {}).filter(Boolean).forEach((el) => {
+            el.style.fontFamily = cs.fontFamily;
+            el.style.fontWeight = "600";
+            el.style.letterSpacing = cs.letterSpacing;
+            el.style.textTransform = cs.textTransform;
+            el.style.lineHeight = cs.lineHeight;
+            el.style.color = "#fff";
+            el.style.fontSize = (parseFloat(cs.fontSize) + 1) + "px";
+            el.style.opacity = 0.85;
+          });
+
+          // GAUGES — NUMERIC LABELS
           const gaugeNums = [
             STATE.dom.gaugeNumsLeft?.start,
             STATE.dom.gaugeNumsLeft?.mid,
@@ -5897,7 +6043,7 @@
             el.style.letterSpacing = cs.letterSpacing;
             el.style.textTransform = cs.textTransform;
             el.style.lineHeight = cs.lineHeight;
-            el.style.color = cs.color;
+            el.style.color = "#fff";
             el.style.fontSize = (parseFloat(cs.fontSize) - 1) + "px";
             el.style.opacity = 0.7;
           });
@@ -5912,15 +6058,13 @@
 
       function alignTitle() {
         try {
-          const freqTitle = document.querySelector("#freq-container h2");
-          const freqPanel = document.querySelector("#freq-container");
-          if (!freqTitle || !freqPanel || !STATE.dom.title) return;
+          if (!STATE.dom.title) return;
 
-          const r1 = freqTitle.getBoundingClientRect();
-          const r2 = freqPanel.getBoundingClientRect();
           STATE.dom.title.style.margin = "0 0 0 12px";
           STATE.dom.title.style.position = "relative";
-          STATE.dom.title.style.top = r1.top - r2.top + "px";
+          STATE.dom.title.style.top = "8px";
+          STATE.dom.title.style.left = "0";
+          STATE.dom.title.style.transform = "none";
         } catch (e) {
           console.error("[AudioMetrix] alignTitle failed:", e);
         }
@@ -5973,10 +6117,7 @@
     ].forEach(safeDisconnect);
 
     ["left", "right", "audio"].forEach(k => {
-      try {
-        clearTimeout(STATE.peakTimeout[k]);
-        STATE.peakTimeout[k] = null;
-      } catch (e) {}
+      STATE.peakHoldUntil[k] = 0;
     });
   }
 
@@ -6061,15 +6202,23 @@
         return { instantDb, smoothDb };
       }
 
-      function updatePeak(instDb, peakDb, side) {
+      function updatePeak(instDb, peakDb, side, now) {
+        const minDb = CONFIG.audio.minDb;
+
+        if (!isFinite(peakDb) || peakDb === -999) {
+          peakDb = minDb;
+        }
+
         if (instDb > peakDb) {
-          clearTimeout(STATE.peakTimeout[side]);
-          STATE.peakTimeout[side] = setTimeout(() => {
-            STATE.levels[side].peakDb = CONFIG.audio.minDb;
-          }, CONFIG.audio.peakHoldMs);
+          STATE.peakHoldUntil[side] = now + CONFIG.audio.peakHoldMs;
           return instDb;
         }
-        return peakDb - CONFIG.audio.peakDecayDbPerFrame;
+
+        if ((STATE.peakHoldUntil[side] || 0) > now) {
+          return peakDb;
+        }
+
+        return Math.max(minDb, peakDb - CONFIG.audio.peakDecayDbPerFrame);
       }
 
       function initAudioSystem() {
@@ -6168,7 +6317,7 @@
             STATE.audio.analyserPeak.fftSize = CONFIG.audio.peakFftSize;
 
             STATE.audio.dataPeak = new Uint8Array(
-              STATE.audio.analyserPeak.frequencyBinCount
+              STATE.audio.analyserPeak.fftSize
             );
 
             STATE.audio.bassFilter = ctx.createBiquadFilter();
@@ -6276,29 +6425,36 @@
             baseH
           );
         }
-
+    
+        if (STATE.dom.canvasGauges) {
+          resizeCanvasIfNeeded(
+            STATE.dom.canvasGauges,
+            safeW,
+            WRAPPER_HEIGHT - 20
+          );
+        }
+    
         invalidateVisualCaches();
         requestRender();
       }
 
       // UPDATE METERS
       function updateMetersFrame() {
-        try {
-          // Wait for stereo
-          if (!STATE.audio.analyserLeft || !STATE.audio.analyserRight) {
-            RENDER_GATE.rafId = requestAnimationFrame(updateMetersFrame);
-            return;
-          }
+        if (
+          !STATE.audio ||
+          !STATE.audio.analyserLeft ||
+          !STATE.audio.analyserRight ||
+          !STATE.audio.analyserPeak
+        ) {
+          RENDER_GATE.rafId = requestAnimationFrame(updateMetersFrame);
+          return;
+        }
 
+        try {
           // Adaptive audio cadence (single decision point)
           const runAudio = shouldRunAudio();
 
           if (runAudio) {
-
-            // READ TRUE STEREO DATA (L / R)
-            STATE.audio.analyserLeft.getByteFrequencyData(STATE.audio.dataLeft);
-            STATE.audio.analyserRight.getByteFrequencyData(STATE.audio.dataRight);
-
             // READ TIME DOMAIN FOR L / R
             STATE.audio.analyserLeft.getByteTimeDomainData(STATE.audio.timeLeft);
             STATE.audio.analyserRight.getByteTimeDomainData(STATE.audio.timeRight);
@@ -6325,16 +6481,23 @@
             STATE.levels.left.smoothDb = L.smoothDb;
             STATE.levels.right.smoothDb = R.smoothDb;
 
+            const nowTs =
+              (typeof performance !== "undefined" && performance.now)
+                ? performance.now()
+                : Date.now();
+
             // PEAKS (hold + decay)
             STATE.levels.left.peakDb = updatePeak(
               L.instantDb,
               STATE.levels.left.peakDb,
-              "left"
+              "left",
+              nowTs
             );
             STATE.levels.right.peakDb = updatePeak(
               R.instantDb,
               STATE.levels.right.peakDb,
-              "right"
+              "right",
+              nowTs
             );
 
             // AUDIO PEAK (A) — RMS BAR + PPM PEAK
@@ -6362,17 +6525,27 @@
                 STATE.audioPeak.lastTs = now;
 
                 // Read TIME DOMAIN samples
-                const buf = new Uint8Array(STATE.audio.analyserPeak.fftSize);
+                const buf = STATE.audio.dataPeak;
+                if (!buf) return;
+
                 STATE.audio.analyserPeak.getByteTimeDomainData(buf);
 
                 // RMS + TRUE PEAK
                 let sumSq = 0;
                 let instPeak = 0;
 
-                for (let i = 0; i < buf.length; i++) {
-                  const v = (buf[i] - 128) / 128;
-                  sumSq += v * v;
-                  instPeak = Math.max(instPeak, Math.abs(v));
+                const len = buf.length;
+
+                for (let i = 0; i < len; i++) {
+                  let v = buf[i] - 128;
+
+                  if (v < 0) v = -v;
+
+                  const n = v / 128;
+
+                  sumSq += n * n;
+
+                  if (n > instPeak) instPeak = n;
                 }
 
                 const rms = Math.sqrt(sumSq / buf.length);
@@ -6393,21 +6566,31 @@
 
                 STATE.levels.audio.smooth = STATE.audioPeak.bar;
 
-                // PPM PEAK (ballistic, no hold timeout)
+                // AUDIO PEAK LINE — use the same hold/decay logic as L/R
                 const targetPeak = Math.min(255, instPeak * 255 * SCALE);
 
-                if (targetPeak > STATE.audioPeak.ppm) {
-                  // PPM attack
-                  STATE.audioPeak.ppm +=
-                    (targetPeak - STATE.audioPeak.ppm) * CONFIG.audio.attackSpeed;
-                } else {
-                  // PPM release — linear fall toward target
-                  STATE.audioPeak.ppm +=
-                    (targetPeak - STATE.audioPeak.ppm) * CONFIG.audio.releaseSpeed;
-                }
+                const minDbA = CONFIG.audio.minDb;
+                const maxDbA = CONFIG.audio.maxDb;
+                const rangeA = maxDbA - minDbA;
 
-                STATE.levels.audio.peak = STATE.audioPeak.ppm;
+                const instPeakDb =
+                  minDbA + (targetPeak / 255) * rangeA;
 
+                const prevPeakDb =
+                  isFinite(STATE.audioPeak.peakDb)
+                    ? STATE.audioPeak.peakDb
+                    : minDbA;
+
+                const nextPeakDb =
+                  updatePeak(instPeakDb, prevPeakDb, "audio", now);
+
+                STATE.audioPeak.peakDb = nextPeakDb;
+
+                STATE.levels.audio.peak =
+                  Math.max(
+                    0,
+                    Math.min(255, ((nextPeakDb - minDbA) / rangeA) * 255)
+                  );
               }
             }
 
@@ -6631,6 +6814,14 @@
 
             if (CONFIG.display.showReadouts && STATE.dom.readouts) {
 
+              const setReadoutText = (el, text) => {
+                if (!el) return;
+                const next = text == null ? "" : String(text);
+                if (el.textContent !== next) {
+                  el.textContent = next;
+                }
+              };
+
               const layout = CONFIG.display.layoutMode;
               const minDb  = CONFIG.audio.minDb;
 
@@ -6646,10 +6837,10 @@
                 : 0;
 
               // Real transport state from FM-DX 3LAS frontend
-              const streamIsRunning =
+              const hasStreamObject =
                 (typeof Stream !== "undefined" && Stream !== null);
 
-              const active = streamIsRunning;
+              const active = hasStreamObject;
 
               // Helper for dB formatting on minDb
               const formatDb = (val) => {
@@ -6665,12 +6856,12 @@
 
                 if (!active) {
                   // STOP → hide all
-                  STATE.dom.readouts.L.textContent = "";
-                  STATE.dom.readouts.R.textContent = "";
+                  setReadoutText(STATE.dom.readouts.L, "");
+                  setReadoutText(STATE.dom.readouts.R, "");
                 } else {
                   // PLAY → show all
-                  STATE.dom.readouts.L.textContent = formatDb(lNow);
-                  STATE.dom.readouts.R.textContent = formatDb(rNow);
+                  setReadoutText(STATE.dom.readouts.L, formatDb(lNow));
+                  setReadoutText(STATE.dom.readouts.R, formatDb(rNow));
                 }
               }
 
@@ -6681,29 +6872,33 @@
 
                 if (!active) {
                   // STOP → hide Q/A
-                  STATE.dom.readouts.Q.textContent = "";
-                  STATE.dom.readouts.A.textContent = "";
+                  setReadoutText(STATE.dom.readouts.Q, "");
+                  setReadoutText(STATE.dom.readouts.A, "");
 
                   // On FULL hide L/R
                   if (layout === "full") {
-                    STATE.dom.readouts.L.textContent = "";
-                    STATE.dom.readouts.R.textContent = "";
+                    setReadoutText(STATE.dom.readouts.L, "");
+                    setReadoutText(STATE.dom.readouts.R, "");
                   }
                 } else {
                   // PLAYING
                   const q = getCurrentReadout("Q");
-                  STATE.dom.readouts.Q.textContent =
-                    (q !== null && q > 0.5) ? `${q.toFixed(0)} %` : "0%";
+                  setReadoutText(
+                    STATE.dom.readouts.Q,
+                    (q !== null && q > 0.5) ? `${q.toFixed(0)} %` : "0%"
+                  );
 
                   const aClamped = Math.max(0, Math.min(255, aRaw));
                   const aPct = (aClamped / 255) * 100;
-                  STATE.dom.readouts.A.textContent =
-                    (aRaw > 1) ? `${Math.round(aPct)} %` : "0%";
+                  setReadoutText(
+                    STATE.dom.readouts.A,
+                    (aRaw > 1) ? `${Math.round(aPct)} %` : "0%"
+                  );
 
                   // FULL layout
                   if (layout === "full") {
-                    STATE.dom.readouts.L.textContent = formatDb(lNow);
-                    STATE.dom.readouts.R.textContent = formatDb(rNow);
+                    setReadoutText(STATE.dom.readouts.L, formatDb(lNow));
+                    setReadoutText(STATE.dom.readouts.R, formatDb(rNow));
                   }
                 }
               }
@@ -6716,24 +6911,50 @@
       }
 
       // AUTO REBIND WHEN FM-DX RECREATES AUDIO NODES
+      const AUTO_REBIND_INTERVAL_MS = 1000;
       let last = null;
+
       setInterval(() => {
         try {
-          if (
+          const hasStream =
             typeof Stream !== "undefined" &&
             Stream?.Fallback?.Player?.Amplification &&
-            Stream?.Fallback?.Audio
+            Stream?.Fallback?.Audio;
+
+          if (!hasStream) {
+            last = null;
+            return;
+          }
+
+          const node = Stream.Fallback.Player.Amplification;
+          const ctx  = Stream.Fallback.Audio;
+
+          if (!node || !ctx) {
+            last = null;
+            return;
+          }
+
+          if (node !== last) {
+            last = node;
+            stopRenderingLoop();
+            resetAudioState();
+            initAudioSystem();
+            return;
+          }
+
+          if (
+            !STATE.audio ||
+            !STATE.audio.context ||
+            !STATE.audio.source ||
+            !STATE.audio.analyserLeft ||
+            !STATE.audio.analyserRight
           ) {
-            const node = Stream.Fallback.Player.Amplification;
-            if (node !== last) {
-              last = node;
-              stopRenderingLoop();
-              resetAudioState();
-              initAudioSystem();
-            }
+            stopRenderingLoop();
+            resetAudioState();
+            initAudioSystem();
           }
         } catch (e) {}
-      }, 1000);
+      }, AUTO_REBIND_INTERVAL_MS);
 
       // Log + internal update check (panel + console)
       console.log(`[AudioMetrix] Loaded v${AMX_VERSION}`);

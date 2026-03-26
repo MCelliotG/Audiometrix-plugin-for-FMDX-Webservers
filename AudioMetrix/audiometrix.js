@@ -6,7 +6,7 @@
 
   // PLUGIN METADATA
   const AMX_PLUGIN_NAME        = "AudioMetrix";
-  const AMX_VERSION            = "3.7";
+  const AMX_VERSION            = "3.8";
   const AMX_CHECK_FOR_UPDATES  = true;
   const AMX_UPDATE_URL         =
     "https://raw.githubusercontent.com/MCelliotG/Audiometrix-plugin-for-FMDX-Webservers/main/AudioMetrix/audiometrix.js";

@@ -1824,7 +1824,7 @@ function saveAMXPanelGeometry(panel) {
       if (!target) return false;
   
       return !!target.closest(
-        'input, select, textarea, button, a, label, option, [data-amx-no-drag], .amx-resize-handle'
+        'input, select, textarea, button, a, label, option, [data-amx-no-drag], .amx-resize-handle, .dropdown, .options, .option, .form-control'
       );
     }
   

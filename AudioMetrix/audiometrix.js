@@ -6,7 +6,7 @@
 
   // PLUGIN METADATA
   const AMX_PLUGIN_NAME        = "AudioMetrix";
-  const AMX_VERSION            = "3.8";
+  const AMX_VERSION            = "3.9";
   const AMX_CHECK_FOR_UPDATES  = true;
   const AMX_UPDATE_URL         =
     "https://raw.githubusercontent.com/MCelliotG/Audiometrix-plugin-for-FMDX-Webservers/main/AudioMetrix/audiometrix.js";
@@ -79,8 +79,9 @@
     GRADIENT_CACHE.stops = [];
     GRADIENT_CACHE.peakThresholdX = -1;
     GRADIENT_CACHE.hash = "";
-    GRADIENT_CACHE.ctx = null;
-    GRADIENT_CACHE_MAP.clear();
+    if (GRADIENT_CACHE_MAP.size) {
+      GRADIENT_CACHE_MAP.clear();
+    }
 
     // Pillars geometry
     STATE.cache.pillar.path = null;
@@ -105,6 +106,7 @@
   const STORAGE_PANEL_TOP     = "AMX_PANEL_TOP";
   const STORAGE_PANEL_WIDTH   = "AMX_PANEL_WIDTH";
   const STORAGE_PANEL_HEIGHT  = "AMX_PANEL_HEIGHT";
+  const MIRRORED_LAYOUTS = ["lr", "sa", "full"];
   const AMX_DEBUG             = false;
 
   // HARDENED LOCAL STORAGE HELPERS
@@ -356,10 +358,8 @@
     // STATE INIT (separate for bars / gauges)
     if (!STATE.render) STATE.render = {};
 
-    const tf =
-      (ctx && typeof ctx.getTransform === "function")
-        ? ctx.getTransform()
-        : null;
+    const tf = (typeof ctx.getTransform === "function")
+      ? ctx.getTransform() : null;
 
     const tx = tf ? Math.round(tf.e) : 0;
     const ty = tf ? Math.round(tf.f) : 0;
@@ -497,7 +497,7 @@
   }
 
   // UNIFIED BARS GRADIENT ENGINE — pixel-accurate
-  function buildBarsGradient(mode, width, y = 0) {
+  function buildBarsGradient(mode, width) {
 
     // 1) Theme colors
     const col  = ACTIVE_THEME.colors;
@@ -509,13 +509,7 @@
     const YELLOW_ZONE_COLOR = "#ffd400"; // stereo quality
 
     // 2) Threshold selector
-    let THR;
-
-    if (mode === 2) {
-      THR = 0.74;
-    } else {
-      THR = 0.58;
-    }
+    const THR = (mode === 2) ? 0.74 : 0.58;
 
     const t   = THR;
     const t1  = t - 0.001;
@@ -724,10 +718,7 @@
       add(0.999999, high);
     }
 
-    const seamColor =
-      (mode === 2) ? high :
-      (mode === 1) ? low  :
-      low;
+    const seamColor = (mode === 2) ? high : low;
 
     g.addColorStop(1.0, seamColor);
 
@@ -2443,14 +2434,17 @@ function saveAMXPanelGeometry(panel) {
       bindDropdown(layoutInput, "#amx-layout-options", (val) => {
         CONFIG.display.layoutMode = val;
         safeLSSet("AMX_LAYOUT_MODE", val);
-
-        if (CONFIG.display.renderMode === "mirrored" && val !== "lr" && val !== "sa") {
+      
+        if (
+          CONFIG.display.renderMode === "mirrored" &&
+          !MIRRORED_LAYOUTS.includes(val)
+        ) {
           CONFIG.display.renderMode = "bars";
           safeLSSet("AMX_RENDER_MODE", "bars");
           const renderInput = document.getElementById("amx-render-input");
           if (renderInput) renderInput.value = "Bars";
         }
-
+      
         invalidateVisualCaches();
         updateMirroredCanvasHeight();
         requestRender();
@@ -2482,19 +2476,18 @@ function saveAMXPanelGeometry(panel) {
       bindDropdown(renderInput, "#amx-render-options", (val) => {
         if (
           val === "mirrored" &&
-          CONFIG.display.layoutMode !== "lr" &&
-          CONFIG.display.layoutMode !== "sa"
+          !MIRRORED_LAYOUTS.includes(CONFIG.display.layoutMode)
         ) {
           showAMXSoftMessage(
-            "Mirrored mode is only available when Layout Mode is set to Stereo Bars or Stereo Quality/Audio Peak.",
+            "Mirrored mode is only available when Layout Mode is set to Stereo Bars, Stereo Quality/Audio Peak, or Full.",
             "fa-triangle-exclamation"
           );
-
+        
           renderInput.value =
             CONFIG.display.renderMode === "bars" ? "Bars" :
             CONFIG.display.renderMode === "gauges" ? "Gauges" :
             "Mirrored";
-
+        
           return;
         }
 
@@ -2833,33 +2826,13 @@ function saveAMXPanelGeometry(panel) {
     if (canvas.style.height !== sh) canvas.style.height = sh;
   }
 
-  function getMirroredCanvasHeight() {
-    const barH = CONFIG.display.dimensions.barHeight;
-    const gap = CONFIG.display.dimensions.spacing;
-
-    if (CONFIG.display.barStyle === "circledots") {
-      return barH * 3.2;
-    } else if (CONFIG.display.barStyle === "matrixdots") {
-      return barH * 3.6;
-    }
-
-    return barH * 2 + gap + 15;
-  }
-
   function updateMirroredCanvasHeight() {
     const cm = STATE.dom.canvasMirror;
     if (!cm) return;
 
-    const barH = CONFIG.display.dimensions.barHeight;
-    const style = CONFIG.display.barStyle;
-    const h = getMirroredCanvasHeight();
-
-    let offsetY = 0;
-    if (style === "circledots") {
-      offsetY = -Math.round(barH * 0.32);
-    } else if (style === "matrixdots") {
-      offsetY = -Math.round(barH * 0.22);
-    }
+    const metrics = getMirroredLayoutMetrics();
+    const h = metrics.singlePanelHeight;
+    const offsetY = metrics.canvasOffsetY;
 
     const nextH = h + "px";
     const nextMinH = h + "px";
@@ -2877,6 +2850,88 @@ function saveAMXPanelGeometry(panel) {
     }
   }
 
+  function getFullMirroredMetrics() {
+    const barH = CONFIG.display.dimensions.barHeight;
+    const gap = CONFIG.display.dimensions.spacing;
+    const extraScaleBand = 18;
+
+    // Fixed overlay reference height so labels/readouts stay stable
+    // across all styles, including circledots and matrixdots.
+    const height_mirrored = barH * 2 + gap + 15 + extraScaleBand;
+
+    const mirrorHeightTrim = 16;
+    const rowGap = 8;
+    const mirroredYOffset = Math.floor(mirrorHeightTrim / 2);
+    const singleRowHeight =
+      Math.floor((height_mirrored - mirrorHeightTrim - rowGap) / 2);
+
+    const baseTopCenter =
+      Math.floor(mirroredYOffset + singleRowHeight / 2);
+
+    const baseBottomCenter =
+      Math.floor(singleRowHeight + rowGap + mirroredYOffset + singleRowHeight / 2);
+
+    const topCenterY = baseTopCenter + 4;
+    const bottomCenterY = baseBottomCenter + 6;
+
+    const readoutTopY = baseTopCenter + 8;
+    const readoutBottomY = baseBottomCenter + 8;
+
+    return {
+      height_mirrored,
+      mirrorHeightTrim,
+      rowGap,
+      mirroredYOffset,
+      singleRowHeight,
+      topCenterY,
+      bottomCenterY,
+      readoutTopY,
+      readoutBottomY
+    };
+  }
+
+  function getMirroredLayoutMetrics() {
+    const barH = CONFIG.display.dimensions.barHeight;
+    const gap = CONFIG.display.dimensions.spacing;
+    const style = CONFIG.display.barStyle;
+    const extraScaleBand = 18;
+
+    const CircleDots = style === "circledots";
+    const MatrixDots = style === "matrixdots";
+
+    let singlePanelHeight;
+    if (CircleDots) {
+      singlePanelHeight = Math.round(barH * 3.2) + extraScaleBand;
+    } else if (MatrixDots) {
+      singlePanelHeight = Math.round(barH * 3.6) + extraScaleBand;
+    } else {
+      singlePanelHeight = barH * 2 + gap + 15 + extraScaleBand;
+    }
+
+    let canvasOffsetY = 0;
+    if (CircleDots) {
+      canvasOffsetY = -Math.round(barH * 0.32);
+    } else if (MatrixDots) {
+      canvasOffsetY = -Math.round(barH * 0.22);
+    }
+
+    let mirrorHeightTrim = 16;
+    if (CircleDots || MatrixDots) {
+      mirrorHeightTrim = 12;
+    }
+
+    const mirroredBarH = singlePanelHeight - mirrorHeightTrim;
+    const mirroredYOffset = Math.floor(mirrorHeightTrim / 2);
+
+    return {
+      singlePanelHeight,
+      canvasOffsetY,
+      mirrorHeightTrim,
+      mirroredBarH,
+      mirroredYOffset
+    };
+  }
+
   // MAP DB → X ABSOLUTE POSITION
   function mapDbToX(db, width) {
     const min = CONFIG.audio.minDb;
@@ -2888,13 +2943,16 @@ function saveAMXPanelGeometry(panel) {
 
   // EFFECTIVE WIDTH
   function getEffectiveBarWidth(width) {
+    const display = CONFIG.display;
+
     if (
-      CONFIG.display.renderMode === "mirrored" &&
-      (CONFIG.display.layoutMode === "lr" || CONFIG.display.layoutMode === "sa")
+      display.renderMode === "mirrored" &&
+      MIRRORED_LAYOUTS.includes(display.layoutMode)
     ) {
       return width;
     }
-    return width - CONFIG.display.dimensions.canvasLeft - 5;
+
+    return width - display.dimensions.canvasLeft - 5;
   }
 
   // CLAMPING
@@ -2966,7 +3024,7 @@ function saveAMXPanelGeometry(panel) {
     const baseY = INNER_BASE_TOP;
     const xOut  = "calc(100% - 6px)";
 
-    const useMirrored = render === "mirrored" && (layout === "lr" || layout === "sa");
+    const useMirrored = render === "mirrored" && MIRRORED_LAYOUTS.includes(layout);
 
     // 1) HIDE ALL FIRST (prevents 0,0 bleed)
     Object.values(readouts).forEach(el => {
@@ -2998,14 +3056,41 @@ function saveAMXPanelGeometry(panel) {
 
     // 2) MIRRORED — outside of bars
     if (useMirrored) {
-      const y = (INNER_BASE_TOP + barH * 0.9) + "px";
+      let leftTopKey, rightTopKey, leftBottomKey, rightBottomKey;
+      let yTop, yBottom;
 
-      if (layout === "sa") {
-        showAt("Q", "6px", y, "translate(0, -70%)");
-        showAt("A", xOut, y, "translate(-100%, -70%)");
+      if (layout === "full") {
+        const metrics = getFullMirroredMetrics();
+
+        yTop = metrics.readoutTopY + "px";
+        yBottom = metrics.readoutBottomY + "px";
+
+        leftTopKey = "L";
+        rightTopKey = "R";
+        leftBottomKey = "Q";
+        rightBottomKey = "A";
+
       } else {
-        showAt("L", "6px", y, "translate(0, -70%)");
-        showAt("R", xOut, y, "translate(-100%, -70%)");
+        const y = (INNER_BASE_TOP + barH * 1.28) + "px";
+
+        yTop = y;
+        yBottom = null;
+
+        if (layout === "sa") {
+          leftTopKey = "Q";
+          rightTopKey = "A";
+        } else {
+          leftTopKey = "L";
+          rightTopKey = "R";
+        }
+      }
+
+      showAt(leftTopKey, "6px", yTop, "translate(0, -70%)");
+      showAt(rightTopKey, xOut, yTop, "translate(-100%, -70%)");
+
+      if (yBottom !== null) {
+        showAt(leftBottomKey, "6px", yBottom, "translate(0, -70%)");
+        showAt(rightBottomKey, xOut, yBottom, "translate(-100%, -70%)");
       }
 
       return;
@@ -3246,7 +3331,6 @@ function saveAMXPanelGeometry(panel) {
 
     const effectiveW = getEffectiveBarWidth(width);
     const barW       = Math.max(0, effectiveW - 5);
-    const hasSignal  = levelX > 0;
     const glowIntensity = CONFIG.display.glowIntensity;
 
     if (!gcache || !gcache.colors || !gcache.colors.length) {
@@ -3255,7 +3339,7 @@ function saveAMXPanelGeometry(panel) {
     }
 
     const minLevel = Math.min(levelX, barW);
-    if (!hasSignal || minLevel <= 0) {
+    if (minLevel <= 0) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
     }
@@ -3325,7 +3409,6 @@ function saveAMXPanelGeometry(panel) {
   function renderSegment(ctx, levelX, peakX, y, height, width, gcache) {
     const effectiveW = getEffectiveBarWidth(width);
     const barW = Math.max(0, effectiveW - 5);
-    const hasSignal = levelX > 0;
     const segGap = 2;
     const glowIntensity = CONFIG.display.glowIntensity;
 
@@ -3344,15 +3427,13 @@ function saveAMXPanelGeometry(panel) {
       return;
     }
 
-    // MIRRORED MODE (2 ROWS)
-    if (
-      CONFIG.display.renderMode === "mirrored" &&
-      (CONFIG.display.layoutMode === "lr" ||
-        CONFIG.display.layoutMode === "sa")
-    ) {
-      const rows = 2;
+    // MIRRORED MODE (LR/SA = 2 ROWS, FULL = 1 ROW)
+    if (CONFIG.display.renderMode === "mirrored" && MIRRORED_LAYOUTS.includes(CONFIG.display.layoutMode))
+      {
+      const isFullMirrored = CONFIG.display.layoutMode === "full";
+      const rows = isFullMirrored ? 1 : 2;
       const rowGap = 8;
-      const rowH = Math.floor((height - rowGap) / 2);
+      const rowH = isFullMirrored ? height : Math.floor((height - rowGap) / 2);
 
       const segW = Math.max(2, Math.floor(rowH / 3.2));
       const minLevel = Math.min(levelX, barW);
@@ -3369,12 +3450,12 @@ function saveAMXPanelGeometry(panel) {
       }
 
       for (let r = 0; r < rows; r++) {
-        const ry = y + r * (rowH + rowGap);
+        const ry = isFullMirrored ? y : y + r * (rowH + rowGap);
 
         // static glass layer
         drawSegmentGlassLayer(ctx, ry, rowH, barW, segW, segGap);
 
-        if (hasSignal) {
+        if (minLevel > 0) {
           for (let i = 0; i < xs.length; i++) {
             const x = xs[i];
             if (x + segW > minLevel) break;
@@ -3423,7 +3504,7 @@ function saveAMXPanelGeometry(panel) {
       }
 
       for (let r = 0; r < rows; r++) {
-        const ry = y + r * (rowH + rowGap);
+        const ry = isFullMirrored ? y : y + r * (rowH + rowGap);
         drawExternalPeak(
           ctx,
           levelX,
@@ -3458,7 +3539,7 @@ function saveAMXPanelGeometry(panel) {
     // static glass layer
     drawSegmentGlassLayer(ctx, y, segH, barW, segW, segGap);
 
-    if (hasSignal) {
+    if (minLevel > 0) {
       for (let i = 0; i < xs.length; i++) {
         const x = xs[i];
         if (x + segW > minLevel) break;
@@ -3514,6 +3595,11 @@ function saveAMXPanelGeometry(panel) {
 
     const effectiveW = getEffectiveBarWidth(width);
     const glowIntensity = CONFIG.display.glowIntensity;
+    const renderMode = CONFIG.display.renderMode;
+    const layoutMode = CONFIG.display.layoutMode;
+    const isMirrored = renderMode === "mirrored";
+    const isMirroredLRSA = isMirrored && (layoutMode === "lr" || layoutMode === "sa");
+    const peakYOffset = isMirrored ? 8 : 0;
 
     if (levelX <= 0) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
@@ -3525,25 +3611,21 @@ function saveAMXPanelGeometry(panel) {
       return;
     }
 
-    // MIRRORED MODE (2 rows)
-    if (
-      CONFIG.display.renderMode === "mirrored" &&
-      (CONFIG.display.layoutMode === "lr" ||
-        CONFIG.display.layoutMode === "sa")
-    ) {
+    if (!GEOMETRY_CACHE.circledots) GEOMETRY_CACHE.circledots = new Map();
 
+    // MIRRORED MODE (2 rows) — only for LR / SA
+    if (isMirroredLRSA) {
       const padding = 2;
-      const radius  = Math.max(2, (height / 4) - (padding + 3));
+      const radius  = Math.max(2, Math.floor((height / 4) - (padding + 3)));
       const gapX    = radius * 2 + 4;
 
-      const row1Y = y + height * 0.40;
-      const row2Y = y + height * 0.80;
+      const row1Y = Math.round(y + height * 0.40);
+      const row2Y = Math.round(y + height * 0.80);
 
       const minLevel = Math.min(levelX, effectiveW);
 
       // cache geometry
       const KEY = `${effectiveW}|${radius}|${gapX}|mirrored`;
-      if (!GEOMETRY_CACHE.circledots) GEOMETRY_CACHE.circledots = new Map();
       let xs = GEOMETRY_CACHE.circledots.get(KEY);
 
       if (!xs) {
@@ -3602,20 +3684,23 @@ function saveAMXPanelGeometry(panel) {
         }
       }
 
-      drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
+      drawExternalPeak(ctx, levelX, peakX, y + peakYOffset, height, effectiveW);
       return;
     }
 
     // NORMAL MODE
-    const radius  = Math.max(3, Math.floor(height * 0.54));
+    const dotBaseHeight =
+      (isMirrored && layoutMode === "full")
+        ? CONFIG.display.dimensions.barHeight : height;
+
+    const radius  = Math.max(3, Math.floor(dotBaseHeight * 0.54));
     const gap     = 4;
     const stepX   = radius * 2 + gap;
-    const cy      = y + height / 2;
+    const cy = y + height / 2 + peakYOffset;
 
     const minLevel = Math.min(levelX, effectiveW);
 
     const KEY = `${effectiveW}|${radius}|${stepX}|normal`;
-    if (!GEOMETRY_CACHE.circledots) GEOMETRY_CACHE.circledots = new Map();
     let xs = GEOMETRY_CACHE.circledots.get(KEY);
 
     if (!xs) {
@@ -3668,7 +3753,7 @@ function saveAMXPanelGeometry(panel) {
       }
     }
 
-    drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
+    drawExternalPeak(ctx, levelX, peakX, y + peakYOffset, height, effectiveW);
   }
 
   // 4) MATRIX DOTS
@@ -3676,6 +3761,11 @@ function saveAMXPanelGeometry(panel) {
   function renderMatrixdots(ctx, levelX, peakX, y, height, width, gcache) {
     const effectiveW = getEffectiveBarWidth(width);
     const glowIntensity = CONFIG.display.glowIntensity;
+    const renderMode = CONFIG.display.renderMode;
+    const layoutMode = CONFIG.display.layoutMode;
+    const isMirrored = renderMode === "mirrored";
+    const isMirroredLRSA = isMirrored && (layoutMode === "lr" || layoutMode === "sa");
+    const isFullMirrored = isMirrored && layoutMode === "full";
 
     if (levelX <= 0) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
@@ -3689,12 +3779,10 @@ function saveAMXPanelGeometry(panel) {
 
     const minLevel = Math.min(levelX, effectiveW);
 
-    // MIRRORED MODE (WEDGE)
-    if (
-      CONFIG.display.renderMode === "mirrored" &&
-      (CONFIG.display.layoutMode === "lr" ||
-        CONFIG.display.layoutMode === "sa")
-    ) {
+    if (!GEOMETRY_CACHE.matrixdots) GEOMETRY_CACHE.matrixdots = new Map();
+
+    // MIRRORED MODE (WEDGE) — only for LR / SA
+    if (isMirroredLRSA) {
       const padY = 2;
       const maxR = Math.max(2, Math.floor((height - padY * 2) / 20));
       const radius = Math.max(2, Math.min(maxR, Math.floor(height * 0.085)));
@@ -3706,7 +3794,6 @@ function saveAMXPanelGeometry(panel) {
       const KEY = `${effectiveW}|${radius}|${stepX}|mirrored_matrix`;
 
       // Precompute X positions
-      if (!GEOMETRY_CACHE.matrixdots) GEOMETRY_CACHE.matrixdots = new Map();
       let xs = GEOMETRY_CACHE.matrixdots.get(KEY);
 
       if (!xs) {
@@ -3779,15 +3866,23 @@ function saveAMXPanelGeometry(panel) {
     }
 
     // NORMAL MODE (2 ROWS — ORIGINAL GEOMETRY)
-    const radius = Math.max(2, Math.round(height * 0.19));
+    const visualHeight = isFullMirrored
+      ? CONFIG.display.dimensions.barHeight
+      : height;
+
+    const radius = Math.max(2, Math.round(visualHeight * 0.19));
     const gapX = radius * 2 + 2;
 
-    const row1Y = y + height * 0.28;
-    const row2Y = y + height * 0.72;
+    const matrixYOffset = isFullMirrored ? 6 : 0;
+    const visualTop = isFullMirrored
+      ? y + Math.floor((height - visualHeight) / 2) + matrixYOffset
+      : y;
+
+    const row1Y = visualTop + visualHeight * 0.28;
+    const row2Y = visualTop + visualHeight * 0.72;
 
     const KEY = `${effectiveW}|${radius}|${gapX}|normal_matrix`;
 
-    if (!GEOMETRY_CACHE.matrixdots) GEOMETRY_CACHE.matrixdots = new Map();
     let xs2 = GEOMETRY_CACHE.matrixdots.get(KEY);
 
     if (!xs2) {
@@ -3797,10 +3892,10 @@ function saveAMXPanelGeometry(panel) {
     }
 
     // Glow constants precomputed
-    const doGlow2 = glowIntensity > 0;
-    const glowAlpha2 = 0.38 * glowIntensity;
-    const glowBlur2 = 5.5;
-    const glowR2 = radius + 1.9;
+    const doGlow = glowIntensity > 0;
+    const glowAlpha = 0.38 * glowIntensity;
+    const glowBlur = 5.5;
+    const glowR = radius + 1.9;
 
     // DRAW — EXACTLY LIKE THE ORIGINAL: 2 FIXED ROWS
     for (let i = 0; i < xs2.length; i++) {
@@ -3817,13 +3912,13 @@ function saveAMXPanelGeometry(panel) {
       ctx.arc(x, row1Y, radius, 0, Math.PI * 2);
       ctx.fill();
 
-      if (doGlow2) {
+      if (doGlow) {
         ctx.save();
-        ctx.globalAlpha = glowAlpha2;
-        ctx.filter = `blur(${glowBlur2}px)`;
+        ctx.globalAlpha = glowAlpha;
+        ctx.filter = `blur(${glowBlur}px)`;
         ctx.fillStyle = c;
         ctx.beginPath();
-        ctx.arc(x, row1Y, glowR2, 0, Math.PI * 2);
+        ctx.arc(x, row1Y, glowR, 0, Math.PI * 2);
         ctx.fill();
         ctx.restore();
       }
@@ -3834,19 +3929,19 @@ function saveAMXPanelGeometry(panel) {
       ctx.arc(x, row2Y, radius, 0, Math.PI * 2);
       ctx.fill();
 
-      if (doGlow2) {
+      if (doGlow) {
         ctx.save();
-        ctx.globalAlpha = glowAlpha2;
-        ctx.filter = `blur(${glowBlur2}px)`;
+        ctx.globalAlpha = glowAlpha;
+        ctx.filter = `blur(${glowBlur}px)`;
         ctx.fillStyle = c;
         ctx.beginPath();
-        ctx.arc(x, row2Y, glowR2, 0, Math.PI * 2);
+        ctx.arc(x, row2Y, glowR, 0, Math.PI * 2);
         ctx.fill();
         ctx.restore();
       }
     }
 
-    drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
+    drawExternalPeak(ctx, levelX, peakX, isFullMirrored ? y + matrixYOffset : y, height, effectiveW);
   }
 
   // 5) TRIANGLE PILLARS
@@ -3854,8 +3949,7 @@ function saveAMXPanelGeometry(panel) {
   function renderPillars(ctx, levelX, peakX, y, height, width, gcache) {
 
     const effectiveW = getEffectiveBarWidth(width);
-    const hasSignal = levelX > 1;
-    const fillX = hasSignal ? Math.min(levelX, effectiveW) : 0;
+    const fillX = levelX > 1 ? Math.min(levelX, effectiveW) : 0;
     const glowIntensity = CONFIG.display.glowIntensity;
 
     if (!gcache || !gcache.colors || !gcache.colors.length) {
@@ -4077,12 +4171,13 @@ function saveAMXPanelGeometry(panel) {
   // -------------
   function renderBeveled3D(ctx, levelX, peakX, y, height, width, gcache) {
 
-    const effectiveW =
-      (CONFIG.display.renderMode === "mirrored" &&
-       (CONFIG.display.layoutMode === "lr" ||
-        CONFIG.display.layoutMode === "sa"))
-        ? width
-        : getEffectiveBarWidth(width);
+    const renderMode = CONFIG.display.renderMode;
+    const layoutMode = CONFIG.display.layoutMode;
+    const isMirrored = renderMode === "mirrored" && MIRRORED_LAYOUTS.includes(layoutMode);
+
+    const effectiveW = isMirrored
+      ? width
+      : getEffectiveBarWidth(width);
 
     const fillW = Math.max(0, Math.min(levelX, effectiveW));
     const glowIntensity = CONFIG.display.glowIntensity;
@@ -4278,17 +4373,20 @@ function saveAMXPanelGeometry(panel) {
       ctx.restore();
     }
 
-    // MIRRORED MODE → 2 ROWS
-    if (CONFIG.display.renderMode === "mirrored" &&
-      (CONFIG.display.layoutMode === "lr" ||
-        CONFIG.display.layoutMode === "sa")
-    ) {
+    // MIRRORED MODE → LR/SA = 2 ROWS, FULL = 1 ROW
+    if (isMirrored) {
+      const isFullMirrored = layoutMode === "full";
 
-      const gap = 8;
-      const rowH = Math.floor((height - gap) / 2);
+      if (isFullMirrored) {
+        drawRow(y, height);
+      } else {
+        const gap = 8;
+        const rowH = Math.floor((height - gap) / 2);
 
-      drawRow(y, rowH);
-      drawRow(y + rowH + gap, rowH);
+        drawRow(y, rowH);
+        drawRow(y + rowH + gap, rowH);
+      }
+
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
     }
@@ -4302,12 +4400,13 @@ function saveAMXPanelGeometry(panel) {
   // -------------
   function renderGlassTube(ctx, levelX, peakX, y, height, width, gcache) {
 
-    const effectiveW =
-      (CONFIG.display.renderMode === "mirrored" &&
-       (CONFIG.display.layoutMode === "lr" ||
-        CONFIG.display.layoutMode === "sa"))
-        ? width
-        : getEffectiveBarWidth(width);
+    const renderMode = CONFIG.display.renderMode;
+    const layoutMode = CONFIG.display.layoutMode;
+    const isMirrored = renderMode === "mirrored" && MIRRORED_LAYOUTS.includes(layoutMode);
+
+    const effectiveW = isMirrored
+      ? width
+      : getEffectiveBarWidth(width);
 
     const glowIntensity = CONFIG.display.glowIntensity;
     const drawTubeRow = (ry, rh) => {
@@ -4427,7 +4526,7 @@ function saveAMXPanelGeometry(panel) {
         const glassColor = gcache.colors[sampleX];
         const fillRatio  = Math.min(fillW / effectiveW, 1);
 
-        const tintA = 0.08 + fillRatio * 0.16;   // slightly stronger
+        const tintA = 0.08 + fillRatio * 0.16;
 
         ctx.save();
         ctx.clip(tubePath);
@@ -4526,17 +4625,19 @@ function saveAMXPanelGeometry(panel) {
       ctx.restore();
     };
 
-    // MIRRORED MODE
-    if (CONFIG.display.renderMode === "mirrored" &&
-      (CONFIG.display.layoutMode === "lr" ||
-        CONFIG.display.layoutMode === "sa")
-    ) {
+    // MIRRORED MODE → LR/SA = 2 ROWS, FULL = 1 ROW
+    if (isMirrored) {
+      const isFullMirrored = layoutMode === "full";
 
-      const gap = 8;
-      const rowH = Math.floor((height - gap) / 2);
+      if (isFullMirrored) {
+        drawTubeRow(y, height);
+      } else {
+        const gap = 8;
+        const rowH = Math.floor((height - gap) / 2);
 
-      drawTubeRow(y, rowH);
-      drawTubeRow(y + rowH + gap, rowH);
+        drawTubeRow(y, rowH);
+        drawTubeRow(y + rowH + gap, rowH);
+      }
 
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
@@ -4648,10 +4749,6 @@ function saveAMXPanelGeometry(panel) {
     const minDb = CONFIG.audio.minDb;
     const maxDb = CONFIG.audio.maxDb;
     const range = maxDb - minDb;
-    const stereoQualityLevels = STATE.levels.stereoQuality;
-    const audioLevels = STATE.levels.audio;
-    const q = stereoQualityLevels.smooth;
-    const qSmoothDb = mapStereoQualityToDb(q, minDb, range);
 
     FRAME_GRADIENT_CACHE.clear();
 
@@ -4666,16 +4763,12 @@ function saveAMXPanelGeometry(panel) {
       applyVisualState();
     }
 
-    const useMirrored =
-      render === "mirrored" &&
-      (layout === "lr" || layout === "sa");
-
-    if (useMirrored) {
-      updateMirroredCanvasHeight();
-    }
+    const useMirrored = render === "mirrored" && MIRRORED_LAYOUTS.includes(layout);
+    const mirrorMetrics = useMirrored ? getMirroredLayoutMetrics() : null;
 
     const ctx    = STATE.dom.ctx;
     const canvas = STATE.dom.canvas;
+    const contentWrapper = STATE.dom.contentWrapper;
     if (!ctx || !canvas) return;
 
     const width = canvas.width;
@@ -4689,26 +4782,34 @@ function saveAMXPanelGeometry(panel) {
       return;
     }
 
-    // MIRRORED MODE (LR ONLY)
+    // MIRRORED MODE
     if (useMirrored) {
-      const height_mirrored = getMirroredCanvasHeight();
+      const height_mirrored = mirrorMetrics.singlePanelHeight;
       const nextHeight = height_mirrored + "px";
-
+      const nextMinHeight = height_mirrored + "px";
+      const nextTransform =
+        mirrorMetrics.canvasOffsetY !== 0
+          ? `translateY(${mirrorMetrics.canvasOffsetY}px)`
+          : "";
+    
       if (canvas.height !== height_mirrored) {
         canvas.height = height_mirrored;
       }
       if (canvas.style.height !== nextHeight) {
         canvas.style.height = nextHeight;
       }
-
+      if (canvas.style.minHeight !== nextMinHeight) {
+        canvas.style.minHeight = nextMinHeight;
+      }
+      if (canvas.style.transform !== nextTransform) {
+        canvas.style.transform = nextTransform;
+      }
+    
       ctx.clearRect(0, 0, width, canvas.height);
-
-      const { audioSmoothDb, audioPeakDb } =
-        mapAudioLevelsToDb(audioLevels, minDb, range);
-
+    
       const leftLevels = STATE.levels.left;
       const rightLevels = STATE.levels.right;
-
+    
       const BAR_GAP  = 35;
       const usableW  = Math.floor(width - BAR_GAP);
       const halfW    = Math.floor(usableW / 2);
@@ -4718,9 +4819,112 @@ function saveAMXPanelGeometry(panel) {
       const Lx       = Math.floor(baseLeft - 5);
       const Rx       = Math.floor(baseLeft + Lw + BAR_GAP + 5);
 
+      const leftBaseX = Lx + Lw;
+      const rightBaseX = Rx;
+
+      if (layout === "full") {
+        const stereoQualityLevels = STATE.levels.stereoQuality;
+        const audioLevels = STATE.levels.audio;
+        const qSmoothDb = mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range);
+        const { audioSmoothDb, audioPeakDb } = mapAudioLevelsToDb(audioLevels, minDb, range);
+        const metrics = mirrorMetrics.fullMetrics || (mirrorMetrics.fullMetrics = getFullMirroredMetrics());
+        const bottomBlockY = metrics.singleRowHeight + metrics.rowGap;
+        const mirroredBarH = metrics.singleRowHeight;
+        const mirroredYOffset = metrics.mirroredYOffset;
+        const topY = mirroredYOffset;
+        const bottomY = bottomBlockY + mirroredYOffset;
+
+        // TOP LEFT (L mirrored)
+        ctx.save();
+        ctx.translate(leftBaseX, 0);
+        ctx.scale(-1, 1);
+        try {
+          renderChannel(
+            leftLevels.smoothDb,
+            leftLevels.peakDb,
+            topY,
+            Lw,
+            mirroredBarH,
+            null,
+            barStyle
+          );
+        } finally {
+          ctx.restore();
+        }
+
+        // TOP RIGHT (R normal)
+        ctx.save();
+        ctx.translate(rightBaseX, 0);
+        try {
+          renderChannel(
+            rightLevels.smoothDb,
+            rightLevels.peakDb,
+            topY,
+            Rw,
+            mirroredBarH,
+            null,
+            barStyle
+          );
+        } finally {
+          ctx.restore();
+        }
+
+        // BOTTOM LEFT (Q mirrored)
+        ctx.save();
+        ctx.translate(leftBaseX, 0);
+        ctx.scale(-1, 1);
+        STATE._stereoQualityGradient = true;
+        try {
+          renderChannel(
+            qSmoothDb,
+            qSmoothDb,
+            bottomY,
+            Lw,
+            mirroredBarH,
+            null,
+            barStyle
+          );
+        } finally {
+          STATE._stereoQualityGradient = false;
+          ctx.restore();
+        }
+
+        // BOTTOM RIGHT (A normal)
+        ctx.save();
+        ctx.translate(rightBaseX, 0);
+        STATE._audioPeakGradient = true;
+        try {
+          renderChannel(
+            audioSmoothDb,
+            audioPeakDb,
+            bottomY,
+            Rw,
+            mirroredBarH,
+            null,
+            barStyle
+          );
+        } finally {
+          STATE._audioPeakGradient = false;
+          ctx.restore();
+        }
+
+        return;
+      }
+
+      const mirroredBarH = mirrorMetrics.mirroredBarH;
+      const mirroredYOffset = mirrorMetrics.mirroredYOffset;
+      const stereoQualityLevels = (layout === "sa") ? STATE.levels.stereoQuality : null;
+      const audioLevels = (layout === "sa") ? STATE.levels.audio : null;
+      const qSmoothDb = (layout === "sa")
+        ? mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range)
+        : null;
+      const audioDb = (layout === "sa")
+        ? mapAudioLevelsToDb(audioLevels, minDb, range)
+        : null;
+
       // LEFT (mirrored)
       ctx.save();
-      ctx.translate(Lx + Lw, 0);
+      ctx.translate(leftBaseX, 0);
       ctx.scale(-1, 1);
 
       if (layout === "sa") STATE._stereoQualityGradient = true;
@@ -4728,9 +4932,9 @@ function saveAMXPanelGeometry(panel) {
         renderChannel(
           layout === "sa" ? qSmoothDb : leftLevels.smoothDb,
           layout === "sa" ? qSmoothDb : leftLevels.peakDb,
-          0,
+          mirroredYOffset,
           Lw,
-          height_mirrored,
+          mirroredBarH,
           null,
           barStyle
         );
@@ -4741,16 +4945,16 @@ function saveAMXPanelGeometry(panel) {
 
       // RIGHT (normal)
       ctx.save();
-      ctx.translate(Rx, 0);
+      ctx.translate(rightBaseX, 0);
 
       if (layout === "sa") STATE._audioPeakGradient = true;
       try {
         renderChannel(
-          layout === "sa" ? audioSmoothDb : rightLevels.smoothDb,
-          layout === "sa" ? audioPeakDb : rightLevels.peakDb,
-          0,
+          layout === "sa" ? audioDb.audioSmoothDb : rightLevels.smoothDb,
+          layout === "sa" ? audioDb.audioPeakDb : rightLevels.peakDb,
+          mirroredYOffset,
           Rw,
-          height_mirrored,
+          mirroredBarH,
           null,
           barStyle
         );
@@ -4775,19 +4979,19 @@ function saveAMXPanelGeometry(panel) {
         FULL_GAP * 3;
 
       const nextHeight = neededHeight + "px";
+      const styleHeight = nextHeight;
 
       if (canvas.height !== neededHeight) {
         canvas.height = neededHeight;
       }
-      if (canvas.style.height !== nextHeight) {
-        canvas.style.height = nextHeight;
+      if (canvas.style.height !== styleHeight) {
+        canvas.style.height = styleHeight;
       }
 
       // Ensure wrapper can contain 4 rows
-      const contentWrapper = STATE.dom.contentWrapper;
       if (contentWrapper) {
-        if (contentWrapper.style.height !== nextHeight) {
-          contentWrapper.style.height = nextHeight;
+        if (contentWrapper.style.height !== styleHeight) {
+          contentWrapper.style.height = styleHeight;
         }
       }
 
@@ -4826,6 +5030,9 @@ function saveAMXPanelGeometry(panel) {
 
       // Q — Stereo Quality
       {
+        const stereoQualityLevels = STATE.levels.stereoQuality;
+        const qSmoothDb = mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range);
+
         STATE._stereoQualityGradient = true;
 
         try {
@@ -4847,9 +5054,8 @@ function saveAMXPanelGeometry(panel) {
 
       // A — Audio
       {
-        const { audioSmoothDb, audioPeakDb } =
-          mapAudioLevelsToDb(audioLevels, minDb, range);
-
+        const audioLevels = STATE.levels.audio;
+        const { audioSmoothDb, audioPeakDb } = mapAudioLevelsToDb(audioLevels, minDb, range);
         STATE._audioPeakGradient = true;
 
         try {
@@ -4877,22 +5083,32 @@ function saveAMXPanelGeometry(panel) {
       : barH * 2 + gap;
 
     const nextHeight = neededHeight + "px";
+    const styleHeight = nextHeight;
 
     if (canvas.height !== neededHeight) {
       canvas.height = neededHeight;
     }
-    if (canvas.style.height !== nextHeight) {
-      canvas.style.height = nextHeight;
+    if (canvas.style.height !== styleHeight) {
+      canvas.style.height = styleHeight;
+    }
+
+    if (contentWrapper) {
+      if (contentWrapper.style.height !== styleHeight) {
+        contentWrapper.style.height = styleHeight;
+      }
     }
 
     ctx.clearRect(0, 0, width, canvas.height);
 
     // L+R channels
     if (layout === "lr") {
+      const leftLevels = STATE.levels.left;
+      const rightLevels = STATE.levels.right;
+
       // L
       renderChannel(
-        STATE.levels.left.smoothDb,
-        STATE.levels.left.peakDb,
+        leftLevels.smoothDb,
+        leftLevels.peakDb,
         0,
         width,
         barH,
@@ -4901,8 +5117,8 @@ function saveAMXPanelGeometry(panel) {
       );
       // R
       renderChannel(
-        STATE.levels.right.smoothDb,
-        STATE.levels.right.peakDb,
+        rightLevels.smoothDb,
+        rightLevels.peakDb,
         barH + gap,
         width,
         barH,
@@ -4912,7 +5128,10 @@ function saveAMXPanelGeometry(panel) {
     }
 
     // Stereo Quality (SA)
-    if (layout === "sa") {
+    else if (layout === "sa") {
+      const stereoQualityLevels = STATE.levels.stereoQuality;
+      const qSmoothDb = mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range);
+
       STATE._stereoQualityGradient = true;
 
       try {
@@ -4930,8 +5149,8 @@ function saveAMXPanelGeometry(panel) {
       }
 
       // Audio (SA)
-      const { audioSmoothDb, audioPeakDb } =
-        mapAudioLevelsToDb(audioLevels, minDb, range);
+      const audioLevels = STATE.levels.audio;
+      const { audioSmoothDb, audioPeakDb } = mapAudioLevelsToDb(audioLevels, minDb, range);
 
       STATE._audioPeakGradient = true;
 
@@ -5342,7 +5561,7 @@ function saveAMXPanelGeometry(panel) {
 
     const useMirrored =
       render === "mirrored" &&
-      (layout === "lr" || layout === "sa");
+      MIRRORED_LAYOUTS.includes(layout);
 
     // READOUTS — VISIBILITY (GLOBAL, SINGLE AUTHORITY)
     if (STATE.dom.readouts) {
@@ -5404,8 +5623,11 @@ function saveAMXPanelGeometry(panel) {
     if (STATE.dom.scales.right) STATE.dom.scales.right.style.display = "";
 
     // hide mirrored UI
-    if (STATE.dom.mirrorLabel)     STATE.dom.mirrorLabel.style.display     = "none";
-    if (STATE.dom.mirrorScaleWrap) STATE.dom.mirrorScaleWrap.style.display = "none";
+    if (STATE.dom.mirrorLabel)        STATE.dom.mirrorLabel.style.display        = "none";
+    if (STATE.dom.mirrorLabelTop)     STATE.dom.mirrorLabelTop.style.display     = "none";
+    if (STATE.dom.mirrorLabelBottom)  STATE.dom.mirrorLabelBottom.style.display  = "none";
+    if (STATE.dom.mirrorScaleWrapTop) STATE.dom.mirrorScaleWrapTop.style.display = "none";
+    if (STATE.dom.mirrorScaleWrap)    STATE.dom.mirrorScaleWrap.style.display    = "none";
 
     // reset readouts position
     if (STATE.dom.readouts) {
@@ -5619,32 +5841,105 @@ function saveAMXPanelGeometry(panel) {
       if (STATE.dom.scales.left)  STATE.dom.scales.left.style.display  = "none";
       if (STATE.dom.scales.right) STATE.dom.scales.right.style.display = "none";
 
-      if (STATE.dom.mirrorLabel) {
-        const nextMirrorLabel = layout === "sa" ? "Q | A" : "L | R";
+      if (layout === "full") {
+        const metrics = getFullMirroredMetrics();
 
-        if (STATE.dom.mirrorLabel.style.display !== "block") {
-          STATE.dom.mirrorLabel.style.display = "block";
+        if (STATE.dom.mirrorLabel) {
+          STATE.dom.mirrorLabel.style.display = "none";
         }
-        if (STATE.dom.mirrorLabel.textContent !== nextMirrorLabel) {
-          STATE.dom.mirrorLabel.textContent = nextMirrorLabel;
+
+        if (STATE.dom.mirrorLabelTop) {
+          if (STATE.dom.mirrorLabelTop.style.display !== "block") {
+            STATE.dom.mirrorLabelTop.style.display = "block";
+          }
+          if (STATE.dom.mirrorLabelTop.textContent !== "L | R") {
+            STATE.dom.mirrorLabelTop.textContent = "L | R";
+          }
+          if (STATE.dom.mirrorLabelTop.style.top !== metrics.topCenterY + "px") {
+            STATE.dom.mirrorLabelTop.style.top = metrics.topCenterY + "px";
+          }
         }
+
+        if (STATE.dom.mirrorLabelBottom) {
+          if (STATE.dom.mirrorLabelBottom.style.display !== "block") {
+            STATE.dom.mirrorLabelBottom.style.display = "block";
+          }
+          if (STATE.dom.mirrorLabelBottom.textContent !== "Q | A") {
+            STATE.dom.mirrorLabelBottom.textContent = "Q | A";
+          }
+          if (STATE.dom.mirrorLabelBottom.style.top !== metrics.bottomCenterY + "px") {
+            STATE.dom.mirrorLabelBottom.style.top = metrics.bottomCenterY + "px";
+          }
+        }
+      } else {
+        if (STATE.dom.mirrorLabelTop) {
+          STATE.dom.mirrorLabelTop.style.display = "none";
+        }
+        if (STATE.dom.mirrorLabelBottom) {
+          STATE.dom.mirrorLabelBottom.style.display = "none";
+        }
+
+        if (STATE.dom.mirrorLabel) {
+          const nextMirrorLabel = layout === "sa" ? "Q | A" : "L | R";
+
+          if (STATE.dom.mirrorLabel.style.display !== "block") {
+            STATE.dom.mirrorLabel.style.display = "block";
+          }
+          if (STATE.dom.mirrorLabel.textContent !== nextMirrorLabel) {
+            STATE.dom.mirrorLabel.textContent = nextMirrorLabel;
+          }
+        }
+      }
+
+      if (STATE.dom.mirrorScaleWrapTop) {
+        STATE.dom.mirrorScaleWrapTop.style.display = "block";
       }
 
       if (STATE.dom.mirrorScaleWrap) {
         STATE.dom.mirrorScaleWrap.style.display = "block";
       }
 
+      const nextTopLeftHTML =
+        layout === "full"
+          ? getMirroredScaleHTML("lr", "left")
+          : getMirroredScaleHTML(layout, "left");
+
+      const nextTopRightHTML =
+        layout === "full"
+          ? getMirroredScaleHTML("lr", "right")
+          : getMirroredScaleHTML(layout, "right");
+
+      const nextBottomLeftHTML =
+        layout === "full"
+          ? getMirroredScaleHTML("sa", "left")
+          : getMirroredScaleHTML(layout, "left");
+
+      const nextBottomRightHTML =
+        layout === "full"
+          ? getMirroredScaleHTML("sa", "right")
+          : getMirroredScaleHTML(layout, "right");
+
+      if (STATE.dom.mirrorScaleTopLeft) {
+        if (STATE.dom.mirrorScaleTopLeft.innerHTML !== nextTopLeftHTML) {
+          STATE.dom.mirrorScaleTopLeft.innerHTML = nextTopLeftHTML;
+        }
+      }
+
+      if (STATE.dom.mirrorScaleTopRight) {
+        if (STATE.dom.mirrorScaleTopRight.innerHTML !== nextTopRightHTML) {
+          STATE.dom.mirrorScaleTopRight.innerHTML = nextTopRightHTML;
+        }
+      }
+
       if (STATE.dom.mirrorScaleLeft) {
-        const nextLeftHTML = getMirroredScaleHTML(layout, "left");
-        if (STATE.dom.mirrorScaleLeft.innerHTML !== nextLeftHTML) {
-          STATE.dom.mirrorScaleLeft.innerHTML = nextLeftHTML;
+        if (STATE.dom.mirrorScaleLeft.innerHTML !== nextBottomLeftHTML) {
+          STATE.dom.mirrorScaleLeft.innerHTML = nextBottomLeftHTML;
         }
       }
 
       if (STATE.dom.mirrorScaleRight) {
-        const nextRightHTML = getMirroredScaleHTML(layout, "right");
-        if (STATE.dom.mirrorScaleRight.innerHTML !== nextRightHTML) {
-          STATE.dom.mirrorScaleRight.innerHTML = nextRightHTML;
+        if (STATE.dom.mirrorScaleRight.innerHTML !== nextBottomRightHTML) {
+          STATE.dom.mirrorScaleRight.innerHTML = nextBottomRightHTML;
         }
       }
 
@@ -5812,10 +6107,11 @@ function saveAMXPanelGeometry(panel) {
       if (STATE.dom.canvasGauges) {
         const gaugesHeight = WRAPPER_HEIGHT - 20;
 
-        STATE.dom.canvasGauges.width  = safeWidth;
-        STATE.dom.canvasGauges.height = gaugesHeight;
-        STATE.dom.canvasGauges.style.width  = safeWidth + "px";
-        STATE.dom.canvasGauges.style.height = gaugesHeight + "px";
+        resizeCanvasIfNeeded(
+          STATE.dom.canvasGauges,
+          safeWidth,
+          gaugesHeight
+        );
       }
 
       // FLOATING PANEL REPOSITION ON RESIZE
@@ -5888,13 +6184,13 @@ function saveAMXPanelGeometry(panel) {
       );
 
       // MIRRORED MODE — CLEAN, FINAL DOM ELEMENTS
-      // FIXED CENTRAL L|R LABEL
+      // SINGLE CENTRAL LABEL FOR LR / SA
       STATE.dom.mirrorLabel = document.createElement("div");
       STATE.dom.mirrorLabel.style.cssText = `
         position:absolute;
         left:50%;
-        top:50%;
-        transform:translate(-50%, -115%);
+        top:56%;
+        transform:translate(-50%, -100%);
         white-space:nowrap;
         pointer-events:none;
         user-select:none;
@@ -5905,13 +6201,94 @@ function saveAMXPanelGeometry(panel) {
       `;
       STATE.dom.contentWrapper.appendChild(STATE.dom.mirrorLabel);
 
-      // MIRRORED SCALES WRAPPER (STATIC, TILE-ANCHORED)
+      // FULL MIRRORED — TOP CENTER LABEL
+      STATE.dom.mirrorLabelTop = document.createElement("div");
+      STATE.dom.mirrorLabelTop.style.cssText = `
+        position:absolute;
+        left:50%;
+        top:0;
+        transform:translate(-50%, -50%);
+        white-space:nowrap;
+        pointer-events:none;
+        user-select:none;
+        z-index:10;
+        display:none;
+        font-size:16px;
+        line-height:1.2;
+      `;
+      STATE.dom.contentWrapper.appendChild(STATE.dom.mirrorLabelTop);
+
+      // FULL MIRRORED — BOTTOM CENTER LABEL
+      STATE.dom.mirrorLabelBottom = document.createElement("div");
+      STATE.dom.mirrorLabelBottom.style.cssText = `
+        position:absolute;
+        left:50%;
+        top:0;
+        transform:translate(-50%, -50%);
+        white-space:nowrap;
+        pointer-events:none;
+        user-select:none;
+        z-index:10;
+        display:none;
+        font-size:16px;
+        line-height:1.2;
+      `;
+      STATE.dom.contentWrapper.appendChild(STATE.dom.mirrorLabelBottom);
+
+      // MIRRORED TOP SCALES WRAPPER
+      STATE.dom.mirrorScaleWrapTop = document.createElement("div");
+      STATE.dom.mirrorScaleWrapTop.style.cssText = `
+        position:absolute;
+        left:0;
+        right:0;
+        top:-10px;
+        height:18px;
+        pointer-events:none;
+        user-select:none;
+        z-index:9;
+        display:none;
+      `;
+      STATE.dom.contentWrapper.appendChild(STATE.dom.mirrorScaleWrapTop);
+
+      // TOP LEFT MIRRORED SCALE
+      STATE.dom.mirrorScaleTopLeft = document.createElement("div");
+      STATE.dom.mirrorScaleTopLeft.style.cssText = `
+        position:absolute;
+        left:6px;
+        top:0;
+        width:42%;
+        text-align:left;
+        user-select:none;
+        white-space:nowrap;
+        pointer-events:none;
+        font-size:12px;
+        line-height:1.2;
+      `;
+      STATE.dom.mirrorScaleWrapTop.appendChild(STATE.dom.mirrorScaleTopLeft);
+
+      // TOP RIGHT MIRRORED SCALE
+      STATE.dom.mirrorScaleTopRight = document.createElement("div");
+      STATE.dom.mirrorScaleTopRight.style.cssText = `
+        position:absolute;
+        right:6px;
+        top:0;
+        width:42%;
+        text-align:right;
+        user-select:none;
+        white-space:nowrap;
+        pointer-events:none;
+        font-size:12px;
+        line-height:1.2;
+      `;
+      STATE.dom.mirrorScaleWrapTop.appendChild(STATE.dom.mirrorScaleTopRight);
+
+      // MIRRORED BOTTOM SCALES WRAPPER (STATIC, TILE-ANCHORED)
       STATE.dom.mirrorScaleWrap = document.createElement("div");
       STATE.dom.mirrorScaleWrap.style.cssText = `
         position:absolute;
         left:0;
         right:0;
-        bottom:4px;
+        bottom:0;
         height:18px;
         pointer-events:none;
         user-select:none;
@@ -5925,7 +6302,7 @@ function saveAMXPanelGeometry(panel) {
       STATE.dom.mirrorScaleLeft.style.cssText = `
         position:absolute;
         left:6px;
-        bottom:6px;
+        bottom:0;
         width:42%;
         text-align:left;
         user-select:none;
@@ -5941,7 +6318,7 @@ function saveAMXPanelGeometry(panel) {
       STATE.dom.mirrorScaleRight.style.cssText = `
         position:absolute;
         right:6px;
-        bottom:6px;
+        bottom:0;
         width:42%;
         text-align:right;
         user-select:none;
@@ -6155,6 +6532,10 @@ function saveAMXPanelGeometry(panel) {
             STATE.dom.gaugeLabelQ,
             STATE.dom.gaugeLabelA,
             STATE.dom.mirrorLabel,
+            STATE.dom.mirrorLabelTop,
+            STATE.dom.mirrorLabelBottom,
+            STATE.dom.mirrorScaleTopLeft,
+            STATE.dom.mirrorScaleTopRight,
             STATE.dom.mirrorScaleLeft,
             STATE.dom.mirrorScaleRight
           ].filter(Boolean);
@@ -6174,11 +6555,13 @@ function saveAMXPanelGeometry(panel) {
               el === STATE.dom.labels.right ||
               el === STATE.dom.labels.q     ||
               el === STATE.dom.labels.a     ||
-              el === STATE.dom.gaugeLabelLeft  ||
-              el === STATE.dom.gaugeLabelRight ||
-              el === STATE.dom.gaugeLabelQ     ||
-              el === STATE.dom.gaugeLabelA     ||
-              el === STATE.dom.mirrorLabel
+              el === STATE.dom.gaugeLabelLeft   ||
+              el === STATE.dom.gaugeLabelRight  ||
+              el === STATE.dom.gaugeLabelQ      ||
+              el === STATE.dom.gaugeLabelA      ||
+              el === STATE.dom.mirrorLabel      ||
+              el === STATE.dom.mirrorLabelTop   ||
+              el === STATE.dom.mirrorLabelBottom
             ) {
               el.style.fontSize = base + 2 + "px";
             } else {
@@ -6186,12 +6569,14 @@ function saveAMXPanelGeometry(panel) {
             }
           });
 
-          if (STATE.dom.scales.left)       STATE.dom.scales.left.style.opacity       = 0.7;
-          if (STATE.dom.scales.right)      STATE.dom.scales.right.style.opacity      = 0.7;
-          if (STATE.dom.mirrorScaleLeft)   STATE.dom.mirrorScaleLeft.style.opacity   = 0.7;
-          if (STATE.dom.mirrorScaleRight)  STATE.dom.mirrorScaleRight.style.opacity  = 0.7;
+          if (STATE.dom.mirrorScaleTopLeft)  STATE.dom.mirrorScaleTopLeft.style.opacity  = 0.7;
+          if (STATE.dom.mirrorScaleTopRight) STATE.dom.mirrorScaleTopRight.style.opacity = 0.7;
+          if (STATE.dom.mirrorScaleLeft)     STATE.dom.mirrorScaleLeft.style.opacity     = 0.7;
+          if (STATE.dom.mirrorScaleRight)    STATE.dom.mirrorScaleRight.style.opacity    = 0.7;
 
           [
+            ...Array.from(STATE.dom.mirrorScaleTopLeft?.querySelectorAll("span") || []),
+            ...Array.from(STATE.dom.mirrorScaleTopRight?.querySelectorAll("span") || []),
             ...Array.from(STATE.dom.mirrorScaleLeft?.querySelectorAll("span") || []),
             ...Array.from(STATE.dom.mirrorScaleRight?.querySelectorAll("span") || [])
           ].forEach((el) => {

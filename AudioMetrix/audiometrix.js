@@ -515,7 +515,7 @@
     const YELLOW_ZONE_COLOR = "#ffd400"; // stereo quality
 
     // 2) Threshold selector
-    const THR = (mode === 2) ? 0.74 : 0.58;
+    const THR = (mode === 2) ? 0.80 : 0.58;
 
     const t   = THR;
     const t1  = t - 0.001;

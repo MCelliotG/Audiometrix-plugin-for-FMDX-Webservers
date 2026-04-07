@@ -23,19 +23,19 @@ It is designed as a hybrid metering system, offering both technical insight and 
 🔹 Layouts
 - LR (Stereo Levels)
   
-  ![amx1](https://github.com/user-attachments/assets/c49b8dd5-2f16-410a-bfd7-095c31172c23)
+![amx1](https://github.com/user-attachments/assets/c49b8dd5-2f16-410a-bfd7-095c31172c23)
   
   Classic left/right metering
   
 - SA (Stereo Quality + Audio Peak)
   
-  ![amx2](https://github.com/user-attachments/assets/9f5d6241-f2e6-4515-b885-28043c55a946)
+![amx2](https://github.com/user-attachments/assets/9f5d6241-f2e6-4515-b885-28043c55a946)
   
   Advanced signal analysis
   
 - FULL
   
-  ![amx3](https://github.com/user-attachments/assets/b2be283e-8a6e-4cfa-b952-2194bfabd010)
+![amx3](https://github.com/user-attachments/assets/b2be283e-8a6e-4cfa-b952-2194bfabd010)
   
   Combined multi-row view (L/R + Q/A)
   
@@ -46,7 +46,7 @@ It is designed as a hybrid metering system, offering both technical insight and 
 
 - Gauges — analog-style circular meters
   
-  ![amx5](https://github.com/user-attachments/assets/0cb44e01-9e22-46d8-b1e0-c9758dfbf7bd)
+![amx5](https://github.com/user-attachments/assets/0cb44e01-9e22-46d8-b1e0-c9758dfbf7bd)
 
 - Mirrored — symmetrical dual-channel display
   
@@ -55,7 +55,7 @@ It is designed as a hybrid metering system, offering both technical insight and 
 
 All modes share the same underlying data — only the presentation changes.
 
-🎛️ Styles
+🎛️ Styles and themes
 
 AudioMetrix supports multiple visual styles:
 
@@ -68,12 +68,17 @@ AudioMetrix supports multiple visual styles:
 - Matrix Dots
 - Pillars
 
- ![amx8](https://github.com/user-attachments/assets/1d7ef944-ae69-43b8-93f2-7bd451a13421)
+![amx8](https://github.com/user-attachments/assets/1d7ef944-ae69-43b8-93f2-7bd451a13421)
   
 - Beveled 3D
 - Glass Tube
 
 Each style represents the same signal with a different visual interpretation.
+Audiometrix features 22 pure eye-candy colorful gradient themes for the bars and gauges. 
+The default theme scheme is Automatic which reads the colors of your FMDX Webserver theme automatically.
+
+![amx10](https://github.com/user-attachments/assets/b3a8df08-0e77-4055-aed9-b0644e115002)
+
 
 🌈 Features
 - Real-time RMS + peak metering
@@ -135,7 +140,8 @@ AudioMetrix is optimized for efficiency:
 - Enable Glow for depth and contrast
 - Use SA layout to monitor stereo quality live
 - Adjust gain carefully to avoid constant peak saturation
-- 
+- Enable audio peaks and real time values for a more detailed view of info (default off).
+  
 🧩 Version and updates
 
 AudioMetrix displays on the settings panel the current version.

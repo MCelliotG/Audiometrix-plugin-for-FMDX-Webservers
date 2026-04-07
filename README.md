@@ -45,6 +45,7 @@ It is designed as a hybrid metering system, offering both technical insight and 
   ![amx4](https://github.com/user-attachments/assets/055cbd26-acab-4369-ba32-f8309835d648)
 
 - Gauges — analog-style circular meters
+  
   ![amx5](https://github.com/user-attachments/assets/0cb44e01-9e22-46d8-b1e0-c9758dfbf7bd)
 
 - Mirrored — symmetrical dual-channel display
@@ -59,10 +60,15 @@ All modes share the same underlying data — only the presentation changes.
 AudioMetrix supports multiple visual styles:
 
 - Simple bars
-  
+
+![amx7](https://github.com/user-attachments/assets/10454827-a96d-46d1-9dda-381b89777bee)
+
 - Segmented bars
 - Circle Dots
 - Matrix Dots
+
+    ![amx8](https://github.com/user-attachments/assets/1d7ef944-ae69-43b8-93f2-7bd451a13421)
+
 - Pillars
 - Beveled 3D
 - Glass Tube

@@ -2916,6 +2916,38 @@ function saveAMXPanelGeometry(panel) {
     return (db - min) * width / range;
   }
 
+  function clamp01(v) {
+    return Math.max(0, Math.min(1, v));
+  }
+
+  function fracFromDb(db, widthRef) {
+    return clamp01(mapDbToX(db, widthRef) / widthRef);
+  }
+
+  function getStereoDb(sideKey, fallbackDb) {
+    const side = STATE && STATE.levels && STATE.levels[sideKey];
+    return (side && typeof side.smoothDb === "number") ? side.smoothDb : fallbackDb;
+  }
+
+  function mapStereoQualityToDbRange(q, minDb, range) {
+    const qClamped = Math.max(0, Math.min(STEREO_Q_MAX, q));
+
+    let ratio;
+    if (qClamped <= 100) {
+      ratio = (qClamped / 100) * STEREO_Q_SIGNAL_RATIO;
+    } else {
+      ratio =
+        STEREO_Q_SIGNAL_RATIO +
+        ((qClamped - 100) / 20) * (1 - STEREO_Q_SIGNAL_RATIO);
+    }
+
+    return minDb + ratio * range;
+  }
+
+  function mapAudioSampleToDb(sample, minDb, range) {
+    return minDb + (Math.max(0, Math.min(255, sample)) / 255) * range;
+  }
+
   // EFFECTIVE WIDTH
   function getEffectiveBarWidth(width) {
     const display = CONFIG.display;
@@ -3137,100 +3169,51 @@ function saveAMXPanelGeometry(panel) {
     const widthRef = W || 1;
     const minDb = CONFIG.audio.minDb;
     const range = (CONFIG.audio.maxDb - minDb) || 1;
+    const q = (STATE && STATE.levels && STATE.levels.stereoQuality &&
+      typeof STATE.levels.stereoQuality.smooth === "number")
+      ? STATE.levels.stereoQuality.smooth
+      : 0;
 
-    const SIGNAL_MAX_RATIO = 0.90;
-    const Q_MAX = 120;
+    const aSmooth = (STATE && STATE.levels && STATE.levels.audio &&
+      typeof STATE.levels.audio.smooth === "number")
+      ? STATE.levels.audio.smooth
+      : 0;
 
-    function clamp01(v) {
-      return Math.max(0, Math.min(1, v));
-    }
-
-    function fracFromDb(db) {
-      return clamp01(mapDbToX(db, widthRef) / widthRef);
-    }
-
-    function getStereoDb(sideKey) {
-      const v = (
-        STATE &&
-        STATE.levels &&
-        STATE.levels[sideKey] &&
-        typeof STATE.levels[sideKey].smoothDb === "number"
-      )
-        ? STATE.levels[sideKey].smoothDb
-        : minDb;
-
-      return v;
-    }
-
-    function getQualityDb() {
-      const q = (
-        STATE &&
-        STATE.levels &&
-        STATE.levels.stereoQuality &&
-        typeof STATE.levels.stereoQuality.smooth === "number"
-      )
-        ? STATE.levels.stereoQuality.smooth
-        : 0;
-
-      const qClamped = Math.max(0, Math.min(Q_MAX, q));
-
-      let ratio;
-      if (qClamped <= 100) {
-        ratio = (qClamped / 100) * SIGNAL_MAX_RATIO;
-      } else {
-        ratio =
-          SIGNAL_MAX_RATIO +
-          ((qClamped - 100) / 20) * (1 - SIGNAL_MAX_RATIO);
-      }
-
-      return minDb + ratio * range;
-    }
-
-    function getAudioPeakDb() {
-      const aSmooth = (
-        STATE &&
-        STATE.levels &&
-        STATE.levels.audio &&
-        typeof STATE.levels.audio.smooth === "number"
-      )
-        ? STATE.levels.audio.smooth
-        : 0;
-
-      return minDb + (Math.max(0, Math.min(255, aSmooth)) / 255) * range;
-    }
+    const qualityDb = mapStereoQualityToDbRange(q, minDb, range);
+    const audioPeakDb = mapAudioSampleToDb(aSmooth, minDb, range);
 
     // LR MODE (2 gauges: L, R)
     if (layout === "lr") {
       if (i === 0) {
-        return { mode: 0, frac: fracFromDb(getStereoDb("left")) };
+        return { mode: 0, frac: fracFromDb(getStereoDb("left", minDb), widthRef) };
       }
 
-      return { mode: 0, frac: fracFromDb(getStereoDb("right")) };
+      return { mode: 0, frac: fracFromDb(getStereoDb("right", minDb), widthRef) };
     }
 
     // FULL MODE (4 gauges: L, R, Q, A)
     if (layout === "full") {
       if (i === 0) {
-        return { mode: 0, frac: fracFromDb(getStereoDb("left")) };
+        return { mode: 0, frac: fracFromDb(getStereoDb("left", minDb), widthRef) };
       }
 
       if (i === 1) {
-        return { mode: 0, frac: fracFromDb(getStereoDb("right")) };
+        return { mode: 0, frac: fracFromDb(getStereoDb("right", minDb), widthRef) };
       }
 
       if (i === 2) {
-        return { mode: 2, frac: fracFromDb(getQualityDb()) };
+        return { mode: 2, frac: fracFromDb(qualityDb, widthRef) };
       }
 
-      return { mode: 1, frac: fracFromDb(getAudioPeakDb()) };
+      return { mode: 1, frac: fracFromDb(audioPeakDb, widthRef) };
     }
 
     // SA MODE (2 gauges: Q, A)
     if (i === 0) {
-      return { mode: 2, frac: fracFromDb(getQualityDb()) };
+      return { mode: 2, frac: fracFromDb(qualityDb, widthRef) };
     }
 
-    return { mode: 1, frac: fracFromDb(getAudioPeakDb()) };
+    return { mode: 1, frac: fracFromDb(audioPeakDb, widthRef) };
   }
 
   // Segmented glass background
@@ -4693,27 +4676,80 @@ function saveAMXPanelGeometry(panel) {
 
   // Stereo quality/Audio peak common helpers
   function mapStereoQualityToDb(q, minDb, range) {
-    const Q_MAX = STEREO_Q_MAX;
-    const SIGNAL_MAX_RATIO = STEREO_Q_SIGNAL_RATIO;
-    const qClamped = Math.max(0, Math.min(Q_MAX, q));
-
-    let ratio;
-    if (qClamped <= 100) {
-      ratio = (qClamped / 100) * SIGNAL_MAX_RATIO;
-    } else {
-      ratio =
-        SIGNAL_MAX_RATIO +
-        ((qClamped - 100) / 20) * (1 - SIGNAL_MAX_RATIO);
-    }
-
-    return minDb + ratio * range;
+    return mapStereoQualityToDbRange(q, minDb, range);
   }
 
   function mapAudioLevelsToDb(audioLevels, minDb, range) {
-    const audioSmoothDb = minDb + (audioLevels.smooth / 255) * range;
-    const audioPeakDb = minDb + (audioLevels.peak / 255) * range;
+    const audioSmoothDb = mapAudioSampleToDb(audioLevels.smooth, minDb, range);
+    const audioPeakDb = mapAudioSampleToDb(audioLevels.peak, minDb, range);
 
     return { audioSmoothDb, audioPeakDb };
+  }
+
+  function withGradientMode(mode, fn) {
+    const useStereo = mode === 2;
+    const useAudio = mode === 1;
+
+    if (useStereo) STATE._stereoQualityGradient = true;
+    if (useAudio) STATE._audioPeakGradient = true;
+
+    try {
+      return fn();
+    } finally {
+      if (useStereo) STATE._stereoQualityGradient = false;
+      if (useAudio) STATE._audioPeakGradient = false;
+    }
+  }
+
+  function renderMirroredChannel(ctx, baseX, mirrored, smoothDb, peakDb, y, width, barH, barStyle, mode = 0) {
+    ctx.save();
+    ctx.translate(baseX, 0);
+    if (mirrored) ctx.scale(-1, 1);
+
+    try {
+      return withGradientMode(mode, () => (
+        renderChannel(
+          smoothDb,
+          peakDb,
+          y,
+          width,
+          barH,
+          null,
+          barStyle
+        )
+      ));
+    } finally {
+      ctx.restore();
+    }
+  }
+
+  function syncCanvasAndWrapperHeight(canvas, canvasStyle, contentWrapperStyle, neededHeight) {
+    const nextHeight = neededHeight + "px";
+
+    if (canvas.height !== neededHeight) {
+      canvas.height = neededHeight;
+    }
+    if (canvasStyle.height !== nextHeight) {
+      canvasStyle.height = nextHeight;
+    }
+
+    if (contentWrapperStyle && contentWrapperStyle.height !== nextHeight) {
+      contentWrapperStyle.height = nextHeight;
+    }
+  }
+
+  function renderBarChannelWithMode(smoothDb, peakDb, y, width, barH, effectiveW, barStyle, mode = 0) {
+    return withGradientMode(mode, () => (
+      renderChannel(
+        smoothDb,
+        peakDb,
+        y,
+        width,
+        barH,
+        effectiveW,
+        barStyle
+      )
+    ));
   }
 
   // METERS RENDERER
@@ -4811,78 +4847,32 @@ function saveAMXPanelGeometry(panel) {
         const bottomY = bottomBlockY + mirroredYOffset;
 
         // TOP LEFT (L mirrored)
-        ctx.save();
-        ctx.translate(leftBaseX, 0);
-        ctx.scale(-1, 1);
-        try {
-          renderChannel(
-            leftLevels.smoothDb,
-            leftLevels.peakDb,
-            topY,
-            halfW,
-            mirroredBarH,
-            null,
-            barStyle
-          );
-        } finally {
-          ctx.restore();
-        }
+        renderMirroredChannel(
+          ctx, leftBaseX, true,
+          leftLevels.smoothDb, leftLevels.peakDb,
+          topY, halfW, mirroredBarH, barStyle
+        );
 
         // TOP RIGHT (R normal)
-        ctx.save();
-        ctx.translate(rightBaseX, 0);
-        try {
-          renderChannel(
-            rightLevels.smoothDb,
-            rightLevels.peakDb,
-            topY,
-            halfW,
-            mirroredBarH,
-            null,
-            barStyle
-          );
-        } finally {
-          ctx.restore();
-        }
+        renderMirroredChannel(
+          ctx, rightBaseX, false,
+          rightLevels.smoothDb, rightLevels.peakDb,
+          topY, halfW, mirroredBarH, barStyle
+        );
 
         // BOTTOM LEFT (Q mirrored)
-        ctx.save();
-        ctx.translate(leftBaseX, 0);
-        ctx.scale(-1, 1);
-        STATE._stereoQualityGradient = true;
-        try {
-          renderChannel(
-            qSmoothDb,
-            qSmoothDb,
-            bottomY,
-            halfW,
-            mirroredBarH,
-            null,
-            barStyle
-          );
-        } finally {
-          STATE._stereoQualityGradient = false;
-          ctx.restore();
-        }
+        renderMirroredChannel(
+          ctx, leftBaseX, true,
+          qSmoothDb, qSmoothDb,
+          bottomY, halfW, mirroredBarH, barStyle, 2
+        );
 
         // BOTTOM RIGHT (A normal)
-        ctx.save();
-        ctx.translate(rightBaseX, 0);
-        STATE._audioPeakGradient = true;
-        try {
-          renderChannel(
-            audioSmoothDb,
-            audioPeakDb,
-            bottomY,
-            halfW,
-            mirroredBarH,
-            null,
-            barStyle
-          );
-        } finally {
-          STATE._audioPeakGradient = false;
-          ctx.restore();
-        }
+        renderMirroredChannel(
+          ctx, rightBaseX, false,
+          audioSmoothDb, audioPeakDb,
+          bottomY, halfW, mirroredBarH, barStyle, 1
+        );
 
         return;
       }
@@ -4902,45 +4892,22 @@ function saveAMXPanelGeometry(panel) {
       }
 
       // LEFT (mirrored)
-      ctx.save();
-      ctx.translate(leftBaseX, 0);
-      ctx.scale(-1, 1);
-
-      if (SALayout) STATE._stereoQualityGradient = true;
-      try {
-        renderChannel(
-          SALayout ? qSmoothDb : leftLevels.smoothDb,
-          SALayout ? qSmoothDb : leftLevels.peakDb,
-          mirroredYOffset,
-          halfW,
-          mirroredBarH,
-          null,
-          barStyle
-        );
-      } finally {
-        if (SALayout) STATE._stereoQualityGradient = false;
-        ctx.restore();
-      }
+      renderMirroredChannel(
+        ctx, leftBaseX, true,
+        SALayout ? qSmoothDb : leftLevels.smoothDb,
+        SALayout ? qSmoothDb : leftLevels.peakDb,
+        mirroredYOffset, halfW, mirroredBarH, barStyle,
+        SALayout ? 2 : 0
+      );
 
       // RIGHT (normal)
-      ctx.save();
-      ctx.translate(rightBaseX, 0);
-
-      if (SALayout) STATE._audioPeakGradient = true;
-      try {
-        renderChannel(
-          SALayout ? audioSmoothDb : rightLevels.smoothDb,
-          SALayout ? audioPeakDb : rightLevels.peakDb,
-          mirroredYOffset,
-          halfW,
-          mirroredBarH,
-          null,
-          barStyle
-        );
-      } finally {
-        if (SALayout) STATE._audioPeakGradient = false;
-        ctx.restore();
-      }
+      renderMirroredChannel(
+        ctx, rightBaseX, false,
+        SALayout ? audioSmoothDb : rightLevels.smoothDb,
+        SALayout ? audioPeakDb : rightLevels.peakDb,
+        mirroredYOffset, halfW, mirroredBarH, barStyle,
+        SALayout ? 1 : 0
+      );
 
       return;
     }
@@ -4959,21 +4926,12 @@ function saveAMXPanelGeometry(panel) {
         barH * 4 +
         FULL_GAP * 3;
 
-      const nextHeight = neededHeight + "px";
-
-      if (canvas.height !== neededHeight) {
-        canvas.height = neededHeight;
-      }
-      if (canvasStyle.height !== nextHeight) {
-        canvasStyle.height = nextHeight;
-      }
-
-      // Ensure wrapper can contain 4 rows
-      if (contentWrapperStyle) {
-        if (contentWrapperStyle.height !== nextHeight) {
-          contentWrapperStyle.height = nextHeight;
-        }
-      }
+      syncCanvasAndWrapperHeight(
+        canvas,
+        canvasStyle,
+        contentWrapperStyle,
+        neededHeight
+      );
 
       ctx.clearRect(0, 0, width, canvas.height);
 
@@ -4981,73 +4939,60 @@ function saveAMXPanelGeometry(panel) {
       const fullStep = barH + FULL_GAP;
 
       // L
-      renderChannel(
+      renderBarChannelWithMode(
         leftLevels.smoothDb,
         leftLevels.peakDb,
         y,
         width,
         barH,
         effectiveW,
-        barStyle
+        barStyle,
+        0
       );
 
       y += fullStep;
 
       // R
-      renderChannel(
+      renderBarChannelWithMode(
         rightLevels.smoothDb,
         rightLevels.peakDb,
         y,
         width,
         barH,
         effectiveW,
-        barStyle
+        barStyle,
+        0
       );
 
       y += fullStep;
 
       // Q — Stereo Quality
-      {
-        const qSmoothDb = mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range);
-
-        STATE._stereoQualityGradient = true;
-
-        try {
-          renderChannel(
-            qSmoothDb,
-            qSmoothDb,
-            y,
-            width,
-            barH,
-            effectiveW,
-            barStyle
-          );
-        } finally {
-          STATE._stereoQualityGradient = false;
-        }
-      }
+      const qSmoothDb = mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range);
+      renderBarChannelWithMode(
+        qSmoothDb,
+        qSmoothDb,
+        y,
+        width,
+        barH,
+        effectiveW,
+        barStyle,
+        2
+      );
 
       y += fullStep;
 
       // A — Audio
-      {
-        const { audioSmoothDb, audioPeakDb } = mapAudioLevelsToDb(audioLevels, minDb, range);
-        STATE._audioPeakGradient = true;
-
-        try {
-          renderChannel(
-            audioSmoothDb,
-            audioPeakDb,
-            y,
-            width,
-            barH,
-            effectiveW,
-            barStyle
-          );
-        } finally {
-          STATE._audioPeakGradient = false;
-        }
-      }
+      const { audioSmoothDb, audioPeakDb } = mapAudioLevelsToDb(audioLevels, minDb, range);
+      renderBarChannelWithMode(
+        audioSmoothDb,
+        audioPeakDb,
+        y,
+        width,
+        barH,
+        effectiveW,
+        barStyle,
+        1
+      );
 
       return;
     }
@@ -5058,20 +5003,12 @@ function saveAMXPanelGeometry(panel) {
       ? barH * 3 + gap * 2
       : barH * 2 + gap;
 
-    const nextHeight = neededHeight + "px";
-
-    if (canvas.height !== neededHeight) {
-      canvas.height = neededHeight;
-    }
-    if (canvasStyle.height !== nextHeight) {
-      canvasStyle.height = nextHeight;
-    }
-
-    if (contentWrapperStyle) {
-      if (contentWrapperStyle.height !== nextHeight) {
-        contentWrapperStyle.height = nextHeight;
-      }
-    }
+    syncCanvasAndWrapperHeight(
+      canvas,
+      canvasStyle,
+      contentWrapperStyle,
+      neededHeight
+    );
 
     ctx.clearRect(0, 0, width, canvas.height);
 
@@ -5079,24 +5016,26 @@ function saveAMXPanelGeometry(panel) {
     if (layout === "lr") {
 
       // L
-      renderChannel(
+      renderBarChannelWithMode(
         leftLevels.smoothDb,
         leftLevels.peakDb,
         0,
         width,
         barH,
         effectiveW,
-        barStyle
+        barStyle,
+        0
       );
       // R
-      renderChannel(
+      renderBarChannelWithMode(
         rightLevels.smoothDb,
         rightLevels.peakDb,
         rowStep,
         width,
         barH,
         effectiveW,
-        barStyle
+        barStyle,
+        0
       );
     }
 
@@ -5104,40 +5043,30 @@ function saveAMXPanelGeometry(panel) {
     else if (SALayout) {
       const qSmoothDb = mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range);
 
-      STATE._stereoQualityGradient = true;
-
-      try {
-        renderChannel(
-          qSmoothDb,
-          qSmoothDb,
-          0,
-          width,
-          barH,
-          effectiveW,
-          barStyle
-        );
-      } finally {
-        STATE._stereoQualityGradient = false;
-      }
+      renderBarChannelWithMode(
+        qSmoothDb,
+        qSmoothDb,
+        0,
+        width,
+        barH,
+        effectiveW,
+        barStyle,
+        2
+      );
 
       // Audio (SA)
       const { audioSmoothDb, audioPeakDb } = mapAudioLevelsToDb(audioLevels, minDb, range);
 
-      STATE._audioPeakGradient = true;
-
-      try {
-        renderChannel(
-          audioSmoothDb,
-          audioPeakDb,
-          rowStep,
-          width,
-          barH,
-          effectiveW,
-          barStyle
-        );
-      } finally {
-        STATE._audioPeakGradient = false;
-      }
+      renderBarChannelWithMode(
+        audioSmoothDb,
+        audioPeakDb,
+        rowStep,
+        width,
+        barH,
+        effectiveW,
+        barStyle,
+        1
+      );
     }
   }
 

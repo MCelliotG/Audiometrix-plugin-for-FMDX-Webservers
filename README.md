@@ -28,6 +28,7 @@ It is designed as a hybrid metering system, offering both technical insight and 
   Classic left/right metering
   
 - SA (Stereo Quality + Audio Peak)
+  
   ![amx2](https://github.com/user-attachments/assets/9f5d6241-f2e6-4515-b885-28043c55a946)
   
   Advanced signal analysis
@@ -40,12 +41,14 @@ It is designed as a hybrid metering system, offering both technical insight and 
   
 🔹 Render Modes
 - Bars — clean, linear meters
+  
   ![amx4](https://github.com/user-attachments/assets/055cbd26-acab-4369-ba32-f8309835d648)
 
 - Gauges — analog-style circular meters
   ![amx5](https://github.com/user-attachments/assets/0cb44e01-9e22-46d8-b1e0-c9758dfbf7bd)
 
 - Mirrored — symmetrical dual-channel display
+  
   ![amx6](https://github.com/user-attachments/assets/8f42ac97-0657-477b-8647-6c893f6473f3)
 
 

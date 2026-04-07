@@ -21,21 +21,33 @@ It is designed as a hybrid metering system, offering both technical insight and 
 🎨 Visual Modes & Layouts
 
 🔹 Layouts
-[b]- LR (Stereo Levels)[/b]
+- LR (Stereo Levels)
+  
   ![amx1](https://github.com/user-attachments/assets/c49b8dd5-2f16-410a-bfd7-095c31172c23)
+  
   Classic left/right metering
-[b]- SA (Stereo Quality + Audio Peak)[/b]
+  
+- SA (Stereo Quality + Audio Peak)
   ![amx2](https://github.com/user-attachments/assets/9f5d6241-f2e6-4515-b885-28043c55a946)
+  
   Advanced signal analysis
-[b]- FULL[/b]
+  
+- FULL
+  
   ![amx3](https://github.com/user-attachments/assets/b2be283e-8a6e-4cfa-b952-2194bfabd010)
+  
   Combined multi-row view (L/R + Q/A)
   
 🔹 Render Modes
 - Bars — clean, linear meters
-  
+  ![amx4](https://github.com/user-attachments/assets/055cbd26-acab-4369-ba32-f8309835d648)
+
 - Gauges — analog-style circular meters
+  ![amx5](https://github.com/user-attachments/assets/0cb44e01-9e22-46d8-b1e0-c9758dfbf7bd)
+
 - Mirrored — symmetrical dual-channel display
+  ![amx6](https://github.com/user-attachments/assets/8f42ac97-0657-477b-8647-6c893f6473f3)
+
 
 All modes share the same underlying data — only the presentation changes.
 
@@ -43,8 +55,9 @@ All modes share the same underlying data — only the presentation changes.
 
 AudioMetrix supports multiple visual styles:
 
-- Simple
-- Segment
+- Simple bars
+  
+- Segmented bars
 - Circle Dots
 - Matrix Dots
 - Pillars

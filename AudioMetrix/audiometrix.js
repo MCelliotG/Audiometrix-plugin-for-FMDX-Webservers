@@ -6,7 +6,7 @@
 
   // PLUGIN METADATA
   const AMX_PLUGIN_NAME        = "AudioMetrix";
-  const AMX_VERSION            = "3.9";
+  const AMX_VERSION            = "4.0";
   const AMX_CHECK_FOR_UPDATES  = true;
   const AMX_UPDATE_URL         =
     "https://raw.githubusercontent.com/MCelliotG/Audiometrix-plugin-for-FMDX-Webservers/main/AudioMetrix/audiometrix.js";
@@ -323,8 +323,8 @@
       }
 
       // GAIN (dB)
-      let gRaw = safeLSGet(STORAGE_GAIN);
-      let g = parseInt(gRaw, 10);
+      const gRaw = safeLSGet(STORAGE_GAIN);
+      const g = parseInt(gRaw, 10);
       if (isNaN(g) || g < -15 || g > 15) {
         safeLSSet(STORAGE_GAIN, "0");
       }
@@ -372,6 +372,14 @@
       ? `g:${tx}:${ty}:${Math.round((gauge.cx || 0) * 10)}:${Math.round((gauge.cy || 0) * 10)}:${Math.round((gauge.r || 0) * 10)}:${Math.round((gauge.startAngle || 0) * 1000)}:${Math.round((gauge.sweepAngle || 0) * 1000)}`
       : `b:${tx}:${ty}:${Math.round(y)}:${Math.round(effectiveW)}`;
 
+    // Same visibility rule as readouts
+    const hasStreamObject = STATE.hasStreamObject === true;
+
+    if (!hasStreamObject) {
+      delete bucket[stateKey];
+      return;
+    }
+
     const peakState = (bucket[stateKey] ??= {});
 
     if (typeof peakState.pos !== "number") {
@@ -389,8 +397,6 @@
 
     if (!gauge) {
       // BAR DOMAIN
-      if (peakX <= 0) return;
-
       const BAR_EDGE_INSET = 5;
       const PEAK_THROW_PX = 8;
 
@@ -524,13 +530,7 @@
 
     let cache = GRADIENT_CACHE_MAP.get(hash);
     if (cache) {
-      GRADIENT_CACHE.mode = cache.mode;
-      GRADIENT_CACHE.width = cache.width;
-      GRADIENT_CACHE.colors = cache.colors;
-      GRADIENT_CACHE.stops = cache.stops;
-      GRADIENT_CACHE.peakThresholdX = cache.peakThresholdX;
-      GRADIENT_CACHE.hash = cache.hash;
-      return GRADIENT_CACHE;
+      return cache;
     }
 
     cache = {
@@ -556,46 +556,37 @@
     tctx.clearRect(0, 0, width, 1);
 
     // 6) Build gradient
-    const grad = (() => {
+    const grad = tctx.createLinearGradient(0, 0, width, 0);
 
-      const g = tctx.createLinearGradient(0, 0, width, 0);
+    // ===== AUDIO PEAK =====
+    if (mode === 1) {
+      grad.addColorStop(0.00, low);
+      grad.addColorStop(mid_pos, mid);
+      grad.addColorStop(high_pos, high);
 
-      // ===== AUDIO PEAK =====
-      if (mode === 1) {
+      grad.addColorStop(Math.max(0, t1), high);
+      grad.addColorStop(Math.min(1, t2), RED_ZONE_COLOR);
+      grad.addColorStop(1.00, RED_ZONE_COLOR);
 
-        g.addColorStop(0.00, low);
-        g.addColorStop(mid_pos, mid);
-        g.addColorStop(high_pos, high);
+    // ===== STEREO QUALITY =====
+    } else if (mode === 2) {
+      // Reverse theme gradient up to THR
+      grad.addColorStop(0.00, high);
+      grad.addColorStop(Math.min(mid_pos, t1), mid);
+      grad.addColorStop(Math.min(high_pos, t1), low);
 
-        g.addColorStop(Math.max(0, t1), high);
-        g.addColorStop(Math.min(1, t2), RED_ZONE_COLOR);
-        g.addColorStop(1.00, RED_ZONE_COLOR);
-        return g;
-      }
+      // Yellow zone starts at THR
+      grad.addColorStop(Math.max(0, t1), low);
+      grad.addColorStop(Math.min(1, t2), YELLOW_ZONE_COLOR);
+      grad.addColorStop(1.00, YELLOW_ZONE_COLOR);
 
-      // ===== STEREO QUALITY =====
-      if (mode === 2) {
-
-        // Reverse theme gradient up to THR
-        g.addColorStop(0.00, high);
-        g.addColorStop(Math.min(mid_pos, t1), mid);
-        g.addColorStop(Math.min(high_pos, t1), low);
-
-        // Yellow zone starts at THR
-        g.addColorStop(Math.max(0, t1), low);
-        g.addColorStop(Math.min(1, t2), YELLOW_ZONE_COLOR);
-        g.addColorStop(1.00, YELLOW_ZONE_COLOR);
-        return g;
-      }
-
-      // ===== NORMAL =====
-      g.addColorStop(0.00, low);
-      g.addColorStop(0.50, mid);
-      g.addColorStop(0.80, high);
-      g.addColorStop(1.00, high);
-      return g;
-
-    })();
+    // ===== NORMAL =====
+    } else {
+      grad.addColorStop(0.00, low);
+      grad.addColorStop(0.50, mid);
+      grad.addColorStop(0.80, high);
+      grad.addColorStop(1.00, high);
+    }
 
     tctx.fillStyle = grad;
     tctx.fillRect(0, 0, width, 1);
@@ -628,15 +619,7 @@
     });
 
     GRADIENT_CACHE_MAP.set(hash, cache);
-
-    GRADIENT_CACHE.mode = cache.mode;
-    GRADIENT_CACHE.width = cache.width;
-    GRADIENT_CACHE.colors = cache.colors;
-    GRADIENT_CACHE.stops = cache.stops;
-    GRADIENT_CACHE.peakThresholdX = cache.peakThresholdX;
-    GRADIENT_CACHE.hash = cache.hash;
-
-    return GRADIENT_CACHE;
+    return cache;
   }
 
   // COLOR INTERPOLATION
@@ -1224,8 +1207,6 @@
       height: 0,
       dirty: true
     },
-
-    fullBarsFrameSkip: 0,
 
     peakHoldUntil: {
       left: 0,
@@ -2512,7 +2493,7 @@ function saveAMXPanelGeometry(panel) {
                  style="display:flex;
                         transform:scale(0.6);
                         transform-origin:left center;
-                        margin-left:28px;">
+                        margin-left:30px;">
               <input type="checkbox" id="glow-toggle">
               <label for="glow-toggle"></label>
             </div>
@@ -2545,7 +2526,7 @@ function saveAMXPanelGeometry(panel) {
                  style="display:flex; align-items:right;
                         transform:scale(0.6);
                         transform-origin:left center;
-                        margin-left:30px;">
+                        margin-left:25px;">
               <input type="checkbox" id="peak-toggle">
               <label for="peak-toggle"></label>
             </div>
@@ -2582,7 +2563,7 @@ function saveAMXPanelGeometry(panel) {
                style="display:flex; align-items:right;
                       transform:scale(0.6);
                       transform-origin:left center;
-                      margin-left:19px;">
+                      margin-left:21px;">
             <input type="checkbox" id="amx-show-readouts">
             <label for="amx-show-readouts"></label>
           </div>
@@ -2722,32 +2703,23 @@ function saveAMXPanelGeometry(panel) {
       cg.style.pointerEvents = "none";
     }
 
-    // ACTIVATE REQUESTED CANVAS
+    let activeCanvas = null;
+
     if (type === "mirrored") {
-      if (cm) {
-        cm.style.display = "block";
-        cm.style.visibility = "visible";
-        cm.style.pointerEvents = "auto";
-        STATE.dom.canvas = cm;
-        STATE.dom.ctx = cm.getContext("2d");
-      }
+      activeCanvas = cm;
     } else if (type === "gauges") {
-      if (cg) {
-        cg.style.display = "block";
-        cg.style.visibility = "visible";
-        cg.style.pointerEvents = "auto";
-        STATE.dom.canvas = cg;
-        STATE.dom.ctx = cg.getContext("2d");
-      }
+      activeCanvas = cg;
     } else {
       // NORMAL (default)
-      if (cn) {
-        cn.style.display = "block";
-        cn.style.visibility = "visible";
-        cn.style.pointerEvents = "auto";
-        STATE.dom.canvas = cn;
-        STATE.dom.ctx = cn.getContext("2d");
-      }
+      activeCanvas = cn;
+    }
+
+    if (activeCanvas) {
+      activeCanvas.style.display = "block";
+      activeCanvas.style.visibility = "visible";
+      activeCanvas.style.pointerEvents = "auto";
+      STATE.dom.canvas = activeCanvas;
+      STATE.dom.ctx = activeCanvas.getContext("2d");
     }
   }
 
@@ -2799,15 +2771,19 @@ function saveAMXPanelGeometry(panel) {
   }
 
   function refreshLayoutAndCanvas() {
-    markLayoutDirty();
+    const prevW = STATE.layout.width;
+    const prevH = STATE.layout.height;
 
-    if (STATE.dom.contentWrapper) {
-      forceResizeCanvas();
-      return;
+    markLayoutDirty();
+    readLayoutOnce();
+
+    if (
+      STATE.layout.width !== prevW ||
+      STATE.layout.height !== prevH
+    ) {
+      invalidateVisualCaches();
     }
 
-    readLayoutOnce();
-    invalidateVisualCaches();
     requestRender();
   }
 
@@ -2830,20 +2806,17 @@ function saveAMXPanelGeometry(panel) {
     const cm = STATE.dom.canvasMirror;
     if (!cm) return;
 
-    const metrics = getMirroredLayoutMetrics();
-    const h = metrics.singlePanelHeight;
-    const offsetY = metrics.canvasOffsetY;
+    const { singlePanelHeight, canvasOffsetY } = getMirroredLayoutMetrics();
 
-    const nextH = h + "px";
-    const nextMinH = h + "px";
+    const nextSize = singlePanelHeight + "px";
     const nextTransform =
-      offsetY !== 0 ? `translateY(${offsetY}px)` : "";
+      canvasOffsetY !== 0 ? `translateY(${canvasOffsetY}px)` : "";
 
-    if (cm.style.height !== nextH) {
-      cm.style.height = nextH;
+    if (cm.style.height !== nextSize) {
+      cm.style.height = nextSize;
     }
-    if (cm.style.minHeight !== nextMinH) {
-      cm.style.minHeight = nextMinH;
+    if (cm.style.minHeight !== nextSize) {
+      cm.style.minHeight = nextSize;
     }
     if (cm.style.transform !== nextTransform) {
       cm.style.transform = nextTransform;
@@ -2865,11 +2838,12 @@ function saveAMXPanelGeometry(panel) {
     const singleRowHeight =
       Math.floor((height_mirrored - mirrorHeightTrim - rowGap) / 2);
 
+    const halfRow = singleRowHeight / 2;
     const baseTopCenter =
-      Math.floor(mirroredYOffset + singleRowHeight / 2);
+      Math.floor(mirroredYOffset + halfRow);
 
     const baseBottomCenter =
-      Math.floor(singleRowHeight + rowGap + mirroredYOffset + singleRowHeight / 2);
+      Math.floor(singleRowHeight + rowGap + mirroredYOffset + halfRow);
 
     const topCenterY = baseTopCenter + 4;
     const bottomCenterY = baseBottomCenter + 6;
@@ -2936,9 +2910,10 @@ function saveAMXPanelGeometry(panel) {
   function mapDbToX(db, width) {
     const min = CONFIG.audio.minDb;
     const max = CONFIG.audio.maxDb;
+    const range = max - min;
     if (db < min) db = min;
-    if (db > max) db = max;
-    return ((db - min) / (max - min)) * width;
+    else if (db > max) db = max;
+    return (db - min) * width / range;
   }
 
   // EFFECTIVE WIDTH
@@ -3158,43 +3133,10 @@ function saveAMXPanelGeometry(panel) {
   }
 
   // GAUGES VALUES
-  function getGaugeInputs() {
-    const layout = CONFIG.display.layoutMode;
-    const width = STATE.dom.canvas
-      ? STATE.dom.canvas.width
-      : 1;
-
-    // ---------- LR MODE ----------
-    if (layout === "lr") {
-      const lDb = STATE.levels.left.smoothDb;
-      const rDb = STATE.levels.right.smoothDb;
-
-      const AMX_GAUGE_GAIN = 1.10; // 1.25–1.45
-
-      return [
-        {
-          id: "L",
-          value: Math.max(
-            0,
-            Math.min(1,
-              (mapDbToX(lDb, width) / width) * AMX_GAUGE_GAIN))
-        },
-        {
-          id: "R",
-          value: Math.max(
-            0,
-            Math.min(1, (mapDbToX(rDb, width) / width) * AMX_GAUGE_GAIN))
-        }
-      ];
-    }
-
-    return [];
-  }
-
   function computeFracAndMode(layout, i, W) {
     const widthRef = W || 1;
-    const { minDb, maxDb } = CONFIG.audio;
-    const range = (maxDb - minDb) || 1;
+    const minDb = CONFIG.audio.minDb;
+    const range = (CONFIG.audio.maxDb - minDb) || 1;
 
     const SIGNAL_MAX_RATIO = 0.90;
     const Q_MAX = 120;
@@ -3330,30 +3272,35 @@ function saveAMXPanelGeometry(panel) {
   function renderSimple(ctx, levelX, peakX, y, height, width, gcache) {
 
     const effectiveW = getEffectiveBarWidth(width);
-    const barW       = Math.max(0, effectiveW - 5);
-    const glowIntensity = CONFIG.display.glowIntensity;
+    const barW = Math.max(0, effectiveW - 5);
+    const glowIntensity = CONFIG.display.glowIntensity | 0;
 
-    if (!gcache || !gcache.colors || !gcache.colors.length) {
+    if (!gcache || !(gcache.colors && gcache.colors.length)) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
     }
 
+    const colors = gcache.colors;
+    const colorLen = colors.length;
     const minLevel = Math.min(levelX, barW);
+
     if (minLevel <= 0) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
     }
 
-    const h      = Math.floor(height);
-    const w      = Math.min(Math.floor(minLevel), gcache.colors.length);
-    const colors = gcache.colors;
-    const yy     = y;
+    const h = Math.floor(height);
+    const yy = y;
+    const fillFloor = Math.floor(minLevel);
 
     // UNIFIED GEOMETRY CACHE
     const xs = getPixelFillXs(barW);
 
     // DRAW BAR — pixel accurate
-    const maxX = Math.min(w, xs.length);
+    const maxX =
+      fillFloor < colorLen
+        ? (fillFloor < xs.length ? fillFloor : xs.length)
+        : (colorLen < xs.length ? colorLen : xs.length);
     for (let i = 0; i < maxX; i++) {
       const x = xs[i];
       ctx.fillStyle = colors[x];
@@ -3363,10 +3310,10 @@ function saveAMXPanelGeometry(panel) {
     // SIMPLE GLOW — rim + soft fade (NO BLUR)
     if (glowIntensity > 0) {
 
-      const rimExpand  = 1.5;
+      const rimExpand = 1.5;
       const fadeExpand = 3.5;
 
-      const rimAlpha  = 0.14 * glowIntensity;
+      const rimAlpha = 0.14 * glowIntensity;
       const fadeAlpha = 0.02 * glowIntensity;
 
       ctx.save();
@@ -3410,9 +3357,9 @@ function saveAMXPanelGeometry(panel) {
     const effectiveW = getEffectiveBarWidth(width);
     const barW = Math.max(0, effectiveW - 5);
     const segGap = 2;
-    const glowIntensity = CONFIG.display.glowIntensity;
+    const glowIntensity = CONFIG.display.glowIntensity | 0;
 
-    if (!gcache || !gcache.colors || !gcache.colors.length) {
+    if (!gcache || !(gcache.colors && gcache.colors.length)) {
       drawExternalPeak(
         ctx,
         levelX,
@@ -3427,10 +3374,23 @@ function saveAMXPanelGeometry(panel) {
       return;
     }
 
+    const colors = gcache.colors;
+    const colorLen = colors.length;
+    const segmentCache = GEOMETRY_CACHE.segment;
+
+    const doGlow = glowIntensity > 0;
+    const rimExpand = 1.2;
+    const fadeExpand = 3.8;
+    const rimAlpha = 0.22 * glowIntensity;
+    const fadeAlpha = 0.07 * glowIntensity;
+
+    const renderMode = CONFIG.display.renderMode;
+    const layoutMode = CONFIG.display.layoutMode;
+    const isMirrored = renderMode === "mirrored" && MIRRORED_LAYOUTS.includes(layoutMode);
+
     // MIRRORED MODE (LR/SA = 2 ROWS, FULL = 1 ROW)
-    if (CONFIG.display.renderMode === "mirrored" && MIRRORED_LAYOUTS.includes(CONFIG.display.layoutMode))
-      {
-      const isFullMirrored = CONFIG.display.layoutMode === "full";
+    if (isMirrored) {
+      const isFullMirrored = layoutMode === "full";
       const rows = isFullMirrored ? 1 : 2;
       const rowGap = 8;
       const rowH = isFullMirrored ? height : Math.floor((height - rowGap) / 2);
@@ -3438,15 +3398,15 @@ function saveAMXPanelGeometry(panel) {
       const segW = Math.max(2, Math.floor(rowH / 3.2));
       const minLevel = Math.min(levelX, barW);
 
-      const SEG_KEY = `${barW}|${segW}|${segGap}`;
-      let xs = GEOMETRY_CACHE.segment.get(SEG_KEY);
+      const segKey = `${barW}|${segW}|${segGap}`;
+      let xs = segmentCache.get(segKey);
 
       if (!xs) {
         xs = [];
         for (let x = 0; x <= barW; x += segW + segGap) {
           xs.push(x);
         }
-        GEOMETRY_CACHE.segment.set(SEG_KEY, xs);
+        segmentCache.set(segKey, xs);
       }
 
       for (let r = 0; r < rows; r++) {
@@ -3456,25 +3416,19 @@ function saveAMXPanelGeometry(panel) {
         drawSegmentGlassLayer(ctx, ry, rowH, barW, segW, segGap);
 
         if (minLevel > 0) {
-          for (let i = 0; i < xs.length; i++) {
+          for (let i = 0, len = xs.length; i < len; i++) {
             const x = xs[i];
             if (x + segW > minLevel) break;
 
-            const colorIndex = Math.min(x, gcache.colors.length - 1);
-            const segColor = gcache.colors[colorIndex];
+            const colorIndex = Math.min(x, colorLen - 1);
+            const segColor = colors[colorIndex];
 
             // segment fill
             ctx.fillStyle = segColor;
             ctx.fillRect(x, ry, segW, rowH);
 
             // unified glow (stronger around segment)
-            if (glowIntensity > 0) {
-              const rimExpand = 1.2;
-              const fadeExpand = 3.8;
-
-              const rimAlpha = 0.22 * glowIntensity;
-              const fadeAlpha = 0.07 * glowIntensity;
-
+            if (doGlow) {
               // rim glow
               ctx.save();
               ctx.globalAlpha = rimAlpha;
@@ -3525,40 +3479,34 @@ function saveAMXPanelGeometry(panel) {
     const segW = Math.max(2, Math.floor(segH / 2.9));
     const minLevel = Math.min(levelX, barW);
 
-    const SEG_KEY = `${barW}|${segW}|${segGap}`;
-    let xs = GEOMETRY_CACHE.segment.get(SEG_KEY);
+    const segKey = `${barW}|${segW}|${segGap}`;
+    let xs = segmentCache.get(segKey);
 
     if (!xs) {
       xs = [];
       for (let x = 0; x <= barW; x += segW + segGap) {
         xs.push(x);
       }
-      GEOMETRY_CACHE.segment.set(SEG_KEY, xs);
+      segmentCache.set(segKey, xs);
     }
 
     // static glass layer
     drawSegmentGlassLayer(ctx, y, segH, barW, segW, segGap);
 
     if (minLevel > 0) {
-      for (let i = 0; i < xs.length; i++) {
+      for (let i = 0, len = xs.length; i < len; i++) {
         const x = xs[i];
         if (x + segW > minLevel) break;
 
-        const colorIndex = Math.min(x, gcache.colors.length - 1);
-        const segColor = gcache.colors[colorIndex];
+        const colorIndex = Math.min(x, colorLen - 1);
+        const segColor = colors[colorIndex];
 
         // segment fill
         ctx.fillStyle = segColor;
         ctx.fillRect(x, y, segW, segH);
 
         // unified glow (same profile as mirrored)
-        if (glowIntensity > 0) {
-          const rimExpand = 1.2;
-          const fadeExpand = 3.8;
-
-          const rimAlpha = 0.22 * glowIntensity;
-          const fadeAlpha = 0.07 * glowIntensity;
-
+        if (doGlow) {
           // rim glow
           ctx.save();
           ctx.globalAlpha = rimAlpha;
@@ -3594,7 +3542,7 @@ function saveAMXPanelGeometry(panel) {
   function renderCircledots(ctx, levelX, peakX, y, height, width, gcache) {
 
     const effectiveW = getEffectiveBarWidth(width);
-    const glowIntensity = CONFIG.display.glowIntensity;
+    const glowIntensity = CONFIG.display.glowIntensity | 0;
     const renderMode = CONFIG.display.renderMode;
     const layoutMode = CONFIG.display.layoutMode;
     const isMirrored = renderMode === "mirrored";
@@ -3606,12 +3554,21 @@ function saveAMXPanelGeometry(panel) {
       return;
     }
 
-    if (!gcache || !gcache.colors || !gcache.colors.length) {
+    if (!gcache || !(gcache.colors && gcache.colors.length)) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
     }
 
-    if (!GEOMETRY_CACHE.circledots) GEOMETRY_CACHE.circledots = new Map();
+    const colors = gcache.colors;
+    const colorLen = colors.length;
+    const minLevel = (levelX < effectiveW) ? levelX : effectiveW;
+    const circledotsCache = GEOMETRY_CACHE.circledots;
+
+    const doGlow = glowIntensity > 0;
+    const rimExpand  = 1.4;
+    const fadeExpand = 4.5;
+    const rimAlpha  = 0.24 * glowIntensity;
+    const fadeAlpha = 0.08 * glowIntensity;
 
     // MIRRORED MODE (2 rows) — only for LR / SA
     if (isMirroredLRSA) {
@@ -3622,31 +3579,27 @@ function saveAMXPanelGeometry(panel) {
       const row1Y = Math.round(y + height * 0.40);
       const row2Y = Math.round(y + height * 0.80);
 
-      const minLevel = Math.min(levelX, effectiveW);
-
       // cache geometry
-      const KEY = `${effectiveW}|${radius}|${gapX}|mirrored`;
-      let xs = GEOMETRY_CACHE.circledots.get(KEY);
+      const key = `${effectiveW}|${radius}|${gapX}|mirrored`;
+      let xs = circledotsCache.get(key);
 
       if (!xs) {
         xs = [];
         for (let x = radius; x < effectiveW; x += gapX) xs.push(x);
-        GEOMETRY_CACHE.circledots.set(KEY, xs);
+        circledotsCache.set(key, xs);
       }
 
       for (let row = 0; row < 2; row++) {
         const cy = (row === 0 ? row1Y : row2Y);
         const offset = row === 0 ? 0 : radius;
 
-        for (let i = 0; i < xs.length; i++) {
-
+        for (let i = 0, len = xs.length; i < len; i++) {
           const x = xs[i] + offset;
           if (x > minLevel) break;
-
           if (x + radius > effectiveW) break;
 
-          const idx = Math.min(x, gcache.colors.length - 1);
-          const c   = gcache.colors[idx];
+          const idx = Math.min(x, colorLen - 1);
+          const c = colors[idx];
 
           // DOT
           ctx.fillStyle = c;
@@ -3655,13 +3608,7 @@ function saveAMXPanelGeometry(panel) {
           ctx.fill();
 
           // UNIFIED GLOW
-          if (glowIntensity > 0) {
-
-            const rimExpand  = 1.4;
-            const fadeExpand = 4.5;
-
-            const rimAlpha  = 0.24 * glowIntensity;
-            const fadeAlpha = 0.08 * glowIntensity;
+          if (doGlow) {
 
             // rim
             ctx.save();
@@ -3691,32 +3638,30 @@ function saveAMXPanelGeometry(panel) {
     // NORMAL MODE
     const dotBaseHeight =
       (isMirrored && layoutMode === "full")
-        ? CONFIG.display.dimensions.barHeight : height;
+        ? CONFIG.display.dimensions.barHeight
+        : height;
 
-    const radius  = Math.max(3, Math.floor(dotBaseHeight * 0.54));
-    const gap     = 4;
-    const stepX   = radius * 2 + gap;
+    const radius = Math.max(3, Math.floor(dotBaseHeight * 0.54));
+    const gap = 4;
+    const stepX = radius * 2 + gap;
     const cy = y + height / 2 + peakYOffset;
 
-    const minLevel = Math.min(levelX, effectiveW);
-
-    const KEY = `${effectiveW}|${radius}|${stepX}|normal`;
-    let xs = GEOMETRY_CACHE.circledots.get(KEY);
+    const key = `${effectiveW}|${radius}|${stepX}|normal`;
+    let xs = circledotsCache.get(key);
 
     if (!xs) {
       xs = [];
       for (let x = radius; x < effectiveW; x += stepX) xs.push(x);
-      GEOMETRY_CACHE.circledots.set(KEY, xs);
+      circledotsCache.set(key, xs);
     }
 
-    for (let i = 0; i < xs.length; i++) {
+    for (let i = 0, len = xs.length; i < len; i++) {
       const x = xs[i];
       if (x > minLevel) break;
-
       if (x + radius > effectiveW) break;
 
-      const idx = Math.min(x, gcache.colors.length - 1);
-      const c   = gcache.colors[idx];
+      const idx = Math.min(x, colorLen - 1);
+      const c = colors[idx];
 
       // DOT
       ctx.fillStyle = c;
@@ -3725,13 +3670,7 @@ function saveAMXPanelGeometry(panel) {
       ctx.fill();
 
       // UNIFIED GLOW
-      if (glowIntensity > 0) {
-
-        const rimExpand  = 1.4;
-        const fadeExpand = 4.5;
-
-        const rimAlpha  = 0.24 * glowIntensity;
-        const fadeAlpha = 0.08 * glowIntensity;
+      if (doGlow) {
 
         // rim
         ctx.save();
@@ -3760,7 +3699,7 @@ function saveAMXPanelGeometry(panel) {
   // -------------
   function renderMatrixdots(ctx, levelX, peakX, y, height, width, gcache) {
     const effectiveW = getEffectiveBarWidth(width);
-    const glowIntensity = CONFIG.display.glowIntensity;
+    const glowIntensity = CONFIG.display.glowIntensity | 0;
     const renderMode = CONFIG.display.renderMode;
     const layoutMode = CONFIG.display.layoutMode;
     const isMirrored = renderMode === "mirrored";
@@ -3772,14 +3711,22 @@ function saveAMXPanelGeometry(panel) {
       return;
     }
 
-    if (!gcache || !gcache.colors || !gcache.colors.length) {
+    if (!gcache || !(gcache.colors && gcache.colors.length)) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
     }
 
-    const minLevel = Math.min(levelX, effectiveW);
+    const colors = gcache.colors;
+    const colorLen = colors.length;
+    const minLevel = (levelX < effectiveW) ? levelX : effectiveW;
 
-    if (!GEOMETRY_CACHE.matrixdots) GEOMETRY_CACHE.matrixdots = new Map();
+    // Glow constants precomputed once
+    const doGlow = glowIntensity > 0;
+    const glowAlpha = 0.38 * glowIntensity;
+    const glowBlur = 5.5;
+
+    const matrixdotsCache = GEOMETRY_CACHE.matrixdots;
+    const matrixCountCache = GEOMETRY_CACHE.matrixCount;
 
     // MIRRORED MODE (WEDGE) — only for LR / SA
     if (isMirroredLRSA) {
@@ -3788,51 +3735,44 @@ function saveAMXPanelGeometry(panel) {
       const radius = Math.max(2, Math.min(maxR, Math.floor(height * 0.085)));
       const stepX = radius * 2 + 2;
       const stepY = radius * 2 + 2;
+      const glowR = radius + 1.9;
 
       const centerY = y + height * 0.5;
 
-      const KEY = `${effectiveW}|${radius}|${stepX}|mirrored_matrix`;
+      const key = `${effectiveW}|${radius}|${stepX}|mirrored_matrix`;
 
       // Precompute X positions
-      let xs = GEOMETRY_CACHE.matrixdots.get(KEY);
-
+      let xs = matrixdotsCache.get(key);
       if (!xs) {
         xs = [];
         for (let x = radius; x < effectiveW; x += stepX) xs.push(x);
-        GEOMETRY_CACHE.matrixdots.set(KEY, xs);
+        matrixdotsCache.set(key, xs);
       }
 
-      // Precompute counts for each column (only once per KEY)
-      let counts = GEOMETRY_CACHE.matrixCount.get(KEY);
+      // Precompute counts for each column (only once per key)
+      let counts = matrixCountCache.get(key);
       if (!counts) {
         const maxCountRaw = Math.floor((height - padY * 2 + stepY) / stepY);
         const maxCount =
           Math.max(2, (maxCountRaw % 2 === 0) ? maxCountRaw : maxCountRaw - 1);
 
         counts = new Array(xs.length);
-        for (let i = 0; i < xs.length; i++) {
+        for (let i = 0, len = xs.length; i < len; i++) {
           const desired = 2 + 2 * i;
           counts[i] = Math.min(maxCount, desired);
         }
 
-        GEOMETRY_CACHE.matrixCount.set(KEY, counts);
+        matrixCountCache.set(key, counts);
       }
 
-      // Glow constants precomputed
-      const doGlow = glowIntensity > 0;
-      const glowAlpha = 0.38 * glowIntensity;
-      const glowBlur = 5.5;
-      const glowR = radius + 1.9;
-
       // DRAW
-      for (let i = 0; i < xs.length; i++) {
+      for (let i = 0, len = xs.length; i < len; i++) {
         const x = xs[i];
         if (x > minLevel) break;
         if (x + radius > effectiveW) break;
 
-        const idx = Math.min(x, gcache.colors.length - 1);
-        const c = gcache.colors[idx];
-
+        const idx = Math.min(x, colorLen - 1);
+        const c = colors[idx];
         const count = counts[i];
 
         for (let j = 0; j < count; j++) {
@@ -3872,6 +3812,7 @@ function saveAMXPanelGeometry(panel) {
 
     const radius = Math.max(2, Math.round(visualHeight * 0.19));
     const gapX = radius * 2 + 2;
+    const glowR = radius + 1.9;
 
     const matrixYOffset = isFullMirrored ? 6 : 0;
     const visualTop = isFullMirrored
@@ -3881,21 +3822,14 @@ function saveAMXPanelGeometry(panel) {
     const row1Y = visualTop + visualHeight * 0.28;
     const row2Y = visualTop + visualHeight * 0.72;
 
-    const KEY = `${effectiveW}|${radius}|${gapX}|normal_matrix`;
+    const key = `${effectiveW}|${radius}|${gapX}|normal_matrix`;
 
-    let xs2 = GEOMETRY_CACHE.matrixdots.get(KEY);
-
+    let xs2 = matrixdotsCache.get(key);
     if (!xs2) {
       xs2 = [];
       for (let x = radius; x < effectiveW; x += gapX) xs2.push(x);
-      GEOMETRY_CACHE.matrixdots.set(KEY, xs2);
+      matrixdotsCache.set(key, xs2);
     }
-
-    // Glow constants precomputed
-    const doGlow = glowIntensity > 0;
-    const glowAlpha = 0.38 * glowIntensity;
-    const glowBlur = 5.5;
-    const glowR = radius + 1.9;
 
     // DRAW — EXACTLY LIKE THE ORIGINAL: 2 FIXED ROWS
     for (let i = 0; i < xs2.length; i++) {
@@ -3903,8 +3837,8 @@ function saveAMXPanelGeometry(panel) {
       if (x > minLevel) break;
       if (x + radius > effectiveW) break;
 
-      const idx = Math.min(x, gcache.colors.length - 1);
-      const c = gcache.colors[idx];
+      const idx = Math.min(x, colorLen - 1);
+      const c = colors[idx];
 
       // ROW 1
       ctx.fillStyle = c;
@@ -3949,33 +3883,53 @@ function saveAMXPanelGeometry(panel) {
   function renderPillars(ctx, levelX, peakX, y, height, width, gcache) {
 
     const effectiveW = getEffectiveBarWidth(width);
-    const fillX = levelX > 1 ? Math.min(levelX, effectiveW) : 0;
-    const glowIntensity = CONFIG.display.glowIntensity;
+    const fillX = levelX <= 1
+      ? 0
+      : (levelX < effectiveW ? levelX : effectiveW);
+    const fillFloor = Math.floor(fillX);
+    const glowIntensity = CONFIG.display.glowIntensity | 0;
 
-    if (!gcache || !gcache.colors || !gcache.colors.length) {
+    if (!gcache || !(gcache.colors && gcache.colors.length)) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
     }
 
+    const colors = gcache.colors;
     const topY = y;
     const h = Math.floor(height);
     const W = Math.floor(effectiveW);
+    const xs = getPixelFillXs(W);
+
+    const pathCache =
+      renderPillars._pathCache ||
+      (renderPillars._pathCache = new Map());
+
+    const glassCache =
+      renderPillars._glassCache ||
+      (renderPillars._glassCache = new Map());
+
+    const reflCache =
+      renderPillars._reflCache ||
+      (renderPillars._reflCache = new Map());
+
+    const glowGeomCache =
+      renderPillars._glowGeomCache ||
+      (renderPillars._glowGeomCache = new Map());
 
     // TRIANGLE PATH
     const midY = topY + h * 0.5;
     const bottomY = topY + h;
 
-    if (!renderPillars._pathCache) renderPillars._pathCache = new Map();
     const pathKey = `${topY}|${h}|${W}`;
 
-    let path = renderPillars._pathCache.get(pathKey);
+    let path = pathCache.get(pathKey);
     if (!path) {
       path = new Path2D();
       path.moveTo(0, midY);
       path.lineTo(W, topY);
       path.lineTo(W, bottomY);
       path.closePath();
-      renderPillars._pathCache.set(pathKey, path);
+      pathCache.set(pathKey, path);
     }
 
     // BASE GLASS BODY
@@ -3985,10 +3939,9 @@ function saveAMXPanelGeometry(panel) {
     ctx.fillStyle = "rgba(80,80,80,0.22)";
     ctx.fillRect(0, topY, W, h);
 
-    if (!renderPillars._glassCache) renderPillars._glassCache = new Map();
     const glassKey = `${topY}|${h}`;
 
-    let glass = renderPillars._glassCache.get(glassKey);
+    let glass = glassCache.get(glassKey);
     if (!glass) {
       glass = ctx.createLinearGradient(0, topY, 0, topY + h);
       glass.addColorStop(0.00, "rgba(255,255,255,0.38)");
@@ -3998,7 +3951,7 @@ function saveAMXPanelGeometry(panel) {
       glass.addColorStop(0.70, "rgba(0,0,0,0.08)");
       glass.addColorStop(0.88, "rgba(0,0,0,0.18)");
       glass.addColorStop(1.00, "rgba(0,0,0,0.26)");
-      renderPillars._glassCache.set(glassKey, glass);
+      glassCache.set(glassKey, glass);
     }
 
     ctx.fillStyle = glass;
@@ -4026,9 +3979,9 @@ function saveAMXPanelGeometry(panel) {
     if (fillX > 0) {
       const sampleX = Math.max(
         1,
-        Math.min(Math.floor(fillX) - 1, gcache.colors.length - 1)
+        Math.min(fillFloor - 1, colors.length - 1)
       );
-      const glassColor = gcache.colors[sampleX];
+      const glassColor = colors[sampleX];
       const fillRatio = Math.min(fillX / effectiveW, 1);
       const tintA = 0.05 + fillRatio * 0.10;
 
@@ -4042,18 +3995,14 @@ function saveAMXPanelGeometry(panel) {
 
     // SIGNAL FILL (pixel fill) — CACHED GEOMETRY
     if (fillX > 0) {
-      const fx = Math.min(Math.floor(fillX), gcache.colors.length);
-
-      // geometry
-      const xs = getPixelFillXs(W);
+      const fx = Math.min(fillFloor, colors.length, xs.length);
 
       ctx.save();
       ctx.clip(path);
 
-      // draw only until fx
       for (let i = 0; i < fx; i++) {
         const x = xs[i];
-        ctx.fillStyle = gcache.colors[i];
+        ctx.fillStyle = colors[i];
         ctx.fillRect(x, topY, 1, h);
       }
 
@@ -4063,7 +4012,7 @@ function saveAMXPanelGeometry(panel) {
     // TRIANGLE GLOW — rim + soft fade + ultra-soft outer haze
     if (glowIntensity > 0 && fillX > 1) {
 
-      const fx = Math.min(Math.floor(fillX), gcache.colors.length);
+      const fx = Math.min(fillFloor, colors.length, xs.length);
       if (fx > 0) {
 
         // glow profile
@@ -4076,64 +4025,80 @@ function saveAMXPanelGeometry(panel) {
         const hazeAlpha  = 0.003 * glowIntensity;
         const edgeAlpha  = 1.10 * glowIntensity;
 
-        const topYs = new Array(fx);
-        const spanHs = new Array(fx);
+        const glowGeomKey = `${topY}|${h}|${W}`;
+        let glowGeom = glowGeomCache.get(glowGeomKey);
 
-        for (let x = 0; x < fx; x++) {
-          const top = midY + (topY - midY) * (x / W);
-          const bot = midY + (bottomY - midY) * (x / W);
-          topYs[x] = top;
-          spanHs[x] = bot - top;
+        if (!glowGeom) {
+          const topYs = new Array(xs.length);
+          const spanHs = new Array(xs.length);
+
+          for (let i = 0; i < xs.length; i++) {
+            const x = xs[i];
+            const top = midY + (topY - midY) * (x / W);
+            const bot = midY + (bottomY - midY) * (x / W);
+            topYs[i] = top;
+            spanHs[i] = bot - top;
+          }
+
+          glowGeom = { topYs, spanHs };
+          glowGeomCache.set(glowGeomKey, glowGeom);
         }
+
+        const topYs = glowGeom.topYs;
+        const spanHs = glowGeom.spanHs;
 
         ctx.save();
 
         // RIM GLOW
         ctx.globalAlpha = rimAlpha;
-        for (let x = 0; x < fx; x++) {
-          ctx.fillStyle = gcache.colors[x];
+        for (let i = 0; i < fx; i++) {
+          const x = xs[i];
+          ctx.fillStyle = colors[i];
           ctx.fillRect(
             x - rimExpand,
-            topYs[x] - rimExpand,
+            topYs[i] - rimExpand,
             1 + rimExpand * 2,
-            spanHs[x] + rimExpand * 2
+            spanHs[i] + rimExpand * 2
           );
         }
 
         // INNER SOFT FADE
         ctx.globalAlpha = fadeAlpha;
-        for (let x = 0; x < fx; x++) {
-          ctx.fillStyle = gcache.colors[x];
+        for (let i = 0; i < fx; i++) {
+          const x = xs[i];
+          ctx.fillStyle = colors[i];
           ctx.fillRect(
             x - fadeExpand,
-            topYs[x] - fadeExpand,
+            topYs[i] - fadeExpand,
             1 + fadeExpand * 2,
-            spanHs[x] + fadeExpand * 2
+            spanHs[i] + fadeExpand * 2
           );
         }
 
         // ULTRA-SOFT OUTER HAZE
         ctx.globalAlpha = hazeAlpha;
-        for (let x = 0; x < fx; x++) {
-          ctx.fillStyle = gcache.colors[x];
+        for (let i = 0; i < fx; i++) {
+          const x = xs[i];
+          ctx.fillStyle = colors[i];
           ctx.fillRect(
             x - hazeExpand,
-            topYs[x] - hazeExpand,
+            topYs[i] - hazeExpand,
             1 + hazeExpand * 2,
-            spanHs[x] + hazeExpand * 2
+            spanHs[i] + hazeExpand * 2
           );
         }
 
         // BC EDGE ACCENT
         ctx.globalAlpha = edgeAlpha;
-        for (let x = fx - 2; x < fx; x++) {
-          if (x < 0) continue;
-          ctx.fillStyle = gcache.colors[x];
+        for (let i = fx - 2; i < fx; i++) {
+          if (i < 0) continue;
+          const x = xs[i];
+          ctx.fillStyle = colors[i];
           ctx.fillRect(
             x - fadeExpand,
-            topYs[x] - fadeExpand - 1,
+            topYs[i] - fadeExpand - 1,
             1 + fadeExpand * 2,
-            spanHs[x] + fadeExpand * 2 + 2
+            spanHs[i] + fadeExpand * 2 + 2
           );
         }
 
@@ -4145,10 +4110,9 @@ function saveAMXPanelGeometry(panel) {
     ctx.save();
     ctx.clip(path);
 
-    if (!renderPillars._reflCache) renderPillars._reflCache = new Map();
     const reflKey = `${topY}|${h}`;
 
-    let refl = renderPillars._reflCache.get(reflKey);
+    let refl = reflCache.get(reflKey);
     if (!refl) {
       refl = ctx.createLinearGradient(0, topY, 0, topY + h);
       refl.addColorStop(0.00, "rgba(255,255,255,0.14)");
@@ -4156,7 +4120,7 @@ function saveAMXPanelGeometry(panel) {
       refl.addColorStop(0.55, "rgba(255,255,255,0.02)");
       refl.addColorStop(0.85, "rgba(0,0,0,0.05)");
       refl.addColorStop(1.00, "rgba(0,0,0,0.10)");
-      renderPillars._reflCache.set(reflKey, refl);
+      reflCache.set(reflKey, refl);
     }
 
     ctx.fillStyle = refl;
@@ -4180,12 +4144,28 @@ function saveAMXPanelGeometry(panel) {
       : getEffectiveBarWidth(width);
 
     const fillW = Math.max(0, Math.min(levelX, effectiveW));
-    const glowIntensity = CONFIG.display.glowIntensity;
+    const fillFloor = Math.floor(fillW);
+    const glowIntensity = CONFIG.display.glowIntensity | 0;
 
-    if (!gcache || !gcache.colors || !gcache.colors.length) {
+    if (!gcache || !(gcache.colors && gcache.colors.length)) {
       drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
       return;
     }
+
+    const colors = gcache.colors;
+    let xs = getPixelFillXs(effectiveW);
+
+    const pathCache =
+      renderBeveled3D._pathCache ||
+      (renderBeveled3D._pathCache = new Map());
+
+    const glassCache =
+      renderBeveled3D._glassCache ||
+      (renderBeveled3D._glassCache = new Map());
+
+    const liquidLightCache =
+      renderBeveled3D._liquidLightCache ||
+      (renderBeveled3D._liquidLightCache = new Map());
 
     // inner 3D
     function buildOuterInner(ry, rh) {
@@ -4197,10 +4177,9 @@ function saveAMXPanelGeometry(panel) {
       const innerH = rh - inset * 2;
       const r2 = Math.max(3, radius - inset * 0.65);
 
-      if (!renderBeveled3D._pathCache) renderBeveled3D._pathCache = new Map();
       const pathKey = `${effectiveW}|${ry}|${rh}|${radius}|${innerY}|${innerH}|${r2}`;
 
-      let cached = renderBeveled3D._pathCache.get(pathKey);
+      let cached = pathCache.get(pathKey);
       if (cached) return cached;
 
       // OUTER GLASS SHAPE
@@ -4227,7 +4206,7 @@ function saveAMXPanelGeometry(panel) {
       inner.quadraticCurveTo(0, innerY, r2, innerY);
 
       cached = { outer, inner, innerY, innerH };
-      renderBeveled3D._pathCache.set(pathKey, cached);
+      pathCache.set(pathKey, cached);
       return cached;
     }
 
@@ -4235,15 +4214,13 @@ function saveAMXPanelGeometry(panel) {
     function drawRow(ry, rh) {
 
       const { outer, inner, innerY, innerH } = buildOuterInner(ry, rh);
-      const xs = getPixelFillXs(effectiveW);
-      const colors = gcache.colors;
-      const maxFillX = Math.min(Math.floor(fillW), xs.length, colors.length);
+      const maxFillX = Math.min(fillFloor, xs.length, colors.length);
 
       // GLASS TINT
       if (fillW > 0) {
         const sampleX = Math.max(
           1,
-          Math.min(Math.floor(fillW) - 1, colors.length - 1)
+          Math.min(fillFloor - 1, colors.length - 1)
         );
         const glassColor = colors[sampleX];
         const fillRatio  = Math.min(fillW / effectiveW, 1);
@@ -4301,10 +4278,9 @@ function saveAMXPanelGeometry(panel) {
       ctx.save();
       ctx.clip(outer);
 
-      if (!renderBeveled3D._glassCache) renderBeveled3D._glassCache = new Map();
       const glassKey = `${ry}|${rh}`;
 
-      let glass = renderBeveled3D._glassCache.get(glassKey);
+      let glass = glassCache.get(glassKey);
       if (!glass) {
         glass = ctx.createLinearGradient(0, ry, 0, ry + rh);
         glass.addColorStop(0.00, "rgba(255,255,255,0.58)");
@@ -4312,7 +4288,7 @@ function saveAMXPanelGeometry(panel) {
         glass.addColorStop(0.42, "rgba(255,255,255,0.12)");
         glass.addColorStop(0.72, "rgba(0,0,0,0.14)");
         glass.addColorStop(1.00, "rgba(0,0,0,0.32)");
-        renderBeveled3D._glassCache.set(glassKey, glass);
+        glassCache.set(glassKey, glass);
       }
 
       ctx.fillStyle = glass;
@@ -4343,17 +4319,16 @@ function saveAMXPanelGeometry(panel) {
         const lightOffset = Math.max(1, Math.round(innerH * 0.08));
         const lightY = innerY + lightOffset;
 
-        if (!renderBeveled3D._liquidLightCache) renderBeveled3D._liquidLightCache = new Map();
         const liquidLightKey = `${innerH}|${lightOffset}|${lightH}`;
 
-        let liquidLight = renderBeveled3D._liquidLightCache.get(liquidLightKey);
+        let liquidLight = liquidLightCache.get(liquidLightKey);
         if (!liquidLight) {
           liquidLight = ctx.createLinearGradient(0, lightOffset, 0, lightOffset + lightH);
           liquidLight.addColorStop(0.00, "rgba(255,255,255,0.40)");
           liquidLight.addColorStop(0.30, "rgba(255,255,255,0.20)");
           liquidLight.addColorStop(0.65, "rgba(255,255,255,0.08)");
           liquidLight.addColorStop(1.00, "rgba(255,255,255,0.00)");
-          renderBeveled3D._liquidLightCache.set(liquidLightKey, liquidLight);
+          liquidLightCache.set(liquidLightKey, liquidLight);
         }
 
         ctx.fillStyle = liquidLight;
@@ -4408,18 +4383,39 @@ function saveAMXPanelGeometry(panel) {
       ? width
       : getEffectiveBarWidth(width);
 
-    const glowIntensity = CONFIG.display.glowIntensity;
+    const glowIntensity = CONFIG.display.glowIntensity | 0;
+    let xs = getPixelFillXs(effectiveW);
+
+    const pathCache =
+      renderGlassTube._pathCache ||
+      (renderGlassTube._pathCache = new Map());
+
+    const barShadeCache =
+      renderGlassTube._barShadeCache ||
+      (renderGlassTube._barShadeCache = new Map());
+
+    const glassCache =
+      renderGlassTube._glassCache ||
+      (renderGlassTube._glassCache = new Map());
+
+    const liquidLightCache =
+      renderGlassTube._liquidLightCache ||
+      (renderGlassTube._liquidLightCache = new Map());
+
     const drawTubeRow = (ry, rh) => {
 
       const radius = Math.max(4, rh * 0.18);
-      const fillW  = Math.max(0, Math.min(levelX, effectiveW));
-      const xs = getPixelFillXs(effectiveW);
+      const fillW = levelX <= 0
+        ? 0
+        : (levelX >= effectiveW ? effectiveW : levelX);
+      const fillFloor = Math.floor(fillW);
+      const colors = gcache.colors;
+      const fillLimit = Math.min(fillFloor, xs.length, colors.length);
 
       // TUBE SHAPE
-      if (!renderGlassTube._pathCache) renderGlassTube._pathCache = new Map();
       const pathKey = `${effectiveW}|${ry}|${rh}|${radius}`;
 
-      let tubePath = renderGlassTube._pathCache.get(pathKey);
+      let tubePath = pathCache.get(pathKey);
       if (!tubePath) {
         tubePath = new Path2D();
         tubePath.moveTo(radius, ry);
@@ -4431,13 +4427,13 @@ function saveAMXPanelGeometry(panel) {
         tubePath.quadraticCurveTo(0, ry + rh, 0, ry + rh - radius);
         tubePath.lineTo(0, ry + radius);
         tubePath.quadraticCurveTo(0, ry, radius, ry);
-        renderGlassTube._pathCache.set(pathKey, tubePath);
+        pathCache.set(pathKey, tubePath);
       }
 
       // 1) GLOW
       if (glowIntensity > 0 && fillW > 1) {
 
-        const fx = Math.min(Math.floor(fillW), xs.length, gcache.colors.length);
+        const fx = fillLimit;
 
         const rimExpand  = 1.5;
         const fadeExpand = 4.5;
@@ -4453,7 +4449,7 @@ function saveAMXPanelGeometry(panel) {
         ctx.globalAlpha = rimAlpha;
         for (let i = 0; i < fx; i++) {
           const x = xs[i];
-          ctx.fillStyle = gcache.colors[i];
+          ctx.fillStyle = colors[i];
           ctx.fillRect(
             x - rimExpand,
             ry - rimExpand,
@@ -4466,7 +4462,7 @@ function saveAMXPanelGeometry(panel) {
         ctx.globalAlpha = fadeAlpha;
         for (let i = 0; i < fx; i++) {
           const x = xs[i];
-          ctx.fillStyle = gcache.colors[i];
+          ctx.fillStyle = colors[i];
           ctx.fillRect(
             x - fadeExpand,
             ry - fadeExpand,
@@ -4479,7 +4475,7 @@ function saveAMXPanelGeometry(panel) {
         ctx.globalAlpha = hazeAlpha;
         for (let i = 0; i < fx; i++) {
           const x = xs[i];
-          ctx.fillStyle = gcache.colors[i];
+          ctx.fillStyle = colors[i];
           ctx.fillRect(
             x - hazeExpand,
             ry - hazeExpand,
@@ -4496,10 +4492,9 @@ function saveAMXPanelGeometry(panel) {
         ctx.save();
         ctx.clip(tubePath);
 
-        if (!renderGlassTube._barShadeCache) renderGlassTube._barShadeCache = new Map();
         const barShadeKey = `${ry}|${rh}`;
 
-        let barShade = renderGlassTube._barShadeCache.get(barShadeKey);
+        let barShade = barShadeCache.get(barShadeKey);
         if (!barShade) {
           barShade = ctx.createLinearGradient(0, ry, 0, ry + rh);
           barShade.addColorStop(0.00, "rgba(0,0,0,0.12)");
@@ -4507,7 +4502,7 @@ function saveAMXPanelGeometry(panel) {
           barShade.addColorStop(0.50, "rgba(0,0,0,0.02)");
           barShade.addColorStop(0.75, "rgba(0,0,0,0.06)");
           barShade.addColorStop(1.00, "rgba(0,0,0,0.14)");
-          renderGlassTube._barShadeCache.set(barShadeKey, barShade);
+          barShadeCache.set(barShadeKey, barShade);
         }
 
         ctx.globalAlpha = 0.55;
@@ -4521,9 +4516,9 @@ function saveAMXPanelGeometry(panel) {
 
         const sampleX = Math.max(
           1,
-          Math.min(Math.floor(fillW) - 1, gcache.colors.length - 1)
+          Math.min(fillFloor - 1, colors.length - 1)
         );
-        const glassColor = gcache.colors[sampleX];
+        const glassColor = colors[sampleX];
         const fillRatio  = Math.min(fillW / effectiveW, 1);
 
         const tintA = 0.08 + fillRatio * 0.16;
@@ -4540,10 +4535,9 @@ function saveAMXPanelGeometry(panel) {
       ctx.save();
       ctx.clip(tubePath);
 
-      if (!renderGlassTube._glassCache) renderGlassTube._glassCache = new Map();
       const glassKey = `${ry}|${rh}`;
 
-      let glass = renderGlassTube._glassCache.get(glassKey);
+      let glass = glassCache.get(glassKey);
       if (!glass) {
         glass = ctx.createLinearGradient(0, ry, 0, ry + rh);
         glass.addColorStop(0.00, "rgba(255,255,255,0.38)");
@@ -4552,7 +4546,7 @@ function saveAMXPanelGeometry(panel) {
         glass.addColorStop(0.55, "rgba(255,255,255,0.02)");
         glass.addColorStop(0.75, "rgba(0,0,0,0.14)");
         glass.addColorStop(1.00, "rgba(0,0,0,0.32)");
-        renderGlassTube._glassCache.set(glassKey, glass);
+        glassCache.set(glassKey, glass);
       }
 
       ctx.fillStyle = glass;
@@ -4567,10 +4561,10 @@ function saveAMXPanelGeometry(panel) {
         ctx.clip(tubePath);
         ctx.globalAlpha = 0.90;
 
-        const maxX = Math.min(Math.floor(fillW), xs.length, gcache.colors.length);
+        const maxX = fillLimit;
         for (let i = 0; i < maxX; i++) {
           const x = xs[i];
-          ctx.fillStyle = gcache.colors[i];
+          ctx.fillStyle = colors[i];
           ctx.fillRect(x, ry, 1, rh);
         }
         ctx.restore();
@@ -4585,17 +4579,16 @@ function saveAMXPanelGeometry(panel) {
         const lightOffset = Math.max(1, Math.round(rh * 0.04));
         const lightY = ry + lightOffset;
 
-        if (!renderGlassTube._liquidLightCache) renderGlassTube._liquidLightCache = new Map();
         const liquidLightKey = `${rh}|${lightOffset}|${lightH}`;
 
-        let liquidLight = renderGlassTube._liquidLightCache.get(liquidLightKey);
+        let liquidLight = liquidLightCache.get(liquidLightKey);
         if (!liquidLight) {
           liquidLight = ctx.createLinearGradient(0, lightOffset, 0, lightOffset + lightH);
           liquidLight.addColorStop(0.00, "rgba(255,255,255,0.34)");
           liquidLight.addColorStop(0.22, "rgba(255,255,255,0.20)");
           liquidLight.addColorStop(0.55, "rgba(255,255,255,0.08)");
           liquidLight.addColorStop(1.00, "rgba(255,255,255,0.00)");
-          renderGlassTube._liquidLightCache.set(liquidLightKey, liquidLight);
+          liquidLightCache.set(liquidLightKey, liquidLight);
         }
 
         ctx.fillStyle = liquidLight;
@@ -4648,6 +4641,16 @@ function saveAMXPanelGeometry(panel) {
     drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW);
   }
 
+  const RENDER_CHANNEL_RENDERERS = {
+    simple: renderSimple,
+    segment: renderSegment,
+    circledots: renderCircledots,
+    matrixdots: renderMatrixdots,
+    pillars: renderPillars,
+    beveled3d: renderBeveled3D,
+    glasstube: renderGlassTube
+  };
+
   // FULL RENDER CHANNEL — unified + stable
   function renderChannel(smoothDb, peakDb, y, width, barH, effectiveWOverride = null, barStyleOverride = null) {
 
@@ -4660,56 +4663,32 @@ function saveAMXPanelGeometry(panel) {
     // 0 = normal
     // 1 = audio peak (red zone)
     // 2 = stereo quality (yellow zone + reverse)
-    let mode = 0;
-
-    if (STATE._audioPeakGradient) {
-      mode = 1;
-    } else if (STATE._stereoQualityGradient) {
-      mode = 2;
-    }
+    const mode = STATE._audioPeakGradient
+      ? 1
+      : (STATE._stereoQualityGradient ? 2 : 0);
 
     const effectiveW = (effectiveWOverride != null)
       ? effectiveWOverride
       : getEffectiveBarWidth(width);
-    const levelX = mapDbToX(smoothDb, effectiveW);
-    const peakX  = mapDbToX(peakDb, effectiveW);
+
+    const mapX = mapDbToX;
+    const levelX = mapX(smoothDb, effectiveW);
+    const peakX  = (peakDb === smoothDb)
+      ? levelX
+      : mapX(peakDb, effectiveW);
 
     // unified gradient cache
-    const key = mode + "|" + effectiveW;
-
+    const key = (mode << 16) | effectiveW;
+    
     let gcache = FRAME_GRADIENT_CACHE.get(key);
-    if (!gcache) {
+    
+    if (gcache === undefined) {
       gcache = buildBarsGradient(mode, effectiveW);
       FRAME_GRADIENT_CACHE.set(key, gcache);
     }
-
-    // unified switch (simple included here)
-    switch (style) {
-
-      case "simple":
-        return renderSimple(ctx, levelX, peakX, y, barH, width, gcache);
-
-      case "segment":
-        return renderSegment(ctx, levelX, peakX, y, barH, width, gcache);
-
-      case "circledots":
-        return renderCircledots(ctx, levelX, peakX, y, barH, width, gcache);
-
-      case "matrixdots":
-        return renderMatrixdots(ctx, levelX, peakX, y, barH, width, gcache);
-
-      case "pillars":
-        return renderPillars(ctx, levelX, peakX, y, barH, width, gcache);
-
-      case "beveled3d":
-        return renderBeveled3D(ctx, levelX, peakX, y, barH, width, gcache);
-
-      case "glasstube":
-        return renderGlassTube(ctx, levelX, peakX, y, barH, width, gcache);
-
-      default:
-        return renderSimple(ctx, levelX, peakX, y, barH, width, gcache);
-    }
+    
+    const renderer = RENDER_CHANNEL_RENDERERS[style] || renderSimple;
+    return renderer(ctx, levelX, peakX, y, barH, width, gcache);
   }
 
   // Stereo quality/Audio peak common helpers
@@ -4731,10 +4710,8 @@ function saveAMXPanelGeometry(panel) {
   }
 
   function mapAudioLevelsToDb(audioLevels, minDb, range) {
-    const audioSmoothDb =
-      minDb + (audioLevels.smooth / 255) * range;
-    const audioPeakDb =
-      minDb + (audioLevels.peak / 255) * range;
+    const audioSmoothDb = minDb + (audioLevels.smooth / 255) * range;
+    const audioPeakDb = minDb + (audioLevels.peak / 255) * range;
 
     return { audioSmoothDb, audioPeakDb };
   }
@@ -4747,89 +4724,88 @@ function saveAMXPanelGeometry(panel) {
     const showReadouts = CONFIG.display.showReadouts;
 
     const minDb = CONFIG.audio.minDb;
-    const maxDb = CONFIG.audio.maxDb;
-    const range = maxDb - minDb;
+    const range = CONFIG.audio.maxDb - minDb;
 
     FRAME_GRADIENT_CACHE.clear();
 
-    const visualStateKey =
-      layout + "|" +
-      render + "|" +
-      barStyle + "|" +
-      showReadouts;
+    const visualStateKey = `${layout}|${render}|${barStyle}|${showReadouts}`;
 
     if (visualStateKey !== _lastVisualStateKey) {
       _lastVisualStateKey = visualStateKey;
       applyVisualState();
     }
 
-    const useMirrored = render === "mirrored" && MIRRORED_LAYOUTS.includes(layout);
+    const GaugesRender = (render === "gauges");
+    const BarsRender = (render === "bars");
+    const SALayout = (layout === "sa");
+    const FullLayout = (layout === "full");
+    const useMirrored = (render === "mirrored") && MIRRORED_LAYOUTS.includes(layout);
     const mirrorMetrics = useMirrored ? getMirroredLayoutMetrics() : null;
 
     const ctx    = STATE.dom.ctx;
     const canvas = STATE.dom.canvas;
-    const contentWrapper = STATE.dom.contentWrapper;
     if (!ctx || !canvas) return;
 
+    const canvasStyle = canvas.style;
+    const contentWrapper = STATE.dom.contentWrapper;
+    const contentWrapperStyle = contentWrapper ? contentWrapper.style : null;
+
     const width = canvas.width;
+    if (!width || !canvas.height) return;
+
+    const leftLevels = STATE.levels.left;
+    const rightLevels = STATE.levels.right;
+    const stereoQualityLevels = STATE.levels.stereoQuality;
+    const audioLevels = STATE.levels.audio;
+
     const barH  = CONFIG.display.dimensions.barHeight;
     const gap   = CONFIG.display.dimensions.spacing;
-    const effectiveW = getEffectiveBarWidth(width);
 
     // GAUGES MODE
-    if (render === "gauges") {
+    if (GaugesRender) {
       renderGauges(ctx, canvas, layout);
       return;
     }
 
     // MIRRORED MODE
     if (useMirrored) {
-      const height_mirrored = mirrorMetrics.singlePanelHeight;
-      const nextHeight = height_mirrored + "px";
-      const nextMinHeight = height_mirrored + "px";
+      const nextHeight = mirrorMetrics.singlePanelHeight + "px";
       const nextTransform =
         mirrorMetrics.canvasOffsetY !== 0
           ? `translateY(${mirrorMetrics.canvasOffsetY}px)`
           : "";
     
-      if (canvas.height !== height_mirrored) {
-        canvas.height = height_mirrored;
+      if (canvas.height !== mirrorMetrics.singlePanelHeight) {
+        canvas.height = mirrorMetrics.singlePanelHeight;
       }
-      if (canvas.style.height !== nextHeight) {
-        canvas.style.height = nextHeight;
+      if (canvasStyle.height !== nextHeight) {
+        canvasStyle.height = nextHeight;
       }
-      if (canvas.style.minHeight !== nextMinHeight) {
-        canvas.style.minHeight = nextMinHeight;
+      if (canvasStyle.minHeight !== nextHeight) {
+        canvasStyle.minHeight = nextHeight;
       }
-      if (canvas.style.transform !== nextTransform) {
-        canvas.style.transform = nextTransform;
+      if (canvasStyle.transform !== nextTransform) {
+        canvasStyle.transform = nextTransform;
       }
-    
+
       ctx.clearRect(0, 0, width, canvas.height);
-    
-      const leftLevels = STATE.levels.left;
-      const rightLevels = STATE.levels.right;
-    
+
       const BAR_GAP  = 35;
       const usableW  = Math.floor(width - BAR_GAP);
       const halfW    = Math.floor(usableW / 2);
-      const Lw       = halfW;
-      const Rw       = halfW;
-      const baseLeft = Math.floor((width - (Lw + Rw + BAR_GAP)) / 2);
+      const baseLeft = Math.floor((width - (halfW + halfW + BAR_GAP)) / 2);
       const Lx       = Math.floor(baseLeft - 5);
-      const Rx       = Math.floor(baseLeft + Lw + BAR_GAP + 5);
+      const Rx       = Math.floor(baseLeft + halfW + BAR_GAP + 5);
 
-      const leftBaseX = Lx + Lw;
+      const leftBaseX = Lx + halfW;
       const rightBaseX = Rx;
 
       if (layout === "full") {
-        const stereoQualityLevels = STATE.levels.stereoQuality;
-        const audioLevels = STATE.levels.audio;
         const qSmoothDb = mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range);
         const { audioSmoothDb, audioPeakDb } = mapAudioLevelsToDb(audioLevels, minDb, range);
-        const metrics = mirrorMetrics.fullMetrics || (mirrorMetrics.fullMetrics = getFullMirroredMetrics());
-        const bottomBlockY = metrics.singleRowHeight + metrics.rowGap;
+        const metrics = getFullMirroredMetrics();
         const mirroredBarH = metrics.singleRowHeight;
+        const bottomBlockY = mirroredBarH + metrics.rowGap;
         const mirroredYOffset = metrics.mirroredYOffset;
         const topY = mirroredYOffset;
         const bottomY = bottomBlockY + mirroredYOffset;
@@ -4843,7 +4819,7 @@ function saveAMXPanelGeometry(panel) {
             leftLevels.smoothDb,
             leftLevels.peakDb,
             topY,
-            Lw,
+            halfW,
             mirroredBarH,
             null,
             barStyle
@@ -4860,7 +4836,7 @@ function saveAMXPanelGeometry(panel) {
             rightLevels.smoothDb,
             rightLevels.peakDb,
             topY,
-            Rw,
+            halfW,
             mirroredBarH,
             null,
             barStyle
@@ -4879,7 +4855,7 @@ function saveAMXPanelGeometry(panel) {
             qSmoothDb,
             qSmoothDb,
             bottomY,
-            Lw,
+            halfW,
             mirroredBarH,
             null,
             barStyle
@@ -4898,7 +4874,7 @@ function saveAMXPanelGeometry(panel) {
             audioSmoothDb,
             audioPeakDb,
             bottomY,
-            Rw,
+            halfW,
             mirroredBarH,
             null,
             barStyle
@@ -4913,33 +4889,36 @@ function saveAMXPanelGeometry(panel) {
 
       const mirroredBarH = mirrorMetrics.mirroredBarH;
       const mirroredYOffset = mirrorMetrics.mirroredYOffset;
-      const stereoQualityLevels = (layout === "sa") ? STATE.levels.stereoQuality : null;
-      const audioLevels = (layout === "sa") ? STATE.levels.audio : null;
-      const qSmoothDb = (layout === "sa")
-        ? mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range)
-        : null;
-      const audioDb = (layout === "sa")
-        ? mapAudioLevelsToDb(audioLevels, minDb, range)
-        : null;
+      let qSmoothDb = null;
+      let audioSmoothDb = null;
+      let audioPeakDb = null;
+
+      if (SALayout) {
+        qSmoothDb = mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range);
+
+        const audioMapped = mapAudioLevelsToDb(audioLevels, minDb, range);
+        audioSmoothDb = audioMapped.audioSmoothDb;
+        audioPeakDb = audioMapped.audioPeakDb;
+      }
 
       // LEFT (mirrored)
       ctx.save();
       ctx.translate(leftBaseX, 0);
       ctx.scale(-1, 1);
 
-      if (layout === "sa") STATE._stereoQualityGradient = true;
+      if (SALayout) STATE._stereoQualityGradient = true;
       try {
         renderChannel(
-          layout === "sa" ? qSmoothDb : leftLevels.smoothDb,
-          layout === "sa" ? qSmoothDb : leftLevels.peakDb,
+          SALayout ? qSmoothDb : leftLevels.smoothDb,
+          SALayout ? qSmoothDb : leftLevels.peakDb,
           mirroredYOffset,
-          Lw,
+          halfW,
           mirroredBarH,
           null,
           barStyle
         );
       } finally {
-        if (layout === "sa") STATE._stereoQualityGradient = false;
+        if (SALayout) STATE._stereoQualityGradient = false;
         ctx.restore();
       }
 
@@ -4947,27 +4926,29 @@ function saveAMXPanelGeometry(panel) {
       ctx.save();
       ctx.translate(rightBaseX, 0);
 
-      if (layout === "sa") STATE._audioPeakGradient = true;
+      if (SALayout) STATE._audioPeakGradient = true;
       try {
         renderChannel(
-          layout === "sa" ? audioDb.audioSmoothDb : rightLevels.smoothDb,
-          layout === "sa" ? audioDb.audioPeakDb : rightLevels.peakDb,
+          SALayout ? audioSmoothDb : rightLevels.smoothDb,
+          SALayout ? audioPeakDb : rightLevels.peakDb,
           mirroredYOffset,
-          Rw,
+          halfW,
           mirroredBarH,
           null,
           barStyle
         );
       } finally {
-        if (layout === "sa") STATE._audioPeakGradient = false;
+        if (SALayout) STATE._audioPeakGradient = false;
         ctx.restore();
       }
 
       return;
     }
 
+    const effectiveW = getEffectiveBarWidth(width);
+
     // FULL MODE — NORMAL BARS (L, R, Q, A stacked)
-    if (layout === "full" && render === "bars") {
+    if (FullLayout && BarsRender) {
 
       // tighter spacing ONLY for full mode
       const FULL_GAP = Math.round(gap * 0.35);
@@ -4979,28 +4960,25 @@ function saveAMXPanelGeometry(panel) {
         FULL_GAP * 3;
 
       const nextHeight = neededHeight + "px";
-      const styleHeight = nextHeight;
 
       if (canvas.height !== neededHeight) {
         canvas.height = neededHeight;
       }
-      if (canvas.style.height !== styleHeight) {
-        canvas.style.height = styleHeight;
+      if (canvasStyle.height !== nextHeight) {
+        canvasStyle.height = nextHeight;
       }
 
       // Ensure wrapper can contain 4 rows
-      if (contentWrapper) {
-        if (contentWrapper.style.height !== styleHeight) {
-          contentWrapper.style.height = styleHeight;
+      if (contentWrapperStyle) {
+        if (contentWrapperStyle.height !== nextHeight) {
+          contentWrapperStyle.height = nextHeight;
         }
       }
 
       ctx.clearRect(0, 0, width, canvas.height);
 
-      const leftLevels = STATE.levels.left;
-      const rightLevels = STATE.levels.right;
-
       let y = TOP_PAD;
+      const fullStep = barH + FULL_GAP;
 
       // L
       renderChannel(
@@ -5013,7 +4991,7 @@ function saveAMXPanelGeometry(panel) {
         barStyle
       );
 
-      y += barH + FULL_GAP;
+      y += fullStep;
 
       // R
       renderChannel(
@@ -5026,11 +5004,10 @@ function saveAMXPanelGeometry(panel) {
         barStyle
       );
 
-      y += barH + FULL_GAP;
+      y += fullStep;
 
       // Q — Stereo Quality
       {
-        const stereoQualityLevels = STATE.levels.stereoQuality;
         const qSmoothDb = mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range);
 
         STATE._stereoQualityGradient = true;
@@ -5050,11 +5027,10 @@ function saveAMXPanelGeometry(panel) {
         }
       }
 
-      y += barH + FULL_GAP;
+      y += fullStep;
 
       // A — Audio
       {
-        const audioLevels = STATE.levels.audio;
         const { audioSmoothDb, audioPeakDb } = mapAudioLevelsToDb(audioLevels, minDb, range);
         STATE._audioPeakGradient = true;
 
@@ -5077,24 +5053,23 @@ function saveAMXPanelGeometry(panel) {
     }
 
     // NORMAL / SA MODES (UNCHANGED)
-    const hasAudioPeak = (layout === "sa");
-    const neededHeight = hasAudioPeak
+    const rowStep = barH + gap;
+    const neededHeight = SALayout
       ? barH * 3 + gap * 2
       : barH * 2 + gap;
 
     const nextHeight = neededHeight + "px";
-    const styleHeight = nextHeight;
 
     if (canvas.height !== neededHeight) {
       canvas.height = neededHeight;
     }
-    if (canvas.style.height !== styleHeight) {
-      canvas.style.height = styleHeight;
+    if (canvasStyle.height !== nextHeight) {
+      canvasStyle.height = nextHeight;
     }
 
-    if (contentWrapper) {
-      if (contentWrapper.style.height !== styleHeight) {
-        contentWrapper.style.height = styleHeight;
+    if (contentWrapperStyle) {
+      if (contentWrapperStyle.height !== nextHeight) {
+        contentWrapperStyle.height = nextHeight;
       }
     }
 
@@ -5102,8 +5077,6 @@ function saveAMXPanelGeometry(panel) {
 
     // L+R channels
     if (layout === "lr") {
-      const leftLevels = STATE.levels.left;
-      const rightLevels = STATE.levels.right;
 
       // L
       renderChannel(
@@ -5119,7 +5092,7 @@ function saveAMXPanelGeometry(panel) {
       renderChannel(
         rightLevels.smoothDb,
         rightLevels.peakDb,
-        barH + gap,
+        rowStep,
         width,
         barH,
         effectiveW,
@@ -5128,8 +5101,7 @@ function saveAMXPanelGeometry(panel) {
     }
 
     // Stereo Quality (SA)
-    else if (layout === "sa") {
-      const stereoQualityLevels = STATE.levels.stereoQuality;
+    else if (SALayout) {
       const qSmoothDb = mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range);
 
       STATE._stereoQualityGradient = true;
@@ -5149,7 +5121,6 @@ function saveAMXPanelGeometry(panel) {
       }
 
       // Audio (SA)
-      const audioLevels = STATE.levels.audio;
       const { audioSmoothDb, audioPeakDb } = mapAudioLevelsToDb(audioLevels, minDb, range);
 
       STATE._audioPeakGradient = true;
@@ -5158,7 +5129,7 @@ function saveAMXPanelGeometry(panel) {
         renderChannel(
           audioSmoothDb,
           audioPeakDb,
-          barH + gap,
+          rowStep,
           width,
           barH,
           effectiveW,
@@ -5186,8 +5157,7 @@ function saveAMXPanelGeometry(panel) {
     el.innerHTML = "";
 
     // measure current width
-    let rect = el.getBoundingClientRect();
-    let refWidth = rect.width;
+    const refWidth = el.getBoundingClientRect().width;
 
     // CASE 1 — layout not ready at all (0 px width)
     // try exactly ONE microtask later (no recursion, no animation-frame loops)
@@ -5432,22 +5402,20 @@ function saveAMXPanelGeometry(panel) {
         peakFrac = frac;
       }
 
-      if (peakFrac > 0) {
-        drawExternalPeak(
-          ctx,
-          0, 0, 0, 0, 0,
-          {
-            cx,
-            cy,
-            r: radius,
-            strokeW: ringWidth,
-            startAngle: startAngle + START_EPS,
-            sweepAngle: arcSpan - START_EPS,
-            normLevel: frac,
-            peakNorm: peakFrac
-          }
-        );
-      }
+      drawExternalPeak(
+        ctx,
+        0, 0, 0, 0, 0,
+        {
+          cx,
+          cy,
+          r: radius,
+          strokeW: ringWidth,
+          startAngle: startAngle + START_EPS,
+          sweepAngle: arcSpan - START_EPS,
+          normLevel: frac,
+          peakNorm: peakFrac
+        }
+      );
     }
   }
 
@@ -5696,7 +5664,7 @@ function saveAMXPanelGeometry(panel) {
 
         if (gaugeLabelLeft) {
           setTextIfChanged(gaugeLabelLeft, "L");
-          gaugeLabelLeft.style.left = "12.5%";
+          gaugeLabelLeft.style.left = "11.5%";
           gaugeLabelLeft.style.top = TOP;
           gaugeLabelLeft.style.transform = TRANSFORM;
           gaugeLabelLeft.style.display = "";
@@ -5704,7 +5672,7 @@ function saveAMXPanelGeometry(panel) {
 
         if (gaugeLabelRight) {
           setTextIfChanged(gaugeLabelRight, "R");
-          gaugeLabelRight.style.left = "39%";
+          gaugeLabelRight.style.left = "38.5%";
           gaugeLabelRight.style.top = TOP;
           gaugeLabelRight.style.transform = TRANSFORM;
           gaugeLabelRight.style.display = "";
@@ -6241,7 +6209,7 @@ function saveAMXPanelGeometry(panel) {
         position:absolute;
         left:0;
         right:0;
-        top:-10px;
+        top:-5px;
         height:18px;
         pointer-events:none;
         user-select:none;
@@ -6288,7 +6256,7 @@ function saveAMXPanelGeometry(panel) {
         position:absolute;
         left:0;
         right:0;
-        bottom:0;
+        bottom:5px;
         height:18px;
         pointer-events:none;
         user-select:none;
@@ -6353,7 +6321,7 @@ function saveAMXPanelGeometry(panel) {
           transform:translate(-50%, 60%);
           font-weight:600;
           font-size:16px;
-          opacity:0.92;
+          opacity:0.95;
           pointer-events:none;
           user-select:none;
           z-index:31;
@@ -6466,7 +6434,7 @@ function saveAMXPanelGeometry(panel) {
           white-space:nowrap;
           font-weight:600;
           font-size:13px;
-          opacity:0.85;
+          opacity:0.95;
           display:none;
           z-index:40;
         `;
@@ -6592,7 +6560,7 @@ function saveAMXPanelGeometry(panel) {
             el.style.lineHeight = cs.lineHeight;
             el.style.color = "#fff";
             el.style.fontSize = (parseFloat(cs.fontSize) + 1) + "px";
-            el.style.opacity = 0.85;
+            el.style.opacity = 0.95;
           });
 
           // GAUGES — NUMERIC LABELS
@@ -6962,50 +6930,6 @@ function saveAMXPanelGeometry(panel) {
         RENDER_GATE.rafId = requestAnimationFrame(updateMetersFrame);
       }
 
-      // Resize canvas
-      function forceResizeCanvas() {
-        if (!STATE.dom.contentWrapper) return;
-
-        // --- layout read ---
-        readLayoutOnce();
-
-        const w = STATE.layout.width;
-        const safeW = w && w > 40 ? Math.floor(w) : 300;
-
-        const barH = CONFIG.display.dimensions.barHeight;
-        const gap  = CONFIG.display.dimensions.spacing;
-        const baseH = barH * 2 + gap;
-
-        // NORMAL canvas — force intrinsic reset
-        if (STATE.dom.canvasNormal) {
-          resizeCanvasIfNeeded(
-            STATE.dom.canvasNormal,
-            safeW,
-            baseH
-          );
-        }
-
-        // MIRRORED canvas — MUST also be reset, or it dies on rotate
-        if (STATE.dom.canvasMirror) {
-          resizeCanvasIfNeeded(
-            STATE.dom.canvasMirror,
-            safeW,
-            baseH
-          );
-        }
-
-        if (STATE.dom.canvasGauges) {
-          resizeCanvasIfNeeded(
-            STATE.dom.canvasGauges,
-            safeW,
-            WRAPPER_HEIGHT - 20
-          );
-        }
-
-        invalidateVisualCaches();
-        requestRender();
-      }
-
       // UPDATE METERS
       function updateMetersFrame() {
         if (
@@ -7023,12 +6947,21 @@ function saveAMXPanelGeometry(panel) {
           const runAudio = shouldRunAudio();
 
           if (runAudio) {
+            const layoutMode = CONFIG.display.layoutMode;
+            const nonLRLayout = (layoutMode !== "lr");
+            
+            const audioCfg = CONFIG.audio;
+            const minDb = audioCfg.minDb;
+            const maxDb = audioCfg.maxDb;
+            const atk = audioCfg.attackSpeed;
+            const rel = audioCfg.releaseSpeed;
+
             // READ TIME DOMAIN FOR L / R
             STATE.audio.analyserLeft.getByteTimeDomainData(STATE.audio.timeLeft);
             STATE.audio.analyserRight.getByteTimeDomainData(STATE.audio.timeRight);
 
             // READ MID / SIDE DATA
-            if (CONFIG.display.layoutMode !== "lr") {
+            if (nonLRLayout) {
               if (STATE.audio.analyserMid && STATE.audio.dataMid) {
                 STATE.audio.analyserMid.getByteFrequencyData(STATE.audio.dataMid);
               }
@@ -7072,10 +7005,7 @@ function saveAMXPanelGeometry(panel) {
 
             // AUDIO PEAK (A) — RMS BAR + PPM PEAK
             // Uses ONLY existing CONFIG.audio parameters
-            if (
-              CONFIG.display.layoutMode !== "lr" &&
-              STATE.audio.analyserPeak
-            ) {
+            if (nonLRLayout && STATE.audio.analyserPeak) {
 
               if (!STATE.audioPeak) {
                 STATE.audioPeak = {
@@ -7085,23 +7015,23 @@ function saveAMXPanelGeometry(panel) {
                 };
               }
 
-              const now =
-                (typeof performance !== "undefined" && performance.now)
-                  ? performance.now()
-                  : Date.now();
+              const peakState = STATE.audioPeak;
+              const audioLevels = STATE.levels.audio;
+              const peakAnalyser = STATE.audio.analyserPeak;
+              const now = nowTs;
 
               const INTERVAL_MS = 75;
               const SILENCE_EPS = 0.015;
               const SCALE = 5.5; // visual calibration (same role as before)
 
-              if (now - STATE.audioPeak.lastTs >= INTERVAL_MS) {
-                STATE.audioPeak.lastTs = now;
+              if (now - peakState.lastTs >= INTERVAL_MS) {
+                peakState.lastTs = now;
 
                 // Read TIME DOMAIN samples
                 const buf = STATE.audio.dataPeak;
                 if (!buf) return;
 
-                STATE.audio.analyserPeak.getByteTimeDomainData(buf);
+                peakAnalyser.getByteTimeDomainData(buf);
 
                 // RMS + TRUE PEAK
                 let sumSq = 0;
@@ -7121,7 +7051,7 @@ function saveAMXPanelGeometry(panel) {
                   if (n > instPeak) instPeak = n;
                 }
 
-                const rms = Math.sqrt(sumSq / buf.length);
+                const rms = Math.sqrt(sumSq / len);
 
                 // RMS BAR (average energy)
                 let targetBar = 0;
@@ -7130,29 +7060,27 @@ function saveAMXPanelGeometry(panel) {
                 }
 
                 // smooth bar (attack + release already agreed)
-                if (targetBar > STATE.audioPeak.bar) {
-                  STATE.audioPeak.bar +=
-                    (targetBar - STATE.audioPeak.bar) * CONFIG.audio.attackSpeed;
+                if (targetBar > peakState.bar) {
+                  peakState.bar +=
+                    (targetBar - peakState.bar) * atk;
                 } else {
-                  STATE.audioPeak.bar *= CONFIG.audio.releaseSpeed;
+                  peakState.bar *= rel;
                 }
 
-                STATE.levels.audio.smooth = STATE.audioPeak.bar;
+                audioLevels.smooth = peakState.bar;
 
                 // AUDIO PEAK LINE — use the same hold/decay logic as L/R
                 const targetPeak = Math.min(255, instPeak * 255 * SCALE);
 
-                const minDbA = CONFIG.audio.minDb;
-                const maxDbA = CONFIG.audio.maxDb;
-                const rangeA = maxDbA - minDbA;
+                const rangeA = maxDb - minDb;
 
                 const instPeakDb =
-                  minDbA + (targetPeak / 255) * rangeA;
+                  minDb + (targetPeak / 255) * rangeA;
 
                 const prevPeakDb =
-                  isFinite(STATE.audioPeak.peakDb)
-                    ? STATE.audioPeak.peakDb
-                    : minDbA;
+                  isFinite(peakState.peakDb)
+                    ? peakState.peakDb
+                    : minDb;
 
                 const targetPeakDb =
                   instPeakDb > prevPeakDb
@@ -7162,22 +7090,18 @@ function saveAMXPanelGeometry(panel) {
                 const nextPeakDb =
                   updatePeak(targetPeakDb, prevPeakDb, "audio", now);
 
-                STATE.audioPeak.peakDb = nextPeakDb;
+                peakState.peakDb = nextPeakDb;
 
-                STATE.levels.audio.peak =
+                audioLevels.peak =
                   Math.max(
                     0,
-                    Math.min(255, ((nextPeakDb - minDbA) / rangeA) * 255)
+                    Math.min(255, ((nextPeakDb - minDb) / rangeA) * 255)
                   );
               }
             }
 
             // STEREO QUALITY (Q) — calibrated + gated + richer debug
-            if (
-              CONFIG.display.layoutMode !== "lr" &&
-              STATE.audio.dataMid &&
-              STATE.audio.dataSide
-            ) {
+            if (nonLRLayout && STATE.audio.dataMid && STATE.audio.dataSide) {
 
               const midArr  = STATE.audio.dataMid;
               const sideArr = STATE.audio.dataSide;
@@ -7221,46 +7145,48 @@ function saveAMXPanelGeometry(panel) {
 
                 // MAPPING: 0.40→75%, 0.50→100%, 0.60→120%
                 // with smooth piecewise segments
-                const mapStereoRatioToQ = (r) => {
+                const mapStereoRatioToQ =
+                  updateMetersFrame._mapStereoRatioToQ ||
+                  (updateMetersFrame._mapStereoRatioToQ = (r) => {
 
-                  // Noise / mono collapse
-                  if (r <= 0.05) {
-                    return (r / 0.05) * 5;              // 0 .. 5 %
-                  }
+                    // Noise / mono collapse
+                    if (r <= 0.05) {
+                      return (r / 0.05) * 5;              // 0 .. 5 %
+                    }
 
-                  // Very weak stereo
-                  if (r <= 0.10) {
-                    return 5 + ((r - 0.05) / 0.05) * 10; // 5 .. 15 %
-                  }
+                    // Very weak stereo
+                    if (r <= 0.10) {
+                      return 5 + ((r - 0.05) / 0.05) * 10; // 5 .. 15 %
+                    }
 
-                  // Weak stereo
-                  if (r <= 0.20) {
-                    return 15 + ((r - 0.10) / 0.10) * 20; // 15 .. 35 %
-                  }
+                    // Weak stereo
+                    if (r <= 0.20) {
+                      return 15 + ((r - 0.10) / 0.10) * 20; // 15 .. 35 %
+                    }
 
-                  // Moderate / acceptable stereo
-                  if (r <= 0.30) {
-                    return 35 + ((r - 0.20) / 0.10) * 25; // 35 .. 60 %
-                  }
+                    // Moderate / acceptable stereo
+                    if (r <= 0.30) {
+                      return 35 + ((r - 0.20) / 0.10) * 25; // 35 .. 60 %
+                    }
 
-                  // Good stereo
-                  if (r <= 0.40) {
-                    return 60 + ((r - 0.30) / 0.10) * 25; // 60 .. 85 %
-                  }
+                    // Good stereo
+                    if (r <= 0.40) {
+                      return 60 + ((r - 0.30) / 0.10) * 25; // 60 .. 85 %
+                    }
 
-                  // Very good stereo
-                  if (r <= 0.50) {
-                    return 85 + ((r - 0.40) / 0.10) * 15; // 85 .. 100 %
-                  }
+                    // Very good stereo
+                    if (r <= 0.50) {
+                      return 85 + ((r - 0.40) / 0.10) * 15; // 85 .. 100 %
+                    }
 
-                  // Wide / exaggerated stereo
-                  if (r <= 0.60) {
-                    return 100 + ((r - 0.50) / 0.10) * 20; // 100 .. 120 %
-                  }
+                    // Wide / exaggerated stereo
+                    if (r <= 0.60) {
+                      return 100 + ((r - 0.50) / 0.10) * 20; // 100 .. 120 %
+                    }
 
-                  // Clamp
-                  return 120;
-                };
+                    // Clamp
+                    return 120;
+                  });
 
                 qInstant = mapStereoRatioToQ(stereoRatio);
               } else {
@@ -7270,9 +7196,6 @@ function saveAMXPanelGeometry(panel) {
 
               // SMOOTHING
               const prev = STATE.levels.stereoQuality.smooth;
-              const atk  = CONFIG.audio.attackSpeed;
-              const rel  = CONFIG.audio.releaseSpeed;
-
               const qSmooth =
                 qInstant > prev
                   ? prev + (qInstant - prev) * atk
@@ -7299,31 +7222,32 @@ function saveAMXPanelGeometry(panel) {
             // ADAPTIVE INTERVAL UPDATE (cheap)
             {
               const c = STATE.audioCadence;
+              const levels = STATE.levels;
+              const audioLevels = levels.audio;
+              const stereoLevels = levels.stereoQuality;
 
               // Activity proxy (no extra audio reads):
               // - stronger LR instant levels
               // - audio bar (A)
               // - stereo quality (Q)
-              const minDb = CONFIG.audio.minDb;
-
               const lDb = (typeof L.instantDb === "number") ? L.instantDb : minDb;
               const rDb = (typeof R.instantDb === "number") ? R.instantDb : minDb;
 
               const lAct = Math.max(0, lDb - (minDb + 0.5)); // 0..~range
               const rAct = Math.max(0, rDb - (minDb + 0.5));
 
-              const aRaw = (STATE.levels?.audio && typeof STATE.levels.audio.smooth === "number")
-                ? STATE.levels.audio.smooth
+              const aRaw = (audioLevels && typeof audioLevels.smooth === "number")
+                ? audioLevels.smooth
                 : 0;
-              const qRaw = (STATE.levels?.stereoQuality && typeof STATE.levels.stereoQuality.smooth === "number")
-                ? STATE.levels.stereoQuality.smooth
+              const qRaw = (stereoLevels && typeof stereoLevels.smooth === "number")
+                ? stereoLevels.smooth
                 : 0;
 
               // Normalize into a single scalar
               const energy =
-                (Math.min(1, Math.max(lAct, rAct) / 40) * 0.60) +   // LR activity
-                (Math.min(1, Math.max(0, Math.min(255, aRaw)) / 255) * 0.25) + // A
-                (Math.min(1, Math.max(0, Math.min(120, qRaw)) / 120) * 0.15);  // Q
+                (Math.min(1, Math.max(lAct, rAct) / 40) * 0.60) +
+                (Math.min(1, Math.max(0, Math.min(255, aRaw)) / 255) * 0.25) +
+                (Math.min(1, Math.max(0, Math.min(120, qRaw)) / 120) * 0.15);
 
               const delta = Math.abs(energy - (c.lastEnergy || 0));
               c.lastEnergy = energy;
@@ -7429,7 +7353,7 @@ function saveAMXPanelGeometry(panel) {
               const hasStreamObject =
                 (typeof Stream !== "undefined" && Stream !== null);
 
-              const active = hasStreamObject;
+              STATE.hasStreamObject = hasStreamObject;
 
               // Helper for dB formatting on minDb
               const formatDb =
@@ -7445,7 +7369,7 @@ function saveAMXPanelGeometry(panel) {
               // ─────────────────────────
               if (layout === "lr") {
 
-                if (!active) {
+                if (!hasStreamObject) {
                   setReadoutText(STATE.dom.readouts.L, "");
                   setReadoutText(STATE.dom.readouts.R, "");
                 } else {
@@ -7462,7 +7386,7 @@ function saveAMXPanelGeometry(panel) {
               // ───────────────────────────────
               else if (layout === "sa" || layout === "full") {
 
-                if (!active) {
+                if (!hasStreamObject) {
                   // STOP → hide Q/A
                   setReadoutText(STATE.dom.readouts.Q, "");
                   setReadoutText(STATE.dom.readouts.A, "");

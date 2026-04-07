@@ -42,7 +42,7 @@ It is designed as a hybrid metering system, offering both technical insight and 
 🔹 Render Modes
 - Bars — clean, linear meters
   
-  ![amx4](https://github.com/user-attachments/assets/055cbd26-acab-4369-ba32-f8309835d648)
+![amx4](https://github.com/user-attachments/assets/055cbd26-acab-4369-ba32-f8309835d648)
 
 - Gauges — analog-style circular meters
   
@@ -50,7 +50,7 @@ It is designed as a hybrid metering system, offering both technical insight and 
 
 - Mirrored — symmetrical dual-channel display
   
-  ![amx6](https://github.com/user-attachments/assets/8f42ac97-0657-477b-8647-6c893f6473f3)
+![amx6](https://github.com/user-attachments/assets/8f42ac97-0657-477b-8647-6c893f6473f3)
 
 
 All modes share the same underlying data — only the presentation changes.
@@ -60,16 +60,16 @@ All modes share the same underlying data — only the presentation changes.
 AudioMetrix supports multiple visual styles:
 
 - Simple bars
+- Segmented bars
 
 ![amx7](https://github.com/user-attachments/assets/10454827-a96d-46d1-9dda-381b89777bee)
 
-- Segmented bars
 - Circle Dots
 - Matrix Dots
-
-    ![amx8](https://github.com/user-attachments/assets/1d7ef944-ae69-43b8-93f2-7bd451a13421)
-
 - Pillars
+
+ ![amx8](https://github.com/user-attachments/assets/1d7ef944-ae69-43b8-93f2-7bd451a13421)
+  
 - Beveled 3D
 - Glass Tube
 
@@ -103,7 +103,11 @@ All changes apply instantly in real time.
 - Locate the AudioMetrix panel in the FM-DX interface
 - Click the settings icon / panel trigger
 - The floating panel will appear
+
+![amx9](https://github.com/user-attachments/assets/d53ef1e0-0624-4286-ab81-52d29828f07b)
+
 - Adjust settings live
+- You can move the panel wherever you like or/and change its size by dragging on its corners. The changes will stick.
 
 ⚡ Performance
 AudioMetrix is optimized for efficiency:
@@ -132,6 +136,11 @@ AudioMetrix is optimized for efficiency:
 - Use SA layout to monitor stereo quality live
 - Adjust gain carefully to avoid constant peak saturation
 - 
-🧩 Version
+🧩 Version and updates
 
-AudioMetrix 4.0
+AudioMetrix displays on the settings panel the current version.
+Whenever there is an update, a prompt will appear below the version number.
+- Click on the update banner and you'll be redirected to the Github page
+- Download the update and apply it on your webserver
+- The update will also notify the settings panel of your webserver as an alternative method.
+- Feel free for suggestions and improvements.

@@ -5,6 +5,7 @@ Audiometrix plugin for FMDX Webservers
 
 AudioMetrix is a real-time audio visualization plugin for the FM-DX Webserver.
 
+
 It transforms raw audio data into smooth, responsive, and visually rich meters — combining accurate signal feedback with high-quality eye candy.
 
 It is designed as a hybrid metering system, offering both technical insight and aesthetic presentation.
@@ -20,15 +21,19 @@ It is designed as a hybrid metering system, offering both technical insight and 
 🎨 Visual Modes & Layouts
 
 🔹 Layouts
-- LR (Stereo Levels)
-- Classic left/right metering
-- SA (Stereo Quality + Audio Peak)
-- Advanced signal analysis
-- FULL
-- Combined multi-row view (L/R + Q/A)
+[b]- LR (Stereo Levels)[/b]
+  ![amx1](https://github.com/user-attachments/assets/c49b8dd5-2f16-410a-bfd7-095c31172c23)
+  Classic left/right metering
+[b]- SA (Stereo Quality + Audio Peak)[/b]
+  ![amx2](https://github.com/user-attachments/assets/9f5d6241-f2e6-4515-b885-28043c55a946)
+  Advanced signal analysis
+[b]- FULL[/b]
+  ![amx3](https://github.com/user-attachments/assets/b2be283e-8a6e-4cfa-b952-2194bfabd010)
+  Combined multi-row view (L/R + Q/A)
   
 🔹 Render Modes
 - Bars — clean, linear meters
+  
 - Gauges — analog-style circular meters
 - Mirrored — symmetrical dual-channel display
 

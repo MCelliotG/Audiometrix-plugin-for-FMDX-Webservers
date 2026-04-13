@@ -6,7 +6,7 @@
 
   // PLUGIN METADATA
   const AMX_PLUGIN_NAME        = "AudioMetrix";
-  const AMX_VERSION            = "4.0";
+  const AMX_VERSION            = "4.1";
   const AMX_CHECK_FOR_UPDATES  = true;
   const AMX_UPDATE_URL         =
     "https://raw.githubusercontent.com/MCelliotG/Audiometrix-plugin-for-FMDX-Webservers/main/AudioMetrix/audiometrix.js";
@@ -59,10 +59,7 @@
     matrixCount: new Map()
   };
 
-  const PERCENT_SCALE_PAD = {
-    left: 10,
-    right: 45
-  };
+  const PERCENT_SCALE_PAD = {left: 5, right: 55};
 
   const FRAME_INTERVAL = 1000 / 30;
   let _lastRenderTime = 0;
@@ -515,7 +512,7 @@
     const YELLOW_ZONE_COLOR = "#ffd400"; // stereo quality
 
     // 2) Threshold selector
-    const THR = (mode === 2) ? 0.80 : 0.58;
+    const THR = (mode === 2) ? 0.82 : 0.58;
 
     const t   = THR;
     const t1  = t - 0.001;
@@ -2959,6 +2956,10 @@ function saveAMXPanelGeometry(panel) {
       return width;
     }
 
+    if (display.renderMode === "bars") {
+      return width - display.dimensions.canvasLeft - 20;
+    }
+
     return width - display.dimensions.canvasLeft - 5;
   }
 
@@ -3107,7 +3108,7 @@ function saveAMXPanelGeometry(panel) {
     if (render === "gauges") {
 
       const TOP = "40%";
-      const TOP_FULL = "25%";
+      const TOP_FULL = "35%";
       const T   = "translate(-50%, 0)";
 
       // FULL — 4 gauges
@@ -5184,7 +5185,7 @@ function saveAMXPanelGeometry(panel) {
         const fullGroupShift = -fullCellW * 0.06;
 
         cx = fullCellW * i + fullCellW / 2 + fullGroupShift;
-        cy = centerY;
+        cy = centerY + 8;
 
         // small spacing like stereo mode
         if (i === 0 || i === 1) cx -= gapX / 2;
@@ -5588,7 +5589,7 @@ function saveAMXPanelGeometry(panel) {
       if (layout === "full") {
 
         // FULL MODE — 4 gauges in ONE ROW
-        const TOP = "40%";
+        const TOP = "50%";
         const TRANSFORM = "translate(-50%, 30%)";
 
         if (gaugeLabelLeft) {
@@ -5628,7 +5629,7 @@ function saveAMXPanelGeometry(panel) {
       } else {
 
         // STEREO / SA — 2 gauges (restore baseline)
-        const TOP = "50%";
+        const TOP = "60%";
         const TRANSFORM = "translate(-50%, 60%)";
 
         // hide FULL-only labels
@@ -6376,6 +6377,11 @@ function saveAMXPanelGeometry(panel) {
       renderMeters();
 
       // Insert tile after freq panel
+      const path = window.location.pathname;
+      const isExcludedPage =
+        path.startsWith("/setup") || path.startsWith("/wizard");
+      if (isExcludedPage) return;
+      
       const freq = document.querySelector("#freq-container");
       const next = freq?.nextElementSibling;
       if (next?.parentNode) {
@@ -6383,7 +6389,7 @@ function saveAMXPanelGeometry(panel) {
       } else if (freq?.parentNode) {
         freq.parentNode.appendChild(STATE.dom.container);
       } else {
-        document.body.appendChild(STATE.dom.container);
+        return;
       }
 
       // Skin inheritance (sync fonts/colors)

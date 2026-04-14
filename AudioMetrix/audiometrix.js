@@ -649,7 +649,7 @@
     // THR is the “one source of truth” threshold used by bars
     const THR = (gcache && gcache.width) ? (gcache.peakThresholdX / gcache.width) : 0.74;
 
-    const t   = THR;
+    const t = Math.max(0, THR - 0.05);
     const t1  = t - 0.001;
     const t2  = t + 0.001;
 
@@ -677,7 +677,7 @@
 
     } else if (mode === 2) {
       // STEREO QUALITY — VISUAL 100% CLAMP
-      const VISUAL_YELLOW = 0.63;
+      const VISUAL_YELLOW = 0.55;
 
       const y1 = VISUAL_YELLOW - 0.003;
       const y2 = VISUAL_YELLOW + 0.003;
@@ -5667,7 +5667,6 @@ function saveAMXPanelGeometry(panel) {
 
       // NUMERIC LABELS
       if (layout === "lr") {
-
         ["Left", "Right"].forEach(side => {
           const g = STATE.dom["gaugeNums" + side];
           setGaugeNumericLabels(g, "-35", "-25", "-15", "+5");
@@ -5675,13 +5674,13 @@ function saveAMXPanelGeometry(panel) {
       }
 
       if (layout === "sa") {
-
-        ["Left", "Right"].forEach(side => {
-          const g = STATE.dom["gaugeNums" + side];
-          setGaugeNumericLabels(g, "0", "30", "70", "120%");
-        });
+        const gLeft  = STATE.dom.gaugeNumsLeft;
+        const gRight = STATE.dom.gaugeNumsRight;
+        // Stereo Quality
+        setGaugeNumericLabels(gLeft, "0", "50", "90", "120%");
+        // Audio Peak
+        setGaugeNumericLabels(gRight, "0", "30", "70", "120%");
       }
-
       return;
     }
 

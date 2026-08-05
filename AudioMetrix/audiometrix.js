@@ -1,12 +1,12 @@
 (() => {
   // ─────────────────────────────────────────────────────────
-  // AUDIO METRIX — FULL HARDENED VERSION
+  // AUDIO METRIX 5.0.0 — RELEASE
   // THEME ENGINE • SETTINGS UI • RENDER ENGINE • AUDIO ENGINE
   // ─────────────────────────────────────────────────────────
 
   // PLUGIN METADATA
   const AMX_PLUGIN_NAME        = "AudioMetrix";
-  const AMX_VERSION            = "4.1";
+  const AMX_VERSION            = "5.0";
   const AMX_CHECK_FOR_UPDATES  = true;
   const AMX_UPDATE_URL         =
     "https://raw.githubusercontent.com/MCelliotG/Audiometrix-plugin-for-FMDX-Webservers/main/AudioMetrix/audiometrix.js";
@@ -29,8 +29,7 @@
   ];
 
   const VALID_STYLES = [
-    "simple", "segment", "circledots", "matrixdots", "pillars",
-    "beveled3d", "glasstube"
+    "simple", "segment", "circledots", "matrixdots", "pillars", "beveled3d", "glasstube"
   ];
 
   const GRADIENT_CACHE = {
@@ -63,7 +62,14 @@
 
   const FRAME_INTERVAL = 1000 / 30;
   let _lastRenderTime = 0;
-  let _lastDrawn = { L:null, R:null, Q:null, A:null };
+  let _lastDrawn = {
+    L: null,
+    R: null,
+    Q: null,
+    A: null,
+    EQ: null,
+    Stream: null
+  };
 
   const STEREO_Q_MAX = 120;
   const STEREO_Q_SIGNAL_RATIO = 0.74;
@@ -87,8 +93,17 @@
     STATE.cache.pillar.height = 0;
   }
 
+  function clearTransientRenderState() {
+    if (!STATE.render) return;
+    STATE.render.barPeak = {};
+    STATE.render.gaugePeak = {};
+    STATE.render.analogVuPeak = {};
+    STATE.render.canvasReadouts = {};
+  }
+
   const STORAGE_ENABLE        = "amx_enabled_state";
   const STORAGE_THEME         = "AMX_THEME";
+  const STORAGE_AUTO_PALETTE  = "AMX_AUTO_THEME_PALETTE";
   const STORAGE_GLOW_ENABLED  = "AMX_GLOW_ENABLED";
   const STORAGE_SHOW_PEAKS    = "AMX_SHOW_PEAKS";
   const STORAGE_SHOW_READOUTS = "AMX_SHOW_READOUTS";
@@ -96,6 +111,8 @@
   const STORAGE_GAIN          = "AMX_GAIN";
   const STORAGE_LAYOUT        = "AMX_LAYOUT_MODE";
   const STORAGE_RENDER        = "AMX_RENDER_MODE";
+  const STORAGE_HYBRID_MODE   = "AMX_HYBRID_MODE";
+  const STORAGE_EQ_RENDER     = "AMX_EQ_RENDER_MODE";
   const STORAGE_ATTACK        = "AMX_ATTACK_SPEED";
   const STORAGE_RELEASE       = "AMX_RELEASE_SPEED";
   const STORAGE_PEAK_HOLD     = "AMX_PEAK_HOLD_MS";
@@ -104,6 +121,116 @@
   const STORAGE_PANEL_WIDTH   = "AMX_PANEL_WIDTH";
   const STORAGE_PANEL_HEIGHT  = "AMX_PANEL_HEIGHT";
   const MIRRORED_LAYOUTS = ["lr", "sa", "full"];
+  const EQ_CENTER_FREQUENCIES = [
+    30, 50, 80, 125, 200, 315, 500, 800,
+    1250, 2000, 3150, 5000, 8000, 12000, 16000, 20000
+  ];
+  const EQ_BAND_LABELS = [
+    "30", "50", "80", "125", "200", "315", "500", "800",
+    "1.25K", "2K", "3.15K", "5K", "8K", "12K", "16K", "20K"
+  ];
+  const EQ_PREAMP_GAINS = [
+    0.95, 0.95, 0.95, 0.95, 0.92, 0.92, 0.96, 1.0,
+    1.02, 1.04, 1.06, 1.10, 1.14, 1.18, 1.22, 1.25
+  ];
+  const EQ_FLOOR_LEVELS = [
+    5, 5, 5, 5, 4, 4, 4, 4,
+    4, 4, 4, 4, 5, 5, 5, 6
+  ];
+  const EQ_SENSITIVITY = 0.8;
+  const EQ_HYSTERESIS = 0.006;
+  const EQ_LABEL_ANCHORS = [
+    { index: 0, text: "30" },
+    { index: 3, text: "125" },
+    { index: 7, text: "800" },
+    { index: 11, text: "5K" },
+    { index: 15, text: "20K" }
+  ];
+  const EQ_BAND_COUNT = EQ_BAND_LABELS.length;
+  const HYBRID_STEREO_12_FREQUENCIES = [
+    30, 50, 80, 125, 200, 315, 500, 800,
+    1250, 3150, 8000, 16000
+  ];
+  const HYBRID_AUDIO_10_FREQUENCIES = [
+    30, 63, 125, 250, 500,
+    1000, 2000, 4000, 8000, 16000
+  ];
+  const HYBRID_MODES = [
+    "stereo12",
+    "audio10"
+  ];
+
+  // Fixed gauge geometry. One source of truth for both canvas gauges and DOM labels.
+  // Lower values tighten the group symmetrically around the tile centre.
+  const GAUGE_GAP_SCALE = 0.90;
+
+  function getGaugeGeometry(layout) {
+    const gaugeCount = (layout === "lr" || layout === "sa") ? 2 : (layout === "full" ? 4 : 0);
+    if (!gaugeCount) {
+      return { gaugeCount: 0, centers: [], numericLabels: [] };
+    }
+
+    const cellFraction = 1 / gaugeCount;
+    const centers = Array.from({ length: gaugeCount }, (_, i) =>
+      0.5 + (i - (gaugeCount - 1) / 2) * cellFraction * GAUGE_GAP_SCALE
+    );
+
+    // Numeric scale positions are stored as local offsets from each gauge centre.
+    // This preserves the original arc-label shape while allowing the complete
+    // gauge UI to follow GAUGE_GAP_SCALE as one unified geometry system.
+    const numericLabels = gaugeCount === 2 ? [
+      {
+        start: { x: centers[0] - 0.15, y: 0.80, align: "right" },
+        mid:   { x: centers[0] - 0.12, y: 0.15, align: "right" },
+        high:  { x: centers[0] + 0.12, y: 0.15, align: "left" },
+        end:   { x: centers[0] + 0.15, y: 0.80, align: "left" }
+      },
+      {
+        start: { x: centers[1] - 0.15, y: 0.80, align: "right" },
+        mid:   { x: centers[1] - 0.12, y: 0.15, align: "right" },
+        high:  { x: centers[1] + 0.12, y: 0.15, align: "left" },
+        end:   { x: centers[1] + 0.15, y: 0.80, align: "left" }
+      }
+    ] : [];
+
+    return { gaugeCount, centers, numericLabels };
+  }
+
+  function getGaugeCenterFractions(layout) {
+    return getGaugeGeometry(layout).centers;
+  }
+
+  function applyGaugeNumericGeometry(layout) {
+    const geometry = getGaugeGeometry(layout);
+    const groups = [STATE.dom.gaugeNumsLeft, STATE.dom.gaugeNumsRight];
+
+    groups.forEach((group, index) => {
+      const positions = geometry.numericLabels[index];
+      if (!group || !positions) return;
+
+      ["start", "mid", "high", "end"].forEach(key => {
+        const el = group[key];
+        const pos = positions[key];
+        if (!el || !pos) return;
+
+        el.style.left = `${pos.x * 100}%`;
+        el.style.top  = `${pos.y * 100}%`;
+
+        // Anchor the text toward the gauge arc. Left-side numerics end at
+        // their geometry point; right-side numerics begin at theirs.
+        if (pos.align === "right") {
+          el.style.transform = "translate(-100%, -50%)";
+          el.style.textAlign = "right";
+        } else if (pos.align === "left") {
+          el.style.transform = "translate(0, -50%)";
+          el.style.textAlign = "left";
+        } else {
+          el.style.transform = "translate(-50%, -50%)";
+          el.style.textAlign = "center";
+        }
+      });
+    });
+  }
   const AMX_DEBUG             = false;
 
   // HARDENED LOCAL STORAGE HELPERS
@@ -369,6 +496,23 @@
       ? `g:${tx}:${ty}:${Math.round((gauge.cx || 0) * 10)}:${Math.round((gauge.cy || 0) * 10)}:${Math.round((gauge.r || 0) * 10)}:${Math.round((gauge.startAngle || 0) * 1000)}:${Math.round((gauge.sweepAngle || 0) * 1000)}`
       : `b:${tx}:${ty}:${Math.round(y)}:${Math.round(effectiveW)}`;
 
+    // Once both the live value and the held value reach the visual floor,
+    // remove the physics state and stop drawing the indicator altogether.
+    const atVisualFloor = gauge
+      ? (
+          Math.abs(gauge.normLevel || 0) <= 0.001 &&
+          Math.abs(gauge.peakNorm || 0) <= 0.001
+        )
+      : (
+          Math.abs(levelX || 0) <= 0.5 &&
+          Math.abs(peakX || 0) <= 0.5
+        );
+
+    if (atVisualFloor) {
+      delete bucket[stateKey];
+      return;
+    }
+
     // Same visibility rule as readouts
     const hasStreamObject = STATE.hasStreamObject === true;
 
@@ -440,7 +584,17 @@
       const isNewPeak =
         peakAngle > (peakState.lastPeak + gauge.sweepAngle * 0.0025);
 
-      target = isNewPeak ? peakAngle : base;
+      const throwAngle = Math.min(
+        gauge.sweepAngle * 0.08,
+        8 / Math.max(1, gauge.r)
+      );
+
+      // Exact bar behaviour in arc space: the held peak is the trigger for a
+      // new outward throw, but the marker then returns to the live fill edge
+      // instead of parking at the held value.
+      target = isNewPeak
+        ? Math.min(max, peakAngle + throwAngle)
+        : base;
       peakState.lastPeak = peakAngle;
     }
 
@@ -455,8 +609,10 @@
       peakState.pos = Math.min(max, target);
       peakState.vel = 0;
     } else {
-      // Return quickly but smoothly toward the current bar/gauge edge
-      peakState.vel += (base - peakState.pos) * RETURN;
+      // Return quickly but smoothly toward the active target. For bars the
+      // target is their current edge; for gauges it can remain at the held
+      // peak, preventing frame-by-frame snap-back flicker on the arc.
+      peakState.vel += (target - peakState.pos) * RETURN;
       peakState.vel *= DAMPING;
       peakState.pos += peakState.vel;
     }
@@ -619,6 +775,51 @@
     return cache;
   }
 
+  // Native continuous bar gradient. Unlike the legacy one-column sampler,
+  // this is rasterized as one uninterrupted fill by the browser. That avoids
+  // faint vertical seams when browser zoom maps logical CSS pixels onto
+  // fractional device pixels.
+  function createBarsLinearGradient(ctx, width, mode) {
+    const w = Math.max(1, Number(width) || 1);
+    const col = ACTIVE_THEME.colors;
+    const low = col.low;
+    const mid = col.mid;
+    const high = col.high;
+
+    const RED_ZONE_COLOR = "#ff0000";
+    const YELLOW_ZONE_COLOR = "#ffd400";
+    const THR = (mode === 2) ? 0.82 : 0.58;
+    const t1 = THR - 0.001;
+    const t2 = THR + 0.001;
+    const midPos = 0.40 * THR;
+    const highPos = 0.80 * THR;
+
+    const grad = ctx.createLinearGradient(0, 0, w, 0);
+
+    if (mode === 1) {
+      grad.addColorStop(0.00, low);
+      grad.addColorStop(midPos, mid);
+      grad.addColorStop(highPos, high);
+      grad.addColorStop(Math.max(0, t1), high);
+      grad.addColorStop(Math.min(1, t2), RED_ZONE_COLOR);
+      grad.addColorStop(1.00, RED_ZONE_COLOR);
+    } else if (mode === 2) {
+      grad.addColorStop(0.00, high);
+      grad.addColorStop(Math.min(midPos, t1), mid);
+      grad.addColorStop(Math.min(highPos, t1), low);
+      grad.addColorStop(Math.max(0, t1), low);
+      grad.addColorStop(Math.min(1, t2), YELLOW_ZONE_COLOR);
+      grad.addColorStop(1.00, YELLOW_ZONE_COLOR);
+    } else {
+      grad.addColorStop(0.00, low);
+      grad.addColorStop(0.50, mid);
+      grad.addColorStop(0.80, high);
+      grad.addColorStop(1.00, high);
+    }
+
+    return grad;
+  }
+
   // COLOR INTERPOLATION
   function interpolateColor(c1, c2, t) {
       const n1 = c1.match(/[\d\.]+/g).map(Number);
@@ -727,44 +928,137 @@
   // ─────────────────────────────────────────────────────
   // THEME ENGINE — FM-DX INHERITANCE + MANUAL PRESETS
   // ─────────────────────────────────────────────────────
+  let FM_DX_CSS_PALETTE_CHECK = -Infinity;
+  let FM_DX_CSS_PALETTE = Object.create(null);
+  let FM_DX_COLOR_PROBE = null;
+
+  function refreshFmDxCssPalette(force = false) {
+    const now = performance.now();
+    if (!force && now - FM_DX_CSS_PALETTE_CHECK < 250) return;
+    FM_DX_CSS_PALETTE_CHECK = now;
+
+    try {
+      // A detached AudioMetrix container does not inherit the FM-DX custom
+      // properties. Use it only after insertion; otherwise read from :root.
+      const amxContainer = STATE.dom && STATE.dom.container;
+      const source =
+        (amxContainer && amxContainer.isConnected ? amxContainer : null) ||
+        document.documentElement ||
+        document.body;
+      if (!source) return;
+
+      const computed = getComputedStyle(source);
+      const next = Object.create(null);
+
+      ["--color-2", "--color-3", "--color-4"].forEach((propertyName) => {
+        const raw = computed.getPropertyValue(propertyName).trim();
+        if (!raw) return;
+
+        if (!raw.startsWith("var(") && (!window.CSS || CSS.supports("color", raw))) {
+          next[propertyName] = raw;
+          return;
+        }
+
+        // Resolve nested CSS variables to the actual RGB value understood by
+        // CanvasRenderingContext2D.
+        const parent = document.body || document.documentElement;
+        if (!parent) return;
+        if (!FM_DX_COLOR_PROBE) {
+          FM_DX_COLOR_PROBE = document.createElement("span");
+          FM_DX_COLOR_PROBE.setAttribute("aria-hidden", "true");
+          FM_DX_COLOR_PROBE.style.cssText =
+            "position:fixed;left:-9999px;top:-9999px;visibility:hidden;pointer-events:none;";
+          parent.appendChild(FM_DX_COLOR_PROBE);
+        }
+        FM_DX_COLOR_PROBE.style.color = `var(${propertyName})`;
+        const resolved = getComputedStyle(FM_DX_COLOR_PROBE).color;
+        if (resolved) next[propertyName] = resolved;
+      });
+
+      FM_DX_CSS_PALETTE = next;
+    } catch (e) {}
+  }
+
+  function getFmDxCssColor(propertyName) {
+    refreshFmDxCssPalette();
+    return FM_DX_CSS_PALETTE[propertyName] || null;
+  }
+
   function getFmDxThemeTriple() {
     try {
       const themeName = safeLSGet("theme") || safeLSGet("defaultTheme") || null;
-      if (!themeName) return null;
-      if (typeof themes === "undefined" || !themes) return null;
-
-      const triple = themes[themeName];
-      if (!triple) return null;
-
-      // Validate correct triple
-      if (!Array.isArray(triple) || triple.length < 3) return null;
-
-      const [main, bright, text] = triple;
-
-      // Validate color strings (basic RGB/HSL/HEX detection)
       const isColor = (c) => typeof c === "string" &&
         (c.startsWith("rgb") || c.startsWith("hsl") || c.startsWith("#"));
 
-      if (!isColor(main) || !isColor(bright)) {
-        return null;
+      if (themeName && typeof themes !== "undefined" && themes) {
+        const triple = themes[themeName];
+        if (Array.isArray(triple) && triple.length >= 3) {
+          const [main, bright, text] = triple;
+          if (isColor(main) && isColor(bright)) {
+            return [main, bright, isColor(text) ? text : null];
+          }
+        }
       }
 
-      // text color optional but validate if exists
-      if (text && !isColor(text)) {
-        return [main, bright, null];
+      // The live CSS palette remains available even when the FM-DX JavaScript
+      // theme registry is initialized after AudioMetrix.
+      const cssTriple = [
+        getFmDxCssColor("--color-2"),
+        getFmDxCssColor("--color-3"),
+        getFmDxCssColor("--color-4")
+      ];
+      if (cssTriple.every(isColor)) {
+        return cssTriple;
       }
-
-      return [main, bright, text || null];
+      return null;
     } catch (e) {
       return null;
+    }
+  }
+
+  function getFmDxAccentColor() {
+    return (
+      getFmDxCssColor("--color-4") ||
+      (getFmDxThemeTriple() || [])[2] ||
+      "rgb(184,194,204)"
+    );
+  }
+
+  function isStoredThemeColor(value) {
+    return typeof value === "string" &&
+      (value.startsWith("rgb") || value.startsWith("hsl") || value.startsWith("#"));
+  }
+
+  function loadCachedAutomaticTriple() {
+    try {
+      const parsed = JSON.parse(safeLSGet(STORAGE_AUTO_PALETTE) || "null");
+      return Array.isArray(parsed) &&
+        parsed.length >= 3 &&
+        parsed.every(isStoredThemeColor)
+          ? parsed.slice(0, 3)
+          : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function cacheAutomaticTriple(triple) {
+    if (
+      Array.isArray(triple) &&
+      triple.length >= 3 &&
+      triple.every(isStoredThemeColor)
+    ) {
+      safeLSSet(STORAGE_AUTO_PALETTE, JSON.stringify(triple.slice(0, 3)));
     }
   }
 
   const THEME_REGISTRY = {
     automatic: () => {
       try {
-        const triple = getFmDxThemeTriple();
-        if (!triple) return THEME_REGISTRY.vesper;
+        const triple =
+          getFmDxThemeTriple() ||
+          loadCachedAutomaticTriple() ||
+          ["rgb(28,34,40)", "rgb(92,104,116)", "rgb(184,194,204)"];
 
         const [main, mid, textColor] = triple;
 
@@ -817,7 +1111,15 @@
           }
         };
       } catch (e) {
-        return THEME_REGISTRY.vesper;
+        return {
+          name: "automatic",
+          colors: {
+            low: "rgb(28,34,40)",
+            mid: "rgb(92,104,116)",
+            high: "rgb(184,194,204)",
+            peak: "rgb(255,255,255)"
+          }
+        };
       }
     },
 
@@ -1054,21 +1356,47 @@
   // HARDENED AUTO-INHERIT REFRESH FOR "AUTOMATIC" THEME
   let ACTIVE_THEME = loadActiveTheme();
   let LAST_AUTO_THEME_SIG = JSON.stringify(getFmDxThemeTriple() || []);
+  let LAST_AUTO_THEME_CHECK = 0;
+
+  function refreshAutomaticTheme(force = false) {
+    try {
+      if ((safeLSGet(STORAGE_THEME) || "automatic") !== "automatic") {
+        return false;
+      }
+
+      const now = performance.now();
+      if (!force && now - LAST_AUTO_THEME_CHECK < 250) return false;
+      LAST_AUTO_THEME_CHECK = now;
+
+      // FM-DX may expose its theme registry after AudioMetrix is evaluated.
+      // Keep the current temporary fallback until a valid triple is ready.
+      refreshFmDxCssPalette(force);
+      const nextTriple = getFmDxThemeTriple();
+      if (!nextTriple) return false;
+      cacheAutomaticTriple(nextTriple);
+
+      const nextSig = JSON.stringify(nextTriple);
+      if (!force && nextSig === LAST_AUTO_THEME_SIG) return false;
+
+      LAST_AUTO_THEME_SIG = nextSig;
+      ACTIVE_THEME = THEME_REGISTRY.automatic();
+      invalidateVisualCaches();
+
+      // Theme resolution can complete after the startup canvas has already
+      // been painted with the temporary fallback. Force a repaint even while
+      // playback is stopped; otherwise the correct Automatic palette appears
+      // only after the user changes a layout or render setting.
+      requestRender();
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
 
   try {
     new MutationObserver(() => {
       try {
-        const sel = safeLSGet(STORAGE_THEME) || "automatic";
-        if (sel === "automatic") {
-          const nextTriple = getFmDxThemeTriple() || [];
-          const nextSig = JSON.stringify(nextTriple);
-
-          if (nextSig !== LAST_AUTO_THEME_SIG) {
-            LAST_AUTO_THEME_SIG = nextSig;
-            ACTIVE_THEME = THEME_REGISTRY.automatic();
-            invalidateVisualCaches();
-          }
-        }
+        refreshAutomaticTheme();
 
       } catch (e) {
         console.error(
@@ -1110,8 +1438,10 @@
     display: {
       glowIntensity: loadLSBool(STORAGE_GLOW_ENABLED, false) ? 1 : 0,
       barStyle: loadLSEnum(STORAGE_BARSTYLE, "simple", VALID_STYLES),
-      layoutMode: loadLSEnum(STORAGE_LAYOUT, "lr", ["lr", "sa", "full"]),
-      renderMode: loadLSEnum(STORAGE_RENDER, "bars", ["bars", "gauges", "mirrored"]),
+      layoutMode: loadLSEnum(STORAGE_LAYOUT, "lr", ["lr", "sa", "full", "equalizer", "vuHybrid"]),
+      renderMode: loadLSEnum(STORAGE_RENDER, "bars", ["bars", "gauges", "mirrored", "analogVu"]),
+      hybridMode: loadLSEnum(STORAGE_HYBRID_MODE, "stereo12", HYBRID_MODES),
+      equalizerRenderMode: loadLSEnum(STORAGE_EQ_RENDER, "bars", ["bars", "spectrum"]),
       showPeaks: loadLSBool(STORAGE_SHOW_PEAKS, false),
       showReadouts: loadLSBool(STORAGE_SHOW_READOUTS, false),
       dimensions: {
@@ -1137,6 +1467,8 @@
       splitter: null,
       analyserLeft: null,
       analyserRight: null,
+      analyserEqualizerLeft: null,
+      analyserEqualizerRight: null,
       analyserPeak: null,
       bassFilter: null,
       highPassFilter: null,
@@ -1144,6 +1476,8 @@
       source: null,
       dataLeft: null,
       dataRight: null,
+      dataEqualizerLeft: null,
+      dataEqualizerRight: null,
       dataPeak: null
     },
 
@@ -1170,7 +1504,29 @@
       },
       stereoQuality: {
         instant: 0,
-        smooth: 0
+        smooth: 0,
+        peakDb: -999
+      },
+      equalizer: {
+        values: new Array(EQ_BAND_COUNT).fill(0),
+        peaks: new Array(EQ_BAND_COUNT).fill(0),
+        dbValues: new Array(EQ_BAND_COUNT).fill(-100),
+        peakHoldUntil: new Array(EQ_BAND_COUNT).fill(0),
+        lastUpdateTs: 0
+      },
+      hybridStereo12: {
+        values: new Array(HYBRID_STEREO_12_FREQUENCIES.length).fill(0),
+        peaks: new Array(HYBRID_STEREO_12_FREQUENCIES.length).fill(0),
+        dbValues: new Array(HYBRID_STEREO_12_FREQUENCIES.length).fill(-100),
+        peakHoldUntil: new Array(HYBRID_STEREO_12_FREQUENCIES.length).fill(0),
+        lastUpdateTs: 0
+      },
+      hybridAudio10: {
+        values: new Array(HYBRID_AUDIO_10_FREQUENCIES.length).fill(0),
+        peaks: new Array(HYBRID_AUDIO_10_FREQUENCIES.length).fill(0),
+        dbValues: new Array(HYBRID_AUDIO_10_FREQUENCIES.length).fill(-100),
+        peakHoldUntil: new Array(HYBRID_AUDIO_10_FREQUENCIES.length).fill(0),
+        lastUpdateTs: 0
       }
     },
 
@@ -1202,13 +1558,15 @@
     layout: {
       width: 0,
       height: 0,
+      dpr: 1,
       dirty: true
     },
 
     peakHoldUntil: {
       left: 0,
       right: 0,
-      audio: 0
+      audio: 0,
+      quality: 0
     },
 
     meta: {
@@ -2273,18 +2631,20 @@ function saveAMXPanelGeometry(panel) {
           opts.classList.toggle("opened");
         };
 
-        opts.querySelectorAll(".option").forEach((opt) => {
-          opt.onclick = () => {
-            const val = opt.dataset.value;
-            input.value = opt.textContent;
+        // Event delegation keeps dynamically replaced option sets functional.
+        opts.onclick = (event) => {
+          const opt = event.target.closest(".option");
+          if (!opt || !opts.contains(opt)) return;
 
-            if (typeof onSelect === "function") {
-              onSelect(val, opt);
-            }
+          const val = opt.dataset.value;
+          input.value = opt.textContent;
 
-            opts.classList.remove("opened");
-          };
-        });
+          if (typeof onSelect === "function") {
+            onSelect(val, opt);
+          }
+
+          opts.classList.remove("opened");
+        };
       }
 
       // THEME SELECTOR
@@ -2331,14 +2691,30 @@ function saveAMXPanelGeometry(panel) {
         if (!VALID_THEMES.includes(val)) return;
 
         safeLSSet(STORAGE_THEME, val);
-        ACTIVE_THEME = val === "automatic" ? THEME_REGISTRY.automatic() : THEME_REGISTRY[val];
-        invalidateVisualCaches();
+        if (val === "automatic") {
+          refreshAutomaticTheme(true);
+        } else {
+          ACTIVE_THEME = THEME_REGISTRY[val];
+          invalidateVisualCaches();
+        }
         requestRender();
       });
 
       // BAR STYLE AVAILABILITY (renderMode dependent)
       function updateBarStyleAvailability() {
-        const disabled = CONFIG.display.renderMode === "gauges";
+        const disabled =
+          (
+            CONFIG.display.layoutMode === "equalizer" &&
+            CONFIG.display.equalizerRenderMode === "spectrum"
+          ) ||
+          (
+            CONFIG.display.layoutMode !== "equalizer" &&
+            CONFIG.display.layoutMode !== "vuHybrid" &&
+            (
+              CONFIG.display.renderMode === "gauges" ||
+              CONFIG.display.renderMode === "analogVu"
+            )
+          );
         styleDiv.classList.toggle("is-disabled", disabled);
       }
 
@@ -2394,9 +2770,11 @@ function saveAMXPanelGeometry(panel) {
         <div class="dropdown">
           <input type="text" id="amx-layout-input" class="form-control" readonly>
           <div id="amx-layout-options" class="options">
-            <div class="option" data-value="lr">Stereo Bars</div>
-            <div class="option" data-value="sa">Stereo Quality & Audio Peak Bars</div>
-            <div class="option" data-value="full">Full Mode (Both)</div>
+            <div class="option" data-value="lr">Stereo levels</div>
+            <div class="option" data-value="sa">Stereo quality &amp; Audio peak</div>
+            <div class="option" data-value="full">Audio levels (Full mode)</div>
+            <div class="option" data-value="equalizer">Equalizer</div>
+            <div class="option" data-value="vuHybrid">Vu Hybrid</div>
           </div>
         </div>
       `;
@@ -2405,16 +2783,42 @@ function saveAMXPanelGeometry(panel) {
       const layoutInput = document.getElementById("amx-layout-input");
       const savedLayout = CONFIG.display.layoutMode;
       layoutInput.value =
-        savedLayout === "lr" ? "Stereo Bars" :
-        savedLayout === "sa" ? "Stereo Quality & Audio Peak Bars" :
-        "Full Mode (Both)";
+        savedLayout === "lr" ? "Stereo levels" :
+        savedLayout === "sa" ? "Stereo quality & Audio peak" :
+        savedLayout === "full" ? "Audio levels (Full mode)" :
+        savedLayout === "vuHybrid" ? "Vu Hybrid" :
+        "Equalizer";
 
       bindDropdown(layoutInput, "#amx-layout-options", (val) => {
+        if (!["lr", "sa", "full", "equalizer", "vuHybrid"].includes(val)) return;
         CONFIG.display.layoutMode = val;
         safeLSSet("AMX_LAYOUT_MODE", val);
-      
+
+        if (val === "equalizer" && CONFIG.display.renderMode !== "bars") {
+          STATE._renderBeforeEqualizer = CONFIG.display.renderMode;
+          CONFIG.display.renderMode = "bars";
+          const renderInput = document.getElementById("amx-render-input");
+          if (renderInput) renderInput.value = "Bars";
+        } else if (
+          val !== "equalizer" &&
+          STATE._renderBeforeEqualizer &&
+          ["bars", "gauges", "mirrored", "analogVu"].includes(STATE._renderBeforeEqualizer)
+        ) {
+          CONFIG.display.renderMode = STATE._renderBeforeEqualizer;
+          const renderInput = document.getElementById("amx-render-input");
+          if (renderInput) {
+            renderInput.value =
+              CONFIG.display.renderMode === "gauges" ? "Gauges" :
+              CONFIG.display.renderMode === "analogVu" ? "Analog VU" :
+              CONFIG.display.renderMode === "mirrored" ? "Mirrored" :
+              "Bars";
+          }
+          STATE._renderBeforeEqualizer = null;
+        }
+
         if (
           CONFIG.display.renderMode === "mirrored" &&
+          val !== "vuHybrid" &&
           !MIRRORED_LAYOUTS.includes(val)
         ) {
           CONFIG.display.renderMode = "bars";
@@ -2422,7 +2826,13 @@ function saveAMXPanelGeometry(panel) {
           const renderInput = document.getElementById("amx-render-input");
           if (renderInput) renderInput.value = "Bars";
         }
-      
+
+        updateBarStyleAvailability();
+        const renderGroup = document.getElementById("amx-render-group");
+        if (renderGroup) {
+          renderGroup.classList.remove("is-disabled");
+        }
+        syncRenderSelectorOptions();
         invalidateVisualCaches();
         updateMirroredCanvasHeight();
         requestRender();
@@ -2430,6 +2840,7 @@ function saveAMXPanelGeometry(panel) {
 
       // RENDER STYLE SELECTOR
       const renderDiv = document.createElement("div");
+      renderDiv.id = "amx-render-group";
       renderDiv.className = "form-group";
       renderDiv.innerHTML = `
         <label class="form-label"><i class="fa-solid m-right-10"></i>RENDER STYLE</label>
@@ -2439,6 +2850,7 @@ function saveAMXPanelGeometry(panel) {
             <div class="option" data-value="bars">Bars</div>
             <div class="option" data-value="mirrored">Mirrored</div>
             <div class="option" data-value="gauges">Gauges</div>
+            <div class="option" data-value="analogVu">Analog VU</div>
           </div>
         </div>
       `;
@@ -2447,23 +2859,45 @@ function saveAMXPanelGeometry(panel) {
       const renderInput = document.getElementById("amx-render-input");
       const savedRender = CONFIG.display.renderMode;
       renderInput.value =
+        CONFIG.display.layoutMode === "equalizer" ? "Bars" :
         savedRender === "bars" ? "Bars" :
         savedRender === "gauges" ? "Gauges" :
+        savedRender === "analogVu" ? "Analog VU" :
         "Mirrored";
 
       bindDropdown(renderInput, "#amx-render-options", (val) => {
+        if (CONFIG.display.layoutMode === "vuHybrid") {
+          if (!HYBRID_MODES.includes(val)) return;
+          CONFIG.display.hybridMode = val;
+          safeLSSet(STORAGE_HYBRID_MODE, val);
+          invalidateVisualCaches();
+          requestRender();
+          return;
+        }
+
+        if (CONFIG.display.layoutMode === "equalizer") {
+          if (!["bars", "spectrum"].includes(val)) return;
+          CONFIG.display.equalizerRenderMode = val;
+          safeLSSet(STORAGE_EQ_RENDER, val);
+          updateBarStyleAvailability();
+          invalidateVisualCaches();
+          requestRender();
+          return;
+        }
+
         if (
           val === "mirrored" &&
           !MIRRORED_LAYOUTS.includes(CONFIG.display.layoutMode)
         ) {
           showAMXSoftMessage(
-            "Mirrored mode is only available when Layout Mode is set to Stereo Bars, Stereo Quality/Audio Peak, or Full.",
+            "Mirrored mode is only available with Stereo levels, Stereo quality & Audio peak, or Full mode.",
             "fa-triangle-exclamation"
           );
         
           renderInput.value =
             CONFIG.display.renderMode === "bars" ? "Bars" :
             CONFIG.display.renderMode === "gauges" ? "Gauges" :
+            CONFIG.display.renderMode === "analogVu" ? "Analog VU" :
             "Mirrored";
         
           return;
@@ -2476,6 +2910,50 @@ function saveAMXPanelGeometry(panel) {
         updateMirroredCanvasHeight();
         requestRender();
       });
+
+      function syncRenderSelectorOptions() {
+        const options = document.getElementById("amx-render-options");
+        if (!options || !renderInput) return;
+
+        if (CONFIG.display.layoutMode === "vuHybrid") {
+          options.innerHTML = `
+            <div class="option" data-value="stereo12">Stereo levels &amp; 12-band EQ</div>
+            <div class="option" data-value="audio10">Audio levels &amp; 10-band EQ</div>
+          `;
+          renderInput.value =
+            CONFIG.display.hybridMode === "audio10"
+              ? "Audio levels & 10-band EQ"
+              : "Stereo levels & 12-band EQ";
+          return;
+        }
+
+        if (CONFIG.display.layoutMode === "equalizer") {
+          options.innerHTML = `
+            <div class="option" data-value="bars">Bars</div>
+            <div class="option" data-value="spectrum">Spectrum</div>
+          `;
+          renderInput.value =
+            CONFIG.display.equalizerRenderMode === "spectrum"
+              ? "Spectrum"
+              : "Bars";
+          return;
+        }
+
+        options.innerHTML = `
+          <div class="option" data-value="bars">Bars</div>
+          <div class="option" data-value="mirrored">Mirrored</div>
+          <div class="option" data-value="gauges">Gauges</div>
+          <div class="option" data-value="analogVu">Analog VU</div>
+        `;
+        renderInput.value =
+          CONFIG.display.layoutMode === "equalizer" ? "Bars" :
+          CONFIG.display.renderMode === "gauges" ? "Gauges" :
+          CONFIG.display.renderMode === "analogVu" ? "Analog VU" :
+          CONFIG.display.renderMode === "mirrored" ? "Mirrored" :
+          "Bars";
+      }
+
+      syncRenderSelectorOptions();
 
       // GLOW ENABLE / DISABLE
       {
@@ -2578,6 +3056,7 @@ function saveAMXPanelGeometry(panel) {
           readoutsCb.checked ? "true" : "false"
         );
         applyVisualState();
+        requestRender();
       });
 
       // AUDIO RESPONSE PANEL
@@ -2704,7 +3183,7 @@ function saveAMXPanelGeometry(panel) {
 
     if (type === "mirrored") {
       activeCanvas = cm;
-    } else if (type === "gauges") {
+    } else if (type === "gauges" || type === "analogVu") {
       activeCanvas = cg;
     } else {
       // NORMAL (default)
@@ -2767,36 +3246,141 @@ function saveAMXPanelGeometry(panel) {
     STATE.layout.dirty = true;
   }
 
+  // HiDPI rendering: keep all meter geometry in logical CSS pixels while
+  // allocating a denser backing store for Retina/high-DPI displays and zoom.
+  const AMX_MAX_RENDER_DPR = 2;
+
+  function getAMXRenderDpr() {
+    const raw = Number(window.devicePixelRatio) || 1;
+    // Keep a modest supersampling floor so browser zoom below 100% still
+    // receives enough backing-store pixels, while avoiding fractional
+    // logical geometry and the vertical seams it caused in bar fills.
+    return Math.max(1.25, Math.min(AMX_MAX_RENDER_DPR, raw));
+  }
+
+  function getCanvasLogicalWidth(canvas) {
+    if (!canvas) return 0;
+    return Number(canvas._amxLogicalWidth) || 0;
+  }
+
+  function getCanvasLogicalHeight(canvas) {
+    if (!canvas) return 0;
+    return Number(canvas._amxLogicalHeight) || 0;
+  }
+
+  function getCanvasRenderedWidth(canvas) {
+    if (!canvas) return 0;
+    const rect = canvas.getBoundingClientRect();
+    return Math.max(0, Math.round(rect.width || 0));
+  }
+
+  function getExpectedCanvasWidth(canvas) {
+    const wrapperW = Math.max(0, Math.round(STATE.layout.width || 0));
+    if (!wrapperW) return getCanvasLogicalWidth(canvas);
+
+    if (canvas === STATE.dom.canvasMirror) {
+      const left = Math.max(4, CONFIG.display.dimensions.canvasLeft - 20);
+      return Math.max(1, wrapperW - left - Math.max(8, CONFIG.display.dimensions.canvasLeft - 15));
+    }
+
+    if (canvas === STATE.dom.canvasGauges) {
+      // Gauges use a symmetric full-width drawing surface so their group can
+      // be mathematically centered in the tile without clipping either edge.
+      return Math.max(1, wrapperW - 10);
+    }
+
+    // Normal bars keep their original inset track.
+    return Math.max(1, wrapperW - CONFIG.display.dimensions.canvasLeft - 5);
+  }
+
+  function applyCanvasHiDpiTransform(canvas) {
+    if (!canvas) return null;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+
+    const dpr = Number(canvas._amxDpr) || getAMXRenderDpr();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return ctx;
+  }
+
   function refreshLayoutAndCanvas() {
     const prevW = STATE.layout.width;
     const prevH = STATE.layout.height;
+    const prevDpr = STATE.layout.dpr || 1;
 
     markLayoutDirty();
     readLayoutOnce();
+    STATE.layout.dpr = getAMXRenderDpr();
 
-    if (
+    const layoutChanged =
       STATE.layout.width !== prevW ||
-      STATE.layout.height !== prevH
-    ) {
+      STATE.layout.height !== prevH;
+    const dprChanged = STATE.layout.dpr !== prevDpr;
+
+    if (layoutChanged || dprChanged) {
       invalidateVisualCaches();
+
+      // Reallocate existing canvases at the new density without changing
+      // their logical drawing coordinates or current layout heights.
+      [
+        STATE.dom.canvasNormal,
+        STATE.dom.canvasMirror,
+        STATE.dom.canvasGauges
+      ].forEach((canvas) => {
+        if (!canvas) return;
+        const renderedW = getCanvasRenderedWidth(canvas);
+        const logicalW = renderedW > 40
+          ? renderedW
+          : getExpectedCanvasWidth(canvas);
+        const logicalH = getCanvasLogicalHeight(canvas);
+        if (logicalW > 0 && logicalH > 0) {
+          resizeCanvasIfNeeded(canvas, logicalW, logicalH);
+        }
+      });
     }
 
     requestRender();
   }
 
   function resizeCanvasIfNeeded(canvas, w, h) {
-    if (!canvas) return;
+    if (!canvas) return false;
 
-    if (canvas.width !== w || canvas.height !== h) {
-      canvas.width  = w;
-      canvas.height = h;
+    // Keep logical meter geometry on integer CSS pixels. Fractional logical
+    // widths combined with a rounded backing store can create faint vertical
+    // seams between adjacent 1px bar columns.
+    const logicalW = Math.max(1, Math.round(Number(w) || 1));
+    const logicalH = Math.max(1, Math.round(Number(h) || 1));
+    const dpr = getAMXRenderDpr();
+    const pixelW = Math.max(1, Math.round(logicalW * dpr));
+    const pixelH = Math.max(1, Math.round(logicalH * dpr));
+
+    let changed = false;
+
+    if (canvas.width !== pixelW || canvas.height !== pixelH) {
+      canvas.width = pixelW;
+      canvas.height = pixelH;
+      changed = true;
     }
 
-    const sw = w + "px";
-    const sh = h + "px";
+    canvas._amxLogicalWidth = logicalW;
+    canvas._amxLogicalHeight = logicalH;
+    canvas._amxDpr = dpr;
+    delete canvas._amxScaleX;
+    delete canvas._amxScaleY;
 
-    if (canvas.style.width !== sw)  canvas.style.width  = sw;
-    if (canvas.style.height !== sh) canvas.style.height = sh;
+    // Keep the authored CSS width (usually calc(...)) intact. The backing
+    // store follows the actually rendered width; forcing a px width here
+    // breaks gauge/label alignment and can clip mirrored mode.
+    const sh = logicalH + "px";
+
+    if (canvas.style.height !== sh) {
+      canvas.style.height = sh;
+      changed = true;
+    }
+
+    applyCanvasHiDpiTransform(canvas);
+    STATE.layout.dpr = dpr;
+    return changed;
   }
 
   function updateMirroredCanvasHeight() {
@@ -3062,6 +3646,16 @@ function saveAMXPanelGeometry(panel) {
       }
     }
 
+    // Gauge labels live in an overlay inset by 5px on both sides, whereas
+    // readouts are direct children of the full content wrapper. Convert the
+    // shared normalized centre to the equivalent wrapper coordinate exactly.
+    function gaugeReadoutLeft(centerFraction) {
+      const f = clamp01(centerFraction);
+      const insetCorrection = 5 - 10 * f;
+      const sign = insetCorrection < 0 ? "-" : "+";
+      return `calc(${f * 100}% ${sign} ${Math.abs(insetCorrection)}px)`;
+    }
+
     // 2) MIRRORED — outside of bars
     if (useMirrored) {
       let leftTopKey, rightTopKey, leftBottomKey, rightBottomKey;
@@ -3111,26 +3705,28 @@ function saveAMXPanelGeometry(panel) {
       const TOP_FULL = "35%";
       const T   = "translate(-50%, 0)";
 
+      const centers = getGaugeGeometry(layout).centers;
+
       // FULL — 4 gauges
-      if (layout === "full") {
-        showAt("L", "17.5%", TOP_FULL, T);
-        showAt("R", "40%",   TOP_FULL, T);
-        showAt("Q", "62.5%", TOP_FULL, T);
-        showAt("A", "85%",   TOP_FULL, T);
+      if (layout === "full" && centers.length === 4) {
+        showAt("L", gaugeReadoutLeft(centers[0]), TOP_FULL, T);
+        showAt("R", gaugeReadoutLeft(centers[1]), TOP_FULL, T);
+        showAt("Q", gaugeReadoutLeft(centers[2]), TOP_FULL, T);
+        showAt("A", gaugeReadoutLeft(centers[3]), TOP_FULL, T);
         return;
       }
 
       // SA — 2 gauges (Q / A)
-      if (layout === "sa") {
-        showAt("Q", "27%", TOP, T);
-        showAt("A", "75%", TOP, T);
+      if (layout === "sa" && centers.length === 2) {
+        showAt("Q", gaugeReadoutLeft(centers[0]), TOP, T);
+        showAt("A", gaugeReadoutLeft(centers[1]), TOP, T);
         return;
       }
 
       // LR — 2 gauges (L / R)
-      if (layout === "lr") {
-        showAt("L", "27%", TOP, T);
-        showAt("R", "75%", TOP, T);
+      if (layout === "lr" && centers.length === 2) {
+        showAt("L", gaugeReadoutLeft(centers[0]), TOP, T);
+        showAt("R", gaugeReadoutLeft(centers[1]), TOP, T);
         return;
       }
 
@@ -3280,55 +3876,20 @@ function saveAMXPanelGeometry(panel) {
     // UNIFIED GEOMETRY CACHE
     const xs = getPixelFillXs(barW);
 
-    // DRAW BAR — pixel accurate
-    const maxX =
-      fillFloor < colorLen
-        ? (fillFloor < xs.length ? fillFloor : xs.length)
-        : (colorLen < xs.length ? colorLen : xs.length);
-    for (let i = 0; i < maxX; i++) {
-      const x = xs[i];
-      ctx.fillStyle = colors[x];
-      ctx.fillRect(x, yy, 1, h);
+    const maxX = Math.min(fillFloor, colorLen, xs.length);
+    if (glowIntensity > 0 && maxX > 0) {
+      ctx.save();
+      ctx.globalAlpha = 0.44 * glowIntensity;
+      ctx.filter = "blur(7px)";
+      ctx.fillStyle = createBarsLinearGradient(ctx, barW, gcache.mode);
+      ctx.fillRect(0, yy, maxX, h);
+      ctx.restore();
     }
 
-    // SIMPLE GLOW — rim + soft fade (NO BLUR)
-    if (glowIntensity > 0) {
-
-      const rimExpand = 1.5;
-      const fadeExpand = 3.5;
-
-      const rimAlpha = 0.14 * glowIntensity;
-      const fadeAlpha = 0.02 * glowIntensity;
-
-      ctx.save();
-
-      // rim
-      ctx.globalAlpha = rimAlpha;
-      for (let i = 0; i < maxX; i++) {
-        const x = xs[i];
-        ctx.fillStyle = colors[x];
-        ctx.fillRect(
-          x - rimExpand,
-          yy - rimExpand,
-          1 + rimExpand * 2,
-          h + rimExpand * 2
-        );
-      }
-
-      // soft fade
-      ctx.globalAlpha = fadeAlpha;
-      for (let i = 0; i < maxX; i++) {
-        const x = xs[i];
-        ctx.fillStyle = colors[x];
-        ctx.fillRect(
-          x - fadeExpand,
-          yy - fadeExpand,
-          1 + fadeExpand * 2,
-          h + fadeExpand * 2
-        );
-      }
-
-      ctx.restore();
+    // DRAW BAR — clean fill above the unified gradient halo.
+    if (maxX > 0) {
+      ctx.fillStyle = createBarsLinearGradient(ctx, barW, gcache.mode);
+      ctx.fillRect(0, yy, maxX, h);
     }
 
     // EXTERNAL PEAK
@@ -3363,10 +3924,6 @@ function saveAMXPanelGeometry(panel) {
     const segmentCache = GEOMETRY_CACHE.segment;
 
     const doGlow = glowIntensity > 0;
-    const rimExpand = 1.2;
-    const fadeExpand = 3.8;
-    const rimAlpha = 0.22 * glowIntensity;
-    const fadeAlpha = 0.07 * glowIntensity;
 
     const renderMode = CONFIG.display.renderMode;
     const layoutMode = CONFIG.display.layoutMode;
@@ -3411,31 +3968,17 @@ function saveAMXPanelGeometry(panel) {
             ctx.fillStyle = segColor;
             ctx.fillRect(x, ry, segW, rowH);
 
-            // unified glow (stronger around segment)
             if (doGlow) {
-              // rim glow
               ctx.save();
-              ctx.globalAlpha = rimAlpha;
+              ctx.globalAlpha = 0.50 * glowIntensity;
+              ctx.filter = "blur(6px)";
               ctx.fillStyle = segColor;
-              ctx.fillRect(
-                x - rimExpand,
-                ry - rimExpand,
-                segW + rimExpand * 2,
-                rowH + rimExpand * 2
-              );
+              ctx.fillRect(x, ry, segW, rowH);
               ctx.restore();
 
-              // soft fade
-              ctx.save();
-              ctx.globalAlpha = fadeAlpha;
+              // Restore a crisp fill above the blurred segment halo.
               ctx.fillStyle = segColor;
-              ctx.fillRect(
-                x - fadeExpand,
-                ry - fadeExpand,
-                segW + fadeExpand * 2,
-                rowH + fadeExpand * 2
-              );
-              ctx.restore();
+              ctx.fillRect(x, ry, segW, rowH);
             }
           }
         }
@@ -3489,31 +4032,17 @@ function saveAMXPanelGeometry(panel) {
         ctx.fillStyle = segColor;
         ctx.fillRect(x, y, segW, segH);
 
-        // unified glow (same profile as mirrored)
         if (doGlow) {
-          // rim glow
           ctx.save();
-          ctx.globalAlpha = rimAlpha;
+          ctx.globalAlpha = 0.50 * glowIntensity;
+          ctx.filter = "blur(6px)";
           ctx.fillStyle = segColor;
-          ctx.fillRect(
-            x - rimExpand,
-            y - rimExpand,
-            segW + rimExpand * 2,
-            segH + rimExpand * 2
-          );
+          ctx.fillRect(x, y, segW, segH);
           ctx.restore();
 
-          // soft fade
-          ctx.save();
-          ctx.globalAlpha = fadeAlpha;
+          // Restore a crisp fill above the blurred segment halo.
           ctx.fillStyle = segColor;
-          ctx.fillRect(
-            x - fadeExpand,
-            y - fadeExpand,
-            segW + fadeExpand * 2,
-            segH + fadeExpand * 2
-          );
-          ctx.restore();
+          ctx.fillRect(x, y, segW, segH);
         }
       }
     }
@@ -3549,10 +4078,8 @@ function saveAMXPanelGeometry(panel) {
     const circledotsCache = GEOMETRY_CACHE.circledots;
 
     const doGlow = glowIntensity > 0;
-    const rimExpand  = 1.4;
-    const fadeExpand = 4.5;
-    const rimAlpha  = 0.24 * glowIntensity;
-    const fadeAlpha = 0.08 * glowIntensity;
+    const glowAlpha = 0.58 * glowIntensity;
+    const glowBlur = 7;
 
     // MIRRORED MODE (2 rows) — only for LR / SA
     if (isMirroredLRSA) {
@@ -3591,26 +4118,20 @@ function saveAMXPanelGeometry(panel) {
           ctx.arc(x, cy, radius, 0, Math.PI * 2);
           ctx.fill();
 
-          // UNIFIED GLOW
           if (doGlow) {
-
-            // rim
             ctx.save();
-            ctx.globalAlpha = rimAlpha;
+            ctx.globalAlpha = glowAlpha;
+            ctx.filter = `blur(${glowBlur}px)`;
             ctx.fillStyle = c;
             ctx.beginPath();
-            ctx.arc(x, cy, radius + rimExpand, 0, Math.PI * 2);
+            ctx.arc(x, cy, radius, 0, Math.PI * 2);
             ctx.fill();
             ctx.restore();
 
-            // soft fade
-            ctx.save();
-            ctx.globalAlpha = fadeAlpha;
             ctx.fillStyle = c;
             ctx.beginPath();
-            ctx.arc(x, cy, radius + fadeExpand, 0, Math.PI * 2);
+            ctx.arc(x, cy, radius, 0, Math.PI * 2);
             ctx.fill();
-            ctx.restore();
           }
         }
       }
@@ -3653,26 +4174,20 @@ function saveAMXPanelGeometry(panel) {
       ctx.arc(x, cy, radius, 0, Math.PI * 2);
       ctx.fill();
 
-      // UNIFIED GLOW
       if (doGlow) {
-
-        // rim
         ctx.save();
-        ctx.globalAlpha = rimAlpha;
+        ctx.globalAlpha = glowAlpha;
+        ctx.filter = `blur(${glowBlur}px)`;
         ctx.fillStyle = c;
         ctx.beginPath();
-        ctx.arc(x, cy, radius + rimExpand, 0, Math.PI * 2);
+        ctx.arc(x, cy, radius, 0, Math.PI * 2);
         ctx.fill();
         ctx.restore();
 
-        // soft fade
-        ctx.save();
-        ctx.globalAlpha = fadeAlpha;
         ctx.fillStyle = c;
         ctx.beginPath();
-        ctx.arc(x, cy, radius + fadeExpand, 0, Math.PI * 2);
+        ctx.arc(x, cy, radius, 0, Math.PI * 2);
         ctx.fill();
-        ctx.restore();
       }
     }
 
@@ -3706,8 +4221,8 @@ function saveAMXPanelGeometry(panel) {
 
     // Glow constants precomputed once
     const doGlow = glowIntensity > 0;
-    const glowAlpha = 0.38 * glowIntensity;
-    const glowBlur = 5.5;
+    const glowAlpha = 0.66 * glowIntensity;
+    const glowBlur = 7;
 
     const matrixdotsCache = GEOMETRY_CACHE.matrixdots;
     const matrixCountCache = GEOMETRY_CACHE.matrixCount;
@@ -3719,7 +4234,6 @@ function saveAMXPanelGeometry(panel) {
       const radius = Math.max(2, Math.min(maxR, Math.floor(height * 0.085)));
       const stepX = radius * 2 + 2;
       const stepY = radius * 2 + 2;
-      const glowR = radius + 1.9;
 
       const centerY = y + height * 0.5;
 
@@ -3778,9 +4292,14 @@ function saveAMXPanelGeometry(panel) {
             ctx.filter = `blur(${glowBlur}px)`;
             ctx.fillStyle = c;
             ctx.beginPath();
-            ctx.arc(x, cy, glowR, 0, Math.PI * 2);
+            ctx.arc(x, cy, radius, 0, Math.PI * 2);
             ctx.fill();
             ctx.restore();
+
+            ctx.fillStyle = c;
+            ctx.beginPath();
+            ctx.arc(x, cy, radius, 0, Math.PI * 2);
+            ctx.fill();
           }
         }
       }
@@ -3796,7 +4315,6 @@ function saveAMXPanelGeometry(panel) {
 
     const radius = Math.max(2, Math.round(visualHeight * 0.19));
     const gapX = radius * 2 + 2;
-    const glowR = radius + 1.9;
 
     const matrixYOffset = isFullMirrored ? 6 : 0;
     const visualTop = isFullMirrored
@@ -3836,9 +4354,14 @@ function saveAMXPanelGeometry(panel) {
         ctx.filter = `blur(${glowBlur}px)`;
         ctx.fillStyle = c;
         ctx.beginPath();
-        ctx.arc(x, row1Y, glowR, 0, Math.PI * 2);
+        ctx.arc(x, row1Y, radius, 0, Math.PI * 2);
         ctx.fill();
         ctx.restore();
+
+        ctx.fillStyle = c;
+        ctx.beginPath();
+        ctx.arc(x, row1Y, radius, 0, Math.PI * 2);
+        ctx.fill();
       }
 
       // ROW 2
@@ -3853,9 +4376,14 @@ function saveAMXPanelGeometry(panel) {
         ctx.filter = `blur(${glowBlur}px)`;
         ctx.fillStyle = c;
         ctx.beginPath();
-        ctx.arc(x, row2Y, glowR, 0, Math.PI * 2);
+        ctx.arc(x, row2Y, radius, 0, Math.PI * 2);
         ctx.fill();
         ctx.restore();
+
+        ctx.fillStyle = c;
+        ctx.beginPath();
+        ctx.arc(x, row2Y, radius, 0, Math.PI * 2);
+        ctx.fill();
       }
     }
 
@@ -3895,10 +4423,6 @@ function saveAMXPanelGeometry(panel) {
     const reflCache =
       renderPillars._reflCache ||
       (renderPillars._reflCache = new Map());
-
-    const glowGeomCache =
-      renderPillars._glowGeomCache ||
-      (renderPillars._glowGeomCache = new Map());
 
     // TRIANGLE PATH
     const midY = topY + h * 0.5;
@@ -3977,6 +4501,35 @@ function saveAMXPanelGeometry(panel) {
       ctx.restore();
     }
 
+    // UNIFIED GRADIENT HALO — same mechanism as the vertical pillar.
+    // The active triangular path is blurred behind the clean signal fill.
+    if (glowIntensity > 0 && fillX > 1) {
+      const fx = Math.min(fillFloor, colors.length, xs.length);
+      if (fx > 0) {
+        const fillRatio = fx / Math.max(1, W);
+        const activeTop =
+          midY + (topY - midY) * fillRatio;
+        const activeBottom =
+          midY + (bottomY - midY) * fillRatio;
+        const activePath = new Path2D();
+        activePath.moveTo(0, midY);
+        activePath.lineTo(fx, activeTop);
+        activePath.lineTo(fx, activeBottom);
+        activePath.closePath();
+
+        ctx.save();
+        ctx.globalAlpha = 0.46 * glowIntensity;
+        ctx.filter = "blur(7px)";
+        ctx.fillStyle = createBarsLinearGradient(
+          ctx,
+          W,
+          gcache.mode
+        );
+        ctx.fill(activePath);
+        ctx.restore();
+      }
+    }
+
     // SIGNAL FILL (pixel fill) — CACHED GEOMETRY
     if (fillX > 0) {
       const fx = Math.min(fillFloor, colors.length, xs.length);
@@ -3984,110 +4537,10 @@ function saveAMXPanelGeometry(panel) {
       ctx.save();
       ctx.clip(path);
 
-      for (let i = 0; i < fx; i++) {
-        const x = xs[i];
-        ctx.fillStyle = colors[i];
-        ctx.fillRect(x, topY, 1, h);
-      }
+      ctx.fillStyle = createBarsLinearGradient(ctx, W, gcache.mode);
+      ctx.fillRect(0, topY, fx, h);
 
       ctx.restore();
-    }
-
-    // TRIANGLE GLOW — rim + soft fade + ultra-soft outer haze
-    if (glowIntensity > 0 && fillX > 1) {
-
-      const fx = Math.min(fillFloor, colors.length, xs.length);
-      if (fx > 0) {
-
-        // glow profile
-        const rimExpand   = 1.0;
-        const fadeExpand  = 2.5;
-        const hazeExpand  = 8.0;
-
-        const rimAlpha   = 0.18 * glowIntensity;
-        const fadeAlpha  = 0.06 * glowIntensity;
-        const hazeAlpha  = 0.003 * glowIntensity;
-        const edgeAlpha  = 1.10 * glowIntensity;
-
-        const glowGeomKey = `${topY}|${h}|${W}`;
-        let glowGeom = glowGeomCache.get(glowGeomKey);
-
-        if (!glowGeom) {
-          const topYs = new Array(xs.length);
-          const spanHs = new Array(xs.length);
-
-          for (let i = 0; i < xs.length; i++) {
-            const x = xs[i];
-            const top = midY + (topY - midY) * (x / W);
-            const bot = midY + (bottomY - midY) * (x / W);
-            topYs[i] = top;
-            spanHs[i] = bot - top;
-          }
-
-          glowGeom = { topYs, spanHs };
-          glowGeomCache.set(glowGeomKey, glowGeom);
-        }
-
-        const topYs = glowGeom.topYs;
-        const spanHs = glowGeom.spanHs;
-
-        ctx.save();
-
-        // RIM GLOW
-        ctx.globalAlpha = rimAlpha;
-        for (let i = 0; i < fx; i++) {
-          const x = xs[i];
-          ctx.fillStyle = colors[i];
-          ctx.fillRect(
-            x - rimExpand,
-            topYs[i] - rimExpand,
-            1 + rimExpand * 2,
-            spanHs[i] + rimExpand * 2
-          );
-        }
-
-        // INNER SOFT FADE
-        ctx.globalAlpha = fadeAlpha;
-        for (let i = 0; i < fx; i++) {
-          const x = xs[i];
-          ctx.fillStyle = colors[i];
-          ctx.fillRect(
-            x - fadeExpand,
-            topYs[i] - fadeExpand,
-            1 + fadeExpand * 2,
-            spanHs[i] + fadeExpand * 2
-          );
-        }
-
-        // ULTRA-SOFT OUTER HAZE
-        ctx.globalAlpha = hazeAlpha;
-        for (let i = 0; i < fx; i++) {
-          const x = xs[i];
-          ctx.fillStyle = colors[i];
-          ctx.fillRect(
-            x - hazeExpand,
-            topYs[i] - hazeExpand,
-            1 + hazeExpand * 2,
-            spanHs[i] + hazeExpand * 2
-          );
-        }
-
-        // BC EDGE ACCENT
-        ctx.globalAlpha = edgeAlpha;
-        for (let i = fx - 2; i < fx; i++) {
-          if (i < 0) continue;
-          const x = xs[i];
-          ctx.fillStyle = colors[i];
-          ctx.fillRect(
-            x - fadeExpand,
-            topYs[i] - fadeExpand - 1,
-            1 + fadeExpand * 2,
-            spanHs[i] + fadeExpand * 2 + 2
-          );
-        }
-
-        ctx.restore();
-      }
     }
 
     // REFLECTION
@@ -4220,41 +4673,23 @@ function saveAMXPanelGeometry(panel) {
 
       // bar glow
       if (glowIntensity > 0 && maxFillX > 0) {
-
-        const rimAlpha  = 0.16 * glowIntensity;
-        const fadeAlpha = 0.05 * glowIntensity;
-
-        // rim
-        const yRim = innerY - 2;
-        const hRim = innerH + 8;
-
-        // fade
-        const yFade = innerY - 6;
-        const hFade = innerH + 14;
-
         ctx.save();
-        ctx.globalCompositeOperation = "source-over";
-
-        // rim around
-        if (rimAlpha > 0.001) {
-          ctx.globalAlpha = rimAlpha;
-          for (let i = 0; i < maxFillX; i++) {
-            const x = xs[i];
-            ctx.fillStyle = colors[i];
-            ctx.fillRect(x - 1, yRim, 2, hRim);
-          }
-        }
-
-        // fade further out
-        if (fadeAlpha > 0.001) {
-          ctx.globalAlpha = fadeAlpha;
-          for (let i = 0; i < maxFillX; i++) {
-            const x = xs[i];
-            ctx.fillStyle = colors[i];
-            ctx.fillRect(x - 2, yFade, 4, hFade);
-          }
-        }
-
+        ctx.globalAlpha = 0.54 * glowIntensity;
+        ctx.filter = "blur(8px)";
+        ctx.fillStyle = createBarsLinearGradient(
+          ctx,
+          effectiveW,
+          gcache.mode
+        );
+        ctx.beginPath();
+        ctx.roundRect(
+          0,
+          innerY,
+          maxFillX,
+          innerH,
+          Math.min(innerH / 2, maxFillX / 2)
+        );
+        ctx.fill();
         ctx.restore();
       }
 
@@ -4285,11 +4720,8 @@ function saveAMXPanelGeometry(panel) {
         ctx.save();
         ctx.clip(inner);
 
-        for (let i = 0; i < maxFillX; i++) {
-          const x = xs[i];
-          ctx.fillStyle = colors[i];
-          ctx.fillRect(x, innerY, 1, innerH);
-        }
+        ctx.fillStyle = createBarsLinearGradient(ctx, effectiveW, gcache.mode);
+        ctx.fillRect(0, innerY, maxFillX, innerH);
 
         ctx.restore();
       }
@@ -4416,58 +4848,23 @@ function saveAMXPanelGeometry(panel) {
 
       // 1) GLOW
       if (glowIntensity > 0 && fillW > 1) {
-
-        const fx = fillLimit;
-
-        const rimExpand  = 1.5;
-        const fadeExpand = 4.5;
-        const hazeExpand = 2.5;
-
-        const rimAlpha  = 0.16 * glowIntensity;
-        const fadeAlpha = 0.035 * glowIntensity;
-        const hazeAlpha = 0.02 * glowIntensity;
-
-        ctx.save(); // NO CLIP — free halo
-
-        // RIM
-        ctx.globalAlpha = rimAlpha;
-        for (let i = 0; i < fx; i++) {
-          const x = xs[i];
-          ctx.fillStyle = colors[i];
-          ctx.fillRect(
-            x - rimExpand,
-            ry - rimExpand,
-            1 + rimExpand * 2,
-            rh + rimExpand * 2
-          );
-        }
-
-        // FADE
-        ctx.globalAlpha = fadeAlpha;
-        for (let i = 0; i < fx; i++) {
-          const x = xs[i];
-          ctx.fillStyle = colors[i];
-          ctx.fillRect(
-            x - fadeExpand,
-            ry - fadeExpand,
-            1 + fadeExpand * 2,
-            rh + fadeExpand * 2
-          );
-        }
-
-        // HAZE
-        ctx.globalAlpha = hazeAlpha;
-        for (let i = 0; i < fx; i++) {
-          const x = xs[i];
-          ctx.fillStyle = colors[i];
-          ctx.fillRect(
-            x - hazeExpand,
-            ry - hazeExpand,
-            1 + hazeExpand * 2,
-            rh + hazeExpand * 2
-          );
-        }
-
+        ctx.save();
+        ctx.globalAlpha = 0.56 * glowIntensity;
+        ctx.filter = "blur(8px)";
+        ctx.fillStyle = createBarsLinearGradient(
+          ctx,
+          effectiveW,
+          gcache.mode
+        );
+        ctx.beginPath();
+        ctx.roundRect(
+          0,
+          ry,
+          fillLimit,
+          rh,
+          Math.min(radius, fillLimit / 2)
+        );
+        ctx.fill();
         ctx.restore();
       }
 
@@ -4546,11 +4943,8 @@ function saveAMXPanelGeometry(panel) {
         ctx.globalAlpha = 0.90;
 
         const maxX = fillLimit;
-        for (let i = 0; i < maxX; i++) {
-          const x = xs[i];
-          ctx.fillStyle = colors[i];
-          ctx.fillRect(x, ry, 1, rh);
-        }
+        ctx.fillStyle = createBarsLinearGradient(ctx, effectiveW, gcache.mode);
+        ctx.fillRect(0, ry, maxX, rh);
         ctx.restore();
       }
 
@@ -4725,11 +5119,12 @@ function saveAMXPanelGeometry(panel) {
   }
 
   function syncCanvasAndWrapperHeight(canvas, canvasStyle, contentWrapperStyle, neededHeight) {
-    const nextHeight = neededHeight + "px";
+    const logicalWidth = getCanvasLogicalWidth(canvas) || STATE.layout.width || 300;
+    const logicalHeight = Math.max(1, Math.round(neededHeight));
+    const nextHeight = logicalHeight + "px";
 
-    if (canvas.height !== neededHeight) {
-      canvas.height = neededHeight;
-    }
+    resizeCanvasIfNeeded(canvas, logicalWidth, logicalHeight);
+
     if (canvasStyle.height !== nextHeight) {
       canvasStyle.height = nextHeight;
     }
@@ -4753,10 +5148,1240 @@ function saveAMXPanelGeometry(panel) {
     ));
   }
 
+  function createEqualizerGradient(ctx, x, top, width, height) {
+    const colors = ACTIVE_THEME.colors;
+    // Identical X coordinates force a strictly vertical colour axis.
+    const gradientX = Math.round(x + width / 2) + 0.5;
+    const gradient = ctx.createLinearGradient(
+      gradientX,
+      top + height,
+      gradientX,
+      top
+    );
+    gradient.addColorStop(0, colors.low);
+    gradient.addColorStop(0.50, colors.mid);
+    gradient.addColorStop(1, colors.high);
+    return gradient;
+  }
+
+  function getVerticalSegmentMetrics(width) {
+    const gap = 2;
+    const height = Math.max(3, Math.min(6, Math.round(width * 0.30)));
+    return { gap, height, step: height + gap };
+  }
+
+  function snapVerticalThresholdToSegmentGap(threshold, height, width) {
+    const segment = getVerticalSegmentMetrics(width);
+    const targetPx = clamp(threshold, 0, 1) * height;
+    const gapIndex = Math.max(
+      1,
+      Math.round((targetPx + segment.gap / 2) / segment.step)
+    );
+    const gapMidPx = gapIndex * segment.step - segment.gap / 2;
+    return clamp(gapMidPx / Math.max(1, height), 0.001, 0.999);
+  }
+
+  function getVerticalDotMetrics(width, height, style) {
+    const cols = style === "matrixdots" ? 2 : 1;
+    const columnGap = style === "matrixdots" ? 2 : 0;
+    const widthRadius =
+      (width - columnGap * (cols - 1)) / (cols * 2);
+    const heightRadius =
+      height / (style === "matrixdots" ? 30 : 15);
+    const radius = Math.max(
+      1.5,
+      Math.min(widthRadius * 0.88, heightRadius)
+    );
+    const rowGap = style === "matrixdots" ? 2 : 3;
+    return {
+      cols,
+      columnGap,
+      radius,
+      rowGap,
+      stepY: radius * 2 + rowGap
+    };
+  }
+
+  function snapVerticalThresholdToDotGap(
+    threshold,
+    height,
+    width,
+    style
+  ) {
+    const dot = getVerticalDotMetrics(width, height, style);
+    const targetPx = clamp(threshold, 0, 1) * height;
+    const gapIndex = Math.max(
+      1,
+      Math.round((targetPx + dot.rowGap / 2) / dot.stepY)
+    );
+    const gapMidPx = gapIndex * dot.stepY - dot.rowGap / 2;
+    return clamp(gapMidPx / Math.max(1, height), 0.001, 0.999);
+  }
+
+  function snapVerticalThreshold(threshold, height, width, style) {
+    if (style === "segment") {
+      return snapVerticalThresholdToSegmentGap(threshold, height, width);
+    }
+    if (style === "circledots" || style === "matrixdots") {
+      return snapVerticalThresholdToDotGap(
+        threshold,
+        height,
+        width,
+        style
+      );
+    }
+    return threshold;
+  }
+
+  function createVerticalMeterGradient(
+    ctx,
+    x,
+    top,
+    width,
+    height,
+    mode = 0,
+    discreteStyle = null
+  ) {
+    const colors = ACTIVE_THEME.colors;
+    const gradientX = Math.round(x + width / 2) + 0.5;
+    const gradient = ctx.createLinearGradient(
+      gradientX,
+      top + height,
+      gradientX,
+      top
+    );
+
+    if (mode === 1) {
+      const baseThreshold = 0.58;
+      const threshold = snapVerticalThreshold(
+        baseThreshold,
+        height,
+        width,
+        discreteStyle
+      );
+      gradient.addColorStop(0.00, colors.low);
+      gradient.addColorStop(0.40 * baseThreshold, colors.mid);
+      gradient.addColorStop(0.80 * baseThreshold, colors.high);
+      gradient.addColorStop(threshold - 0.001, colors.high);
+      gradient.addColorStop(threshold + 0.001, "#ff0000");
+      gradient.addColorStop(1.00, "#ff0000");
+    } else if (mode === 2) {
+      const baseThreshold = 0.82;
+      const threshold = snapVerticalThreshold(
+        baseThreshold,
+        height,
+        width,
+        discreteStyle
+      );
+      gradient.addColorStop(0.00, colors.high);
+      gradient.addColorStop(0.40 * baseThreshold, colors.mid);
+      gradient.addColorStop(0.80 * baseThreshold, colors.low);
+      gradient.addColorStop(threshold - 0.001, colors.low);
+      gradient.addColorStop(threshold + 0.001, "#ffd400");
+      gradient.addColorStop(1.00, "#ffd400");
+    } else {
+      gradient.addColorStop(0.00, colors.low);
+      gradient.addColorStop(0.50, colors.mid);
+      gradient.addColorStop(0.80, colors.high);
+      gradient.addColorStop(1.00, colors.high);
+    }
+    return gradient;
+  }
+
+  const EQUALIZER_SEGMENT_GLASS_CACHE = new WeakMap();
+
+  function getEqualizerSegmentGlass(ctx, y, height) {
+    let cache = EQUALIZER_SEGMENT_GLASS_CACHE.get(ctx);
+    if (!cache) {
+      cache = new Map();
+      EQUALIZER_SEGMENT_GLASS_CACHE.set(ctx, cache);
+    }
+
+    const glassKey = `${y}|${height}`;
+    let glass = cache.get(glassKey);
+    if (!glass) {
+      // Same emboss profile used by drawSegmentGlassLayer. In the vertical
+      // equalizer the segments are stacked, but each individual segment keeps
+      // the original top-to-bottom glass axis.
+      glass = ctx.createLinearGradient(0, y, 0, y + height);
+      glass.addColorStop(0.00, "rgba(255,255,255,0.45)");
+      glass.addColorStop(0.08, "rgba(255,255,255,0.25)");
+      glass.addColorStop(0.25, "rgba(255,255,255,0.12)");
+      glass.addColorStop(0.55, "rgba(255,255,255,0.03)");
+      glass.addColorStop(0.70, "rgba(0,0,0,0.08)");
+      glass.addColorStop(0.88, "rgba(0,0,0,0.18)");
+      glass.addColorStop(1.00, "rgba(0,0,0,0.28)");
+      cache.set(glassKey, glass);
+    }
+    return glass;
+  }
+
+  function drawEqualizerPeak(
+    ctx,
+    x,
+    top,
+    width,
+    height,
+    levelNorm,
+    peakNorm,
+    style
+  ) {
+    if (
+      !CONFIG.display.showPeaks ||
+      STATE.hasStreamObject !== true ||
+      Math.max(levelNorm, peakNorm) * Math.max(1, height) <= 0.5
+    ) return;
+
+    const level = clamp(levelNorm, 0, 1);
+    const effectivePeak = Math.max(
+      level,
+      clamp(peakNorm, 0, 1)
+    );
+    const fillTop =
+      top + height - Math.round(level * height);
+    let peakY = Math.round(
+      top + height - effectivePeak * height
+    );
+    let peakH = Math.max(2, Math.round(width * 0.10));
+
+    if (style === "segment") {
+      const segment = getVerticalSegmentMetrics(width);
+      const segmentGap = segment.gap;
+      const segmentH = segment.height;
+      const segmentStep = segment.step;
+      const peakFromBottom = Math.max(
+        segmentH,
+        top + height - peakY
+      );
+      const peakSegmentIndex = Math.max(
+        1,
+        Math.ceil(peakFromBottom / segmentStep)
+      );
+      peakY =
+        top + height -
+        peakSegmentIndex * segmentStep +
+        segmentGap;
+      peakH = segmentH;
+
+      // Keep the indicator in the first free segment above the live fill.
+      // This prevents the active colour from visually merging with, or
+      // appearing above, the held peak.
+      let highestActiveY = null;
+      for (
+        let y = top + height - segmentH;
+        y >= top;
+        y -= segmentStep
+      ) {
+        if (y + segmentH >= fillTop) {
+          highestActiveY = y;
+        } else {
+          break;
+        }
+      }
+      if (highestActiveY !== null) {
+        peakY = Math.min(
+          peakY,
+          highestActiveY - segmentStep
+        );
+      }
+    } else {
+      // The complete peak marker stays above the live fill, even when the
+      // held peak and current level have the same value.
+      peakY = Math.min(
+        peakY,
+        fillTop - Math.ceil(peakH / 2)
+      );
+    }
+    ctx.save();
+    ctx.fillStyle = ACTIVE_THEME.colors.peak;
+    const drawY =
+      style === "segment"
+        ? Math.max(top, peakY)
+        : Math.max(top, peakY - peakH / 2);
+    ctx.fillRect(x, drawY, width, peakH);
+    ctx.restore();
+  }
+
+  function getVerticalAudioPeakNorm(
+    levelNorm,
+    heldPeakNorm,
+    height,
+    stateKey
+  ) {
+    if (!STATE.render) STATE.render = {};
+    if (!STATE.render.verticalAudioPeak) {
+      STATE.render.verticalAudioPeak = {};
+    }
+
+    const bucket = STATE.render.verticalAudioPeak;
+    if (STATE.hasStreamObject !== true) {
+      delete bucket[stateKey];
+      return clamp(levelNorm, 0, 1);
+    }
+
+    const pixelNorm = 1 / Math.max(1, height);
+    const live = clamp(levelNorm, 0, 1);
+    const held = clamp(heldPeakNorm, 0, 1);
+    if (live <= 0.5 * pixelNorm && held <= 0.5 * pixelNorm) {
+      delete bucket[stateKey];
+      return 0;
+    }
+
+    const state = (
+      bucket[stateKey] ??= {
+        pos: live,
+        vel: 0,
+        lastPeak: held
+      }
+    );
+
+    const base = Math.min(
+      1,
+      live + pixelNorm
+    );
+    const throwNorm = 8 * pixelNorm;
+    const isNewPeak =
+      held > state.lastPeak + 0.5 * pixelNorm;
+    const target = isNewPeak
+      ? Math.min(1, held + throwNorm)
+      : base;
+
+    state.lastPeak = held;
+
+    const RETURN = 0.28;
+    const DAMPING = 0.78;
+    const delta = target - state.pos;
+
+    if (delta > 0) {
+      state.pos = Math.min(1, target);
+      state.vel = 0;
+    } else {
+      state.vel += (base - state.pos) * RETURN;
+      state.vel *= DAMPING;
+      state.pos += state.vel;
+    }
+
+    state.pos = Math.max(base, Math.min(1, state.pos));
+    return state.pos;
+  }
+
+  function renderEqualizerBand(
+    ctx,
+    x,
+    top,
+    width,
+    height,
+    levelNorm,
+    peakNorm,
+    style,
+    gradient,
+    meterMode = 0
+  ) {
+    const level = clamp(levelNorm, 0, 1);
+    const fillHeight = Math.round(height * level);
+    const fillTop = top + height - fillHeight;
+    const glow = CONFIG.display.glowIntensity > 0;
+    const shellRadius = Math.max(2, Math.min(width * 0.42, 7));
+    // Only the glass styles tint their inactive shell dynamically.
+    let tintColor = null;
+    if (
+      fillHeight > 0 &&
+      (
+        style === "pillars" ||
+        style === "beveled3d" ||
+        style === "glasstube"
+      )
+    ) {
+      const tintPalette = buildBarsGradient(meterMode, 256).colors;
+      tintColor = tintPalette[
+        Math.max(
+          0,
+          Math.min(
+            tintPalette.length - 1,
+            Math.round(level * (tintPalette.length - 1))
+          )
+        )
+      ];
+    }
+
+    const drawGradientGlowRect = (
+      gx,
+      gy,
+      gw,
+      gh,
+      blur = 4,
+      alpha = 0.16
+    ) => {
+      if (!glow || gw <= 0 || gh <= 0) return;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.filter = `blur(${blur}px)`;
+      ctx.fillStyle = gradient;
+      ctx.fillRect(gx, gy, gw, gh);
+      ctx.restore();
+    };
+
+    const drawGradientGlowPath = (
+      path,
+      blur = 4,
+      alpha = 0.18
+    ) => {
+      if (!glow || !path || fillHeight <= 0) return;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.filter = `blur(${blur}px)`;
+      ctx.fillStyle = gradient;
+      ctx.fill(path);
+      ctx.restore();
+    };
+
+    if (style === "segment") {
+      const segment = getVerticalSegmentMetrics(width);
+      const segmentGap = segment.gap;
+      const segmentH = segment.height;
+      const step = segment.step;
+      for (let y = top + height - segmentH; y >= top; y -= step) {
+        const active = y + segmentH >= fillTop;
+
+        if (active && glow) {
+          ctx.save();
+          ctx.fillStyle = gradient;
+          ctx.globalAlpha = 0.35;
+          ctx.fillRect(
+            x - 1,
+            y - 1,
+            width + 2,
+            segmentH + 2
+          );
+          ctx.globalAlpha = 0.14;
+          ctx.fillRect(
+            x - 2,
+            y - 2,
+            width + 4,
+            segmentH + 4
+          );
+          ctx.restore();
+        }
+
+        // Exact glass/emboss profile from the horizontal segmented renderer.
+        // The static glass is painted first and remains strictly inside the
+        // segment, so it cannot produce an external shadow.
+        ctx.fillStyle = getEqualizerSegmentGlass(ctx, y, segmentH);
+        ctx.fillRect(x, y, width, segmentH);
+
+        // Match renderSegment exactly: active fill is painted over the glass,
+        // therefore the coloured segment itself is not embossed.
+        if (active) {
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(x, y, width, segmentH);
+          ctx.clip();
+          ctx.fillStyle = gradient;
+          ctx.fillRect(x, top, width, height);
+          ctx.restore();
+        }
+      }
+    } else if (style === "circledots" || style === "matrixdots") {
+      const dot = getVerticalDotMetrics(width, height, style);
+      const cols = dot.cols;
+      const dotGap = dot.columnGap;
+      const dotR = dot.radius;
+      const stepY = dot.stepY;
+      const totalDotsW = cols * dotR * 2 + (cols - 1) * dotGap;
+      const startX = x + (width - totalDotsW) / 2 + dotR;
+
+      for (let cy = top + height - dotR; cy >= top + dotR; cy -= stepY) {
+        if (cy - dotR < fillTop) continue;
+        for (let col = 0; col < cols; col++) {
+          const cx = startX + col * (dotR * 2 + dotGap);
+          if (glow) {
+            ctx.save();
+            ctx.globalAlpha =
+              style === "matrixdots" ? 0.70 : 0.54;
+            ctx.filter = "blur(6px)";
+            ctx.fillStyle = gradient;
+            ctx.beginPath();
+            ctx.arc(cx, cy, dotR, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+          }
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(cx, cy, dotR, 0, Math.PI * 2);
+          ctx.clip();
+          ctx.fillStyle = gradient;
+          ctx.fillRect(x, top, width, height);
+          ctx.restore();
+        }
+      }
+    } else if (style === "pillars") {
+      // Full vertical glass wedge: point at the floor, widening upwards.
+      if (fillHeight > 0) {
+        const halfActiveWidth =
+          (fillHeight / height) * (width / 2);
+        const activePillar = new Path2D();
+        activePillar.moveTo(x + width / 2, top + height);
+        activePillar.lineTo(
+          x + width / 2 - halfActiveWidth,
+          fillTop
+        );
+        activePillar.lineTo(
+          x + width / 2 + halfActiveWidth,
+          fillTop
+        );
+        activePillar.closePath();
+        drawGradientGlowPath(activePillar, 7, 0.48);
+      }
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(x + width / 2, top + height);
+      ctx.lineTo(x, top);
+      ctx.lineTo(x + width, top);
+      ctx.closePath();
+      ctx.clip();
+      ctx.fillStyle = "rgba(80,80,80,0.20)";
+      ctx.fillRect(x, top, width, height);
+      if (fillHeight > 0) {
+        ctx.globalAlpha = 0.05 + level * 0.10;
+        ctx.fillStyle = tintColor;
+        ctx.fillRect(x, top, width, height);
+        ctx.globalAlpha = 1;
+      }
+      if (fillHeight > 0) {
+        ctx.fillStyle = gradient;
+        ctx.fillRect(x, fillTop, width, fillHeight);
+      }
+      const glass = ctx.createLinearGradient(x, 0, x + width, 0);
+      glass.addColorStop(0, "rgba(0,0,0,0.30)");
+      glass.addColorStop(0.24, "rgba(255,255,255,0.24)");
+      glass.addColorStop(0.72, "rgba(255,255,255,0.06)");
+      glass.addColorStop(1, "rgba(0,0,0,0.34)");
+      ctx.fillStyle = glass;
+      ctx.fillRect(x, top, width, height);
+      ctx.restore();
+    } else if (style === "beveled3d") {
+      const inset = Math.max(2, Math.round(width * 0.18));
+      const bevelRadius = Math.max(
+        2,
+        Math.min(3.5, width * 0.22)
+      );
+
+      // Outer glass shell.
+      ctx.save();
+      ctx.beginPath();
+      ctx.roundRect(x, top, width, height, bevelRadius);
+      ctx.clip();
+      ctx.fillStyle = "rgba(70,70,70,0.18)";
+      ctx.fillRect(x, top, width, height);
+      if (fillHeight > 0) {
+        ctx.globalAlpha = 0.06 + level * 0.22;
+        ctx.fillStyle = tintColor;
+        ctx.fillRect(x, top, width, height);
+        ctx.globalAlpha = 1;
+      }
+      const shell = ctx.createLinearGradient(x, 0, x + width, 0);
+      shell.addColorStop(0, "rgba(0,0,0,0.42)");
+      shell.addColorStop(0.20, "rgba(255,255,255,0.34)");
+      shell.addColorStop(0.55, "rgba(255,255,255,0.10)");
+      shell.addColorStop(1, "rgba(0,0,0,0.45)");
+      ctx.fillStyle = shell;
+      ctx.fillRect(x, top, width, height);
+      ctx.restore();
+
+      // Inner coloured core.
+      if (fillHeight > 0) {
+        const innerX = x + inset;
+        const innerW = Math.max(2, width - inset * 2);
+        const innerTop = Math.max(top + inset, fillTop);
+        const innerBottom = top + height - inset;
+        if (innerBottom > innerTop) {
+          drawGradientGlowRect(
+            innerX,
+            innerTop,
+            innerW,
+            innerBottom - innerTop,
+            8,
+            0.52
+          );
+          ctx.save();
+          ctx.beginPath();
+          ctx.roundRect(
+            innerX,
+            innerTop,
+            innerW,
+            innerBottom - innerTop,
+            Math.max(1.5, bevelRadius - inset * 0.35)
+          );
+          ctx.clip();
+          ctx.fillStyle = gradient;
+          ctx.fillRect(innerX, top, innerW, height);
+          const liquidLight = ctx.createLinearGradient(innerX, 0, innerX + innerW, 0);
+          liquidLight.addColorStop(0, "rgba(255,255,255,0.38)");
+          liquidLight.addColorStop(0.40, "rgba(255,255,255,0.10)");
+          liquidLight.addColorStop(1, "rgba(0,0,0,0.26)");
+          ctx.fillStyle = liquidLight;
+          ctx.fillRect(innerX, innerTop, innerW, innerBottom - innerTop);
+          ctx.restore();
+        }
+      }
+
+      ctx.strokeStyle = "rgba(255,255,255,0.42)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.roundRect(
+        x + 0.5,
+        top + 0.5,
+        width - 1,
+        height - 1,
+        bevelRadius
+      );
+      ctx.stroke();
+    } else if (style === "glasstube") {
+      // Translucent tube body remains visible even at silence.
+      ctx.save();
+      ctx.beginPath();
+      ctx.roundRect(x, top, width, height, shellRadius);
+      ctx.clip();
+      ctx.fillStyle = "rgba(70,70,70,0.18)";
+      ctx.fillRect(x, top, width, height);
+      if (fillHeight > 0) {
+        ctx.globalAlpha = 0.08 + level * 0.16;
+        ctx.fillStyle = tintColor;
+        ctx.fillRect(x, top, width, height);
+        ctx.globalAlpha = 1;
+      }
+
+      if (fillHeight > 0) {
+        ctx.restore();
+        drawGradientGlowRect(
+          x,
+          fillTop,
+          width,
+          fillHeight,
+          8,
+          0.52
+        );
+        ctx.save();
+        ctx.beginPath();
+        ctx.roundRect(x, top, width, height, shellRadius);
+        ctx.clip();
+        ctx.globalAlpha = 0.92;
+        ctx.fillStyle = gradient;
+        ctx.fillRect(x, fillTop, width, fillHeight);
+        ctx.globalAlpha = 1;
+      }
+
+      const tubeGlass = ctx.createLinearGradient(x, 0, x + width, 0);
+      tubeGlass.addColorStop(0, "rgba(0,0,0,0.36)");
+      tubeGlass.addColorStop(0.18, "rgba(255,255,255,0.40)");
+      tubeGlass.addColorStop(0.42, "rgba(255,255,255,0.12)");
+      tubeGlass.addColorStop(0.78, "rgba(255,255,255,0.04)");
+      tubeGlass.addColorStop(1, "rgba(0,0,0,0.38)");
+      ctx.fillStyle = tubeGlass;
+      ctx.fillRect(x, top, width, height);
+      ctx.restore();
+
+      ctx.strokeStyle = "rgba(255,255,255,0.44)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.roundRect(x + 0.5, top + 0.5, width - 1, height - 1, shellRadius);
+      ctx.stroke();
+    } else {
+      // Simple vertical bar.
+      if (fillHeight > 0) {
+        drawGradientGlowRect(
+          x,
+          fillTop,
+          width,
+          fillHeight,
+          7,
+          0.44
+        );
+        ctx.save();
+        ctx.fillStyle = gradient;
+        ctx.fillRect(x, fillTop, width, fillHeight);
+        ctx.restore();
+      }
+    }
+
+    drawEqualizerPeak(
+      ctx,
+      x,
+      top,
+      width,
+      height,
+      levelNorm,
+      peakNorm,
+      style
+    );
+  }
+
+  function renderEqualizer(ctx, canvas, barStyle) {
+    const renderedWidth = getCanvasRenderedWidth(canvas);
+    const width =
+      renderedWidth > 40 ? renderedWidth : getCanvasLogicalWidth(canvas);
+    const desiredHeight = 100;
+
+    if (
+      getCanvasLogicalWidth(canvas) !== width ||
+      getCanvasLogicalHeight(canvas) !== desiredHeight
+    ) {
+      resizeCanvasIfNeeded(canvas, width, desiredHeight);
+      STATE.dom.ctx = canvas.getContext("2d");
+      ctx = STATE.dom.ctx;
+      applyCanvasHiDpiTransform(canvas);
+    }
+
+    const height = getCanvasLogicalHeight(canvas);
+    ctx.clearRect(0, 0, width, height);
+
+    const sidePad = 5;
+    const showValues =
+      CONFIG.display.showReadouts &&
+      STATE.hasStreamObject === true;
+    const topPad = 0;
+    const labelH = 11;
+    const gap = 3;
+    const drawingW = Math.max(1, width - sidePad * 2);
+    const bandW = Math.max(
+      6,
+      (drawingW - gap * (EQ_BAND_COUNT - 1)) / EQ_BAND_COUNT
+    );
+    const groupW = bandW * EQ_BAND_COUNT + gap * (EQ_BAND_COUNT - 1);
+    const startX = (width - groupW) / 2;
+    const meterH = height - labelH;
+    const eq = STATE.levels.equalizer;
+    const fontSource = STATE.dom.labels?.left || STATE.dom.title;
+    const inheritedFont = fontSource
+      ? getComputedStyle(fontSource)
+      : null;
+    const fontFamily =
+      inheritedFont?.fontFamily || "sans-serif";
+    const fontWeight =
+      inheritedFont?.fontWeight || "600";
+    const verticalGradient = createEqualizerGradient(
+      ctx,
+      startX,
+      topPad,
+      groupW,
+      meterH
+    );
+
+    for (let i = 0; i < EQ_BAND_COUNT; i++) {
+      const x = startX + i * (bandW + gap);
+      renderEqualizerBand(
+        ctx,
+        x,
+        topPad,
+        bandW,
+        meterH,
+        eq.values[i] || 0,
+        eq.peaks[i] || 0,
+        barStyle,
+        verticalGradient
+      );
+
+      if (showValues) {
+        const db = eq.dbValues[i];
+        const valueText =
+          Number.isFinite(db) && db > -99
+            ? String(Math.round(db))
+            : "–";
+        const displayedValue = getThrottledCanvasReadout(
+          "equalizer16",
+          i,
+          valueText
+        );
+        ctx.save();
+        ctx.fillStyle = "#ffffff";
+        ctx.globalAlpha = 0.95;
+        ctx.font = `${fontWeight} 7px ${fontFamily}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        ctx.shadowColor = "rgba(0,0,0,0.95)";
+        ctx.shadowBlur = 4;
+        ctx.shadowOffsetY = 1;
+        ctx.fillText(
+          displayedValue,
+          x + bandW / 2,
+          2
+        );
+        ctx.restore();
+      }
+    }
+
+    // One compact label per band; typography follows the active FM-DX theme.
+    ctx.save();
+    ctx.fillStyle = "#ffffff";
+    ctx.globalAlpha = 0.92;
+    ctx.font = `${fontWeight} 7px ${fontFamily}`;
+    ctx.textBaseline = "bottom";
+    ctx.shadowColor = "rgba(0,0,0,0.95)";
+    ctx.shadowBlur = 2;
+
+    EQ_BAND_LABELS.forEach((label, index) => {
+      const labelX =
+        startX + index * (bandW + gap) + bandW / 2;
+      ctx.textAlign = "center";
+      ctx.fillText(label, labelX, height - 1);
+    });
+    ctx.restore();
+  }
+
+  function renderEqualizerSpectrum(ctx, canvas) {
+    const renderedWidth = getCanvasRenderedWidth(canvas);
+    const width =
+      renderedWidth > 40 ? renderedWidth : getCanvasLogicalWidth(canvas);
+    const desiredHeight = 100;
+
+    if (
+      getCanvasLogicalWidth(canvas) !== width ||
+      getCanvasLogicalHeight(canvas) !== desiredHeight
+    ) {
+      resizeCanvasIfNeeded(canvas, width, desiredHeight);
+      STATE.dom.ctx = canvas.getContext("2d");
+      ctx = STATE.dom.ctx;
+      applyCanvasHiDpiTransform(canvas);
+    }
+
+    const height = getCanvasLogicalHeight(canvas);
+    ctx.clearRect(0, 0, width, height);
+
+    const sidePad = 5;
+    const gap = 3;
+    const labelH = 11;
+    const top = 0;
+    const plotH = height - labelH;
+    const baseline = top + plotH;
+    const drawingW = Math.max(1, width - sidePad * 2);
+    const bandW = Math.max(
+      6,
+      (drawingW - gap * (EQ_BAND_COUNT - 1)) /
+        EQ_BAND_COUNT
+    );
+    const groupW =
+      bandW * EQ_BAND_COUNT +
+      gap * (EQ_BAND_COUNT - 1);
+    const startX = (width - groupW) / 2;
+    const endX = startX + groupW;
+    const eq = STATE.levels.equalizer;
+    const gradient = createEqualizerGradient(
+      ctx,
+      startX,
+      top,
+      groupW,
+      plotH
+    );
+
+    const pointX = (index) =>
+      startX + index * (bandW + gap) + bandW / 2;
+    const levelY = (value) =>
+      baseline - clamp(value || 0, 0, 1) * plotH;
+
+    const traceFill = new Path2D();
+    traceFill.moveTo(startX, baseline);
+    traceFill.lineTo(pointX(0), levelY(eq.values[0]));
+    for (let i = 1; i < EQ_BAND_COUNT; i++) {
+      traceFill.lineTo(pointX(i), levelY(eq.values[i]));
+    }
+    traceFill.lineTo(endX, baseline);
+    traceFill.closePath();
+
+    if (CONFIG.display.glowIntensity > 0) {
+      ctx.save();
+      ctx.globalAlpha =
+        0.48 * CONFIG.display.glowIntensity;
+      ctx.filter = "blur(7px)";
+      ctx.fillStyle = gradient;
+      ctx.fill(traceFill);
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.globalAlpha = 0.72;
+    ctx.fillStyle = gradient;
+    ctx.fill(traceFill);
+    ctx.restore();
+
+    const traceLine = new Path2D();
+    traceLine.moveTo(pointX(0), levelY(eq.values[0]));
+    for (let i = 1; i < EQ_BAND_COUNT; i++) {
+      traceLine.lineTo(pointX(i), levelY(eq.values[i]));
+    }
+
+    ctx.save();
+    ctx.lineWidth = 1.6;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.strokeStyle = gradient;
+    ctx.stroke(traceLine);
+    ctx.restore();
+
+    if (
+      CONFIG.display.showPeaks &&
+      STATE.hasStreamObject === true &&
+      eq.peaks.some(value => (value || 0) * plotH > 0.5)
+    ) {
+      const peakLine = new Path2D();
+      peakLine.moveTo(pointX(0), levelY(eq.peaks[0]));
+      for (let i = 1; i < EQ_BAND_COUNT; i++) {
+        peakLine.lineTo(pointX(i), levelY(eq.peaks[i]));
+      }
+      ctx.save();
+      ctx.lineWidth = 1.35;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.strokeStyle = ACTIVE_THEME.colors.peak;
+      ctx.stroke(peakLine);
+      ctx.restore();
+    }
+
+    const fontSource = STATE.dom.labels?.left || STATE.dom.title;
+    const inheritedFont = fontSource
+      ? getComputedStyle(fontSource)
+      : null;
+    const fontFamily =
+      inheritedFont?.fontFamily || "sans-serif";
+    const fontWeight =
+      inheritedFont?.fontWeight || "600";
+
+    if (
+      CONFIG.display.showReadouts &&
+      STATE.hasStreamObject === true
+    ) {
+      for (let i = 0; i < EQ_BAND_COUNT; i++) {
+        const db = eq.dbValues[i];
+        const valueText =
+          Number.isFinite(db) && db > -99
+            ? String(Math.round(db))
+            : "–";
+        const displayedValue = getThrottledCanvasReadout(
+          "equalizer16:spectrum",
+          i,
+          valueText
+        );
+        ctx.save();
+        ctx.fillStyle = "#ffffff";
+        ctx.globalAlpha = 0.95;
+        ctx.font = `${fontWeight} 7px ${fontFamily}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        ctx.shadowColor = "rgba(0,0,0,0.95)";
+        ctx.shadowBlur = 4;
+        ctx.shadowOffsetY = 1;
+        ctx.fillText(displayedValue, pointX(i), 2);
+        ctx.restore();
+      }
+    }
+
+    ctx.save();
+    ctx.fillStyle = "#ffffff";
+    ctx.globalAlpha = 0.92;
+    ctx.textBaseline = "bottom";
+    ctx.textAlign = "center";
+    ctx.shadowColor = "rgba(0,0,0,0.95)";
+    ctx.shadowBlur = 2;
+    ctx.font = `${fontWeight} 8px ${fontFamily}`;
+    EQ_LABEL_ANCHORS.forEach((anchor) => {
+      ctx.fillText(
+        anchor.text,
+        pointX(anchor.index),
+        height - 1
+      );
+    });
+    ctx.restore();
+  }
+
+  function formatSpectrumFrequencyLabel(frequency) {
+    if (frequency >= 1000) {
+      const value = frequency / 1000;
+      return `${Number.isInteger(value) ? value : value.toFixed(2).replace(/0+$/, "").replace(/\.$/, "")}K`;
+    }
+    return String(frequency);
+  }
+
+  function getThrottledCanvasReadout(groupKey, index, nextValue) {
+    if (!STATE.render) STATE.render = {};
+    if (!STATE.render.canvasReadouts) {
+      STATE.render.canvasReadouts = {};
+    }
+
+    const group = (
+      STATE.render.canvasReadouts[groupKey] ??= []
+    );
+    if (
+      group[index] === undefined ||
+      _readoutFrame === 0
+    ) {
+      group[index] =
+        nextValue == null ? "" : String(nextValue);
+    }
+    return group[index];
+  }
+
+  function renderVuHybrid(ctx, canvas, barStyle) {
+    const renderedWidth = getCanvasRenderedWidth(canvas);
+    const width =
+      renderedWidth > 40 ? renderedWidth : getCanvasLogicalWidth(canvas);
+    const desiredHeight = 100;
+
+    if (
+      getCanvasLogicalWidth(canvas) !== width ||
+      getCanvasLogicalHeight(canvas) !== desiredHeight
+    ) {
+      resizeCanvasIfNeeded(canvas, width, desiredHeight);
+      STATE.dom.ctx = canvas.getContext("2d");
+      ctx = STATE.dom.ctx;
+      applyCanvasHiDpiTransform(canvas);
+    }
+
+    const height = getCanvasLogicalHeight(canvas);
+    ctx.clearRect(0, 0, width, height);
+
+    const mode = CONFIG.display.hybridMode;
+    const audioPreset = mode === "audio10";
+    const meterKeys = audioPreset
+      ? ["L", "R", "Q", "A"]
+      : ["L", "R"];
+    const frequencies = audioPreset
+      ? HYBRID_AUDIO_10_FREQUENCIES
+      : HYBRID_STEREO_12_FREQUENCIES;
+    const spectrum = audioPreset
+      ? STATE.levels.hybridAudio10
+      : STATE.levels.hybridStereo12;
+
+    const sidePad = 5;
+    const gap = 3;
+    const labelH = 11;
+    const top = 0;
+    const meterH = height - labelH;
+    const referenceDrawingW = Math.max(1, width - sidePad * 2);
+    const bandW = Math.max(
+      6,
+      (referenceDrawingW - gap * (EQ_BAND_COUNT - 1)) /
+        EQ_BAND_COUNT
+    );
+    const referenceGridW =
+      EQ_BAND_COUNT * bandW +
+      gap * (EQ_BAND_COUNT - 1);
+    const startX = (width - referenceGridW) / 2;
+    const eqStartSlot = audioPreset ? 6 : 4;
+    const eqStartX =
+      startX + eqStartSlot * (bandW + gap);
+    const eqGroupW =
+      frequencies.length * bandW +
+      Math.max(0, frequencies.length - 1) * gap;
+    const showValues =
+      CONFIG.display.showReadouts &&
+      STATE.hasStreamObject === true;
+
+    const fontSource = STATE.dom.labels?.left || STATE.dom.title;
+    const inheritedFont = fontSource
+      ? getComputedStyle(fontSource)
+      : null;
+    const fontFamily =
+      inheritedFont?.fontFamily || "sans-serif";
+    const fontWeight =
+      inheritedFont?.fontWeight || "600";
+
+    const minDb = CONFIG.audio.minDb;
+    const range = CONFIG.audio.maxDb - minDb;
+    const qRaw = clamp(
+      STATE.levels.stereoQuality.smooth,
+      0,
+      STEREO_Q_MAX
+    ) || 0;
+    const audioSmooth = clamp(
+      STATE.levels.audio.smooth,
+      0,
+      255
+    ) || 0;
+    const qDb = mapStereoQualityToDb(qRaw, minDb, range);
+    const qPeakDb = Number.isFinite(
+      STATE.levels.stereoQuality.peakDb
+    )
+      ? STATE.levels.stereoQuality.peakDb
+      : qDb;
+    const audioMapped = mapAudioLevelsToDb(
+      STATE.levels.audio,
+      minDb,
+      range
+    );
+
+    const meterData = {
+      L: {
+        level: fracFromDb(STATE.levels.left.smoothDb, 1),
+        peak: fracFromDb(STATE.levels.left.peakDb, 1),
+        mode: 0,
+        readout: Math.round(clamp(
+          STATE.levels.left.smoothDb,
+          minDb,
+          CONFIG.audio.maxDb
+        ) ?? minDb)
+      },
+      R: {
+        level: fracFromDb(STATE.levels.right.smoothDb, 1),
+        peak: fracFromDb(STATE.levels.right.peakDb, 1),
+        mode: 0,
+        readout: Math.round(clamp(
+          STATE.levels.right.smoothDb,
+          minDb,
+          CONFIG.audio.maxDb
+        ) ?? minDb)
+      },
+      Q: {
+        level: fracFromDb(qDb, 1),
+        peak: fracFromDb(qPeakDb, 1),
+        mode: 2,
+        readout: `${Math.round(qRaw)}%`
+      },
+      A: {
+        level: fracFromDb(audioMapped.audioSmoothDb, 1),
+        peak: 0,
+        mode: 1,
+        readout: `${Math.round((audioSmooth / 255) * 100)}%`
+      }
+    };
+
+    meterData.A.peak = getVerticalAudioPeakNorm(
+      meterData.A.level,
+      fracFromDb(audioMapped.audioPeakDb, 1),
+      meterH,
+      `audio:${Math.round(startX)}:${Math.round(meterH)}`
+    );
+
+    meterKeys.forEach((key, index) => {
+      const x = startX + index * (bandW + gap);
+      const data = meterData[key];
+      const meterGradient = createVerticalMeterGradient(
+        ctx,
+        x,
+        top,
+        bandW,
+        meterH,
+        data.mode,
+        barStyle
+      );
+      renderEqualizerBand(
+        ctx,
+        x,
+        top,
+        bandW,
+        meterH,
+        data.level,
+        data.peak,
+        barStyle,
+        meterGradient,
+        data.mode
+      );
+
+      if (showValues) {
+        const nextReadout = String(data.readout);
+        const displayedReadout = getThrottledCanvasReadout(
+          `${mode}:meters`,
+          index,
+          nextReadout
+        );
+        ctx.save();
+        ctx.fillStyle = "#ffffff";
+        ctx.globalAlpha = 0.95;
+        ctx.font = `${fontWeight} 7px ${fontFamily}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        ctx.shadowColor = "rgba(0,0,0,0.95)";
+        ctx.shadowBlur = 4;
+        ctx.shadowOffsetY = 1;
+        ctx.fillText(
+          displayedReadout,
+          x + bandW / 2,
+          2
+        );
+        ctx.restore();
+      }
+    });
+
+    const spectrumGradient = createEqualizerGradient(
+      ctx,
+      eqStartX,
+      top,
+      eqGroupW,
+      meterH
+    );
+
+    frequencies.forEach((frequency, index) => {
+      const x = eqStartX + index * (bandW + gap);
+      renderEqualizerBand(
+        ctx,
+        x,
+        top,
+        bandW,
+        meterH,
+        spectrum.values[index] || 0,
+        spectrum.peaks[index] || 0,
+        barStyle,
+        spectrumGradient
+      );
+
+      if (showValues) {
+        const db = spectrum.dbValues[index];
+        const valueText =
+          Number.isFinite(db) && db > -99
+            ? String(Math.round(db))
+            : "–";
+        const displayedValue = getThrottledCanvasReadout(
+          `${mode}:equalizer`,
+          index,
+          valueText
+        );
+        ctx.save();
+        ctx.fillStyle = "#ffffff";
+        ctx.globalAlpha = 0.95;
+        ctx.font = `${fontWeight} 7px ${fontFamily}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        ctx.shadowColor = "rgba(0,0,0,0.95)";
+        ctx.shadowBlur = 4;
+        ctx.shadowOffsetY = 1;
+        ctx.fillText(displayedValue, x + bandW / 2, 2);
+        ctx.restore();
+      }
+    });
+
+    ctx.save();
+    ctx.fillStyle = "#ffffff";
+    ctx.globalAlpha = 0.92;
+    ctx.font = `${fontWeight} 7px ${fontFamily}`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "bottom";
+    ctx.shadowColor = "rgba(0,0,0,0.95)";
+    ctx.shadowBlur = 2;
+
+    meterKeys.forEach((key, index) => {
+      const x = startX + index * (bandW + gap);
+      ctx.fillText(key, x + bandW / 2, height - 1);
+    });
+
+    frequencies.forEach((frequency, index) => {
+      const x = eqStartX + index * (bandW + gap);
+      ctx.fillText(
+        formatSpectrumFrequencyLabel(frequency),
+        x + bandW / 2,
+        height - 1
+      );
+    });
+    ctx.restore();
+  }
+
   // METERS RENDERER
   function renderMeters() {
+    refreshAutomaticTheme();
+
     const layout = CONFIG.display.layoutMode;
-    const render = CONFIG.display.renderMode;
+    const render =
+      layout === "equalizer" || layout === "vuHybrid"
+        ? "bars"
+        : CONFIG.display.renderMode;
     const barStyle = CONFIG.display.barStyle;
     const showReadouts = CONFIG.display.showReadouts;
 
@@ -4765,21 +6390,24 @@ function saveAMXPanelGeometry(panel) {
 
     FRAME_GRADIENT_CACHE.clear();
 
-    const visualStateKey = `${layout}|${render}|${barStyle}|${showReadouts}`;
+    const visualStateKey =
+      `${layout}|${render}|${barStyle}|${showReadouts}|${CONFIG.display.hybridMode}|${CONFIG.display.equalizerRenderMode}`;
 
     if (visualStateKey !== _lastVisualStateKey) {
       _lastVisualStateKey = visualStateKey;
+      clearTransientRenderState();
       applyVisualState();
     }
 
     const GaugesRender = (render === "gauges");
+    const AnalogVuRender = (render === "analogVu");
     const BarsRender = (render === "bars");
     const SALayout = (layout === "sa");
     const FullLayout = (layout === "full");
     const useMirrored = (render === "mirrored") && MIRRORED_LAYOUTS.includes(layout);
     const mirrorMetrics = useMirrored ? getMirroredLayoutMetrics() : null;
 
-    const ctx    = STATE.dom.ctx;
+    let ctx    = STATE.dom.ctx;
     const canvas = STATE.dom.canvas;
     if (!ctx || !canvas) return;
 
@@ -4787,8 +6415,25 @@ function saveAMXPanelGeometry(panel) {
     const contentWrapper = STATE.dom.contentWrapper;
     const contentWrapperStyle = contentWrapper ? contentWrapper.style : null;
 
-    const width = canvas.width;
-    if (!width || !canvas.height) return;
+    let width = getCanvasLogicalWidth(canvas);
+    let height = getCanvasLogicalHeight(canvas);
+    if (!width || !height) return;
+
+    // A layout may change the authored CSS width of the shared normal canvas
+    // (Equalizer uses symmetric 5px insets). Synchronize the backing store
+    // before drawing so entry and exit remain geometrically centred.
+    const renderedWidth = getCanvasRenderedWidth(canvas);
+    if (renderedWidth > 40 && Math.abs(renderedWidth - width) > 1) {
+      resizeCanvasIfNeeded(canvas, renderedWidth, height);
+      ctx = canvas.getContext("2d");
+      STATE.dom.ctx = ctx;
+      width = getCanvasLogicalWidth(canvas);
+      height = getCanvasLogicalHeight(canvas);
+    }
+
+    // canvas width/height assignments reset the 2D context state.
+    // Reassert the HiDPI transform before every render pass.
+    applyCanvasHiDpiTransform(canvas);
 
     const leftLevels = STATE.levels.left;
     const rightLevels = STATE.levels.right;
@@ -4798,9 +6443,29 @@ function saveAMXPanelGeometry(panel) {
     const barH  = CONFIG.display.dimensions.barHeight;
     const gap   = CONFIG.display.dimensions.spacing;
 
+    if (layout === "equalizer") {
+      if (CONFIG.display.equalizerRenderMode === "spectrum") {
+        renderEqualizerSpectrum(ctx, canvas);
+      } else {
+        renderEqualizer(ctx, canvas, barStyle);
+      }
+      return;
+    }
+
+    if (layout === "vuHybrid") {
+      renderVuHybrid(ctx, canvas, barStyle);
+      return;
+    }
+
     // GAUGES MODE
     if (GaugesRender) {
       renderGauges(ctx, canvas, layout);
+      return;
+    }
+
+    // ANALOG VU MODE
+    if (AnalogVuRender) {
+      renderAnalogVu(ctx, canvas, layout);
       return;
     }
 
@@ -4812,8 +6477,12 @@ function saveAMXPanelGeometry(panel) {
           ? `translateY(${mirrorMetrics.canvasOffsetY}px)`
           : "";
     
-      if (canvas.height !== mirrorMetrics.singlePanelHeight) {
-        canvas.height = mirrorMetrics.singlePanelHeight;
+      if (getCanvasLogicalHeight(canvas) !== mirrorMetrics.singlePanelHeight) {
+        resizeCanvasIfNeeded(canvas, width, mirrorMetrics.singlePanelHeight);
+        // Intrinsic resize resets all context state. Reassert both the active
+        // context reference and the HiDPI transform before mirrored drawing.
+        STATE.dom.ctx = canvas.getContext("2d");
+        applyCanvasHiDpiTransform(canvas);
       }
       if (canvasStyle.height !== nextHeight) {
         canvasStyle.height = nextHeight;
@@ -4825,7 +6494,7 @@ function saveAMXPanelGeometry(panel) {
         canvasStyle.transform = nextTransform;
       }
 
-      ctx.clearRect(0, 0, width, canvas.height);
+      ctx.clearRect(0, 0, width, getCanvasLogicalHeight(canvas));
 
       const BAR_GAP  = 35;
       const usableW  = Math.floor(width - BAR_GAP);
@@ -4839,6 +6508,9 @@ function saveAMXPanelGeometry(panel) {
 
       if (layout === "full") {
         const qSmoothDb = mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range);
+        const qPeakDb = Number.isFinite(stereoQualityLevels.peakDb)
+          ? stereoQualityLevels.peakDb
+          : qSmoothDb;
         const { audioSmoothDb, audioPeakDb } = mapAudioLevelsToDb(audioLevels, minDb, range);
         const metrics = getFullMirroredMetrics();
         const mirroredBarH = metrics.singleRowHeight;
@@ -4864,7 +6536,7 @@ function saveAMXPanelGeometry(panel) {
         // BOTTOM LEFT (Q mirrored)
         renderMirroredChannel(
           ctx, leftBaseX, true,
-          qSmoothDb, qSmoothDb,
+          qSmoothDb, qPeakDb,
           bottomY, halfW, mirroredBarH, barStyle, 2
         );
 
@@ -4881,11 +6553,15 @@ function saveAMXPanelGeometry(panel) {
       const mirroredBarH = mirrorMetrics.mirroredBarH;
       const mirroredYOffset = mirrorMetrics.mirroredYOffset;
       let qSmoothDb = null;
+      let qPeakDb = null;
       let audioSmoothDb = null;
       let audioPeakDb = null;
 
       if (SALayout) {
         qSmoothDb = mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range);
+        qPeakDb = Number.isFinite(stereoQualityLevels.peakDb)
+          ? stereoQualityLevels.peakDb
+          : qSmoothDb;
 
         const audioMapped = mapAudioLevelsToDb(audioLevels, minDb, range);
         audioSmoothDb = audioMapped.audioSmoothDb;
@@ -4896,7 +6572,7 @@ function saveAMXPanelGeometry(panel) {
       renderMirroredChannel(
         ctx, leftBaseX, true,
         SALayout ? qSmoothDb : leftLevels.smoothDb,
-        SALayout ? qSmoothDb : leftLevels.peakDb,
+        SALayout ? qPeakDb : leftLevels.peakDb,
         mirroredYOffset, halfW, mirroredBarH, barStyle,
         SALayout ? 2 : 0
       );
@@ -4934,7 +6610,7 @@ function saveAMXPanelGeometry(panel) {
         neededHeight
       );
 
-      ctx.clearRect(0, 0, width, canvas.height);
+      ctx.clearRect(0, 0, width, getCanvasLogicalHeight(canvas));
 
       let y = TOP_PAD;
       const fullStep = barH + FULL_GAP;
@@ -4969,9 +6645,12 @@ function saveAMXPanelGeometry(panel) {
 
       // Q — Stereo Quality
       const qSmoothDb = mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range);
+      const qPeakDb = Number.isFinite(stereoQualityLevels.peakDb)
+        ? stereoQualityLevels.peakDb
+        : qSmoothDb;
       renderBarChannelWithMode(
         qSmoothDb,
-        qSmoothDb,
+        qPeakDb,
         y,
         width,
         barH,
@@ -5011,7 +6690,7 @@ function saveAMXPanelGeometry(panel) {
       neededHeight
     );
 
-    ctx.clearRect(0, 0, width, canvas.height);
+    ctx.clearRect(0, 0, width, getCanvasLogicalHeight(canvas));
 
     // L+R channels
     if (layout === "lr") {
@@ -5043,10 +6722,13 @@ function saveAMXPanelGeometry(panel) {
     // Stereo Quality (SA)
     else if (SALayout) {
       const qSmoothDb = mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range);
+      const qPeakDb = Number.isFinite(stereoQualityLevels.peakDb)
+        ? stereoQualityLevels.peakDb
+        : qSmoothDb;
 
       renderBarChannelWithMode(
         qSmoothDb,
-        qSmoothDb,
+        qPeakDb,
         0,
         width,
         barH,
@@ -5142,19 +6824,34 @@ function saveAMXPanelGeometry(panel) {
   }
 
   function renderGauges(ctx, canvas, layout) {
-    const W = canvas.width;
-    const H = canvas.height;
+    const W = getCanvasLogicalWidth(canvas);
+    const desiredH = Math.max(1, WRAPPER_HEIGHT - 20);
+    if (!W) return;
+
+    if (getCanvasLogicalHeight(canvas) !== desiredH) {
+      resizeCanvasIfNeeded(canvas, W, desiredH);
+      ctx = canvas.getContext("2d");
+    }
+    canvas.style.height = `${desiredH}px`;
+    if (STATE.dom.contentWrapper) {
+      STATE.dom.contentWrapper.style.height = `${WRAPPER_HEIGHT}px`;
+      STATE.dom.contentWrapper.style.minHeight = `${WRAPPER_HEIGHT}px`;
+    }
+
+    const H = desiredH;
+
+    applyCanvasHiDpiTransform(canvas);
 
     const gaugeCount = (layout === "lr" || layout === "sa") ? 2 : (layout === "full") ? 4 : 0;
     if (!gaugeCount) return;
 
     const cellW = W / gaugeCount;
+    const centerFractions = getGaugeCenterFractions(layout);
 
     // Geometry
     const radius = (layout === "full") ? Math.min(W / 2, H) * 0.36 : Math.min(cellW, H) * 0.55;
     const ringWidth = radius * 0.26;
     const centerY   = radius + ringWidth / 2;
-    const gapX = (layout === "full") ? 0 : 10;
 
     // Arc (~241° = visual 120%)
     const startAngle = -Math.PI * 1.17;
@@ -5166,9 +6863,6 @@ function saveAMXPanelGeometry(panel) {
       (startAngle + START_EPS) +
       (arcSpan - START_EPS) * Math.max(0, Math.min(1, f));
 
-    // Shift both gauges as a group (optical centering)
-    const GROUP_SHIFT = -cellW * 0.04;
-
     ctx.clearRect(0, 0, W, H);
 
     for (let i = 0; i < gaugeCount; i++) {
@@ -5176,32 +6870,9 @@ function saveAMXPanelGeometry(panel) {
 
       let cx, cy;
 
-      if (layout === "full" && gaugeCount === 4) {
-
-        // 4 gauges in ONE row
-        const fullCellW = W / 4;
-
-        // optical centering for the whole group
-        const fullGroupShift = -fullCellW * 0.06;
-
-        cx = fullCellW * i + fullCellW / 2 + fullGroupShift;
-        cy = centerY + 8;
-
-        // small spacing like stereo mode
-        if (i === 0 || i === 1) cx -= gapX / 2;
-        if (i === 2 || i === 3) cx += gapX / 2;
-
-      } else {
-
-        cx = cellW * i + cellW / 2 + GROUP_SHIFT;
-
-        if (gaugeCount === 2) {
-          if (i === 0) cx -= gapX / 2;
-          if (i === 1) cx += gapX / 2;
-        }
-
-        cy = centerY;
-      }
+      // Canvas gauges and DOM labels share the exact same normalized centres.
+      cx = centerFractions[i] * W;
+      cy = (layout === "full" && gaugeCount === 4) ? centerY + 8 : centerY;
 
       // EMPTY ARC — GLASS STYLE (always visible)
       ctx.save();
@@ -5242,7 +6913,7 @@ function saveAMXPanelGeometry(panel) {
       if (frac > 0) {
         const valueAngle = fracToAngle(frac);
 
-        const { gradient, glowColor } =
+        const { gradient } =
           buildConicGaugeGradient(
             ctx,
             cx,
@@ -5253,16 +6924,16 @@ function saveAMXPanelGeometry(panel) {
             arcSpan
           );
 
-        // GLOW PASS (shadowBlur, masked)
+        // UNIFIED GRADIENT HALO — active arc only.
         if (CONFIG.display.glowIntensity > 0) {
           ctx.save();
-
-          // Draw blurred arc
           ctx.lineCap = "round";
-          ctx.lineWidth = ringWidth - 5;
+          ctx.lineWidth = ringWidth;
           ctx.strokeStyle = gradient;
-          ctx.shadowBlur  = ringWidth * 1.6 * CONFIG.display.glowIntensity;
-          ctx.shadowColor = glowColor;
+          ctx.globalAlpha =
+            0.52 * CONFIG.display.glowIntensity;
+          ctx.filter =
+            `blur(${Math.max(4, ringWidth * 0.72)}px)`;
 
           ctx.beginPath();
           ctx.arc(
@@ -5273,22 +6944,6 @@ function saveAMXPanelGeometry(panel) {
             valueAngle
           );
           ctx.stroke();
-
-          // Cut inner part so glow doesn't fill the arc
-          ctx.globalCompositeOperation = "destination-out";
-          ctx.shadowBlur = 0;
-          ctx.lineWidth = ringWidth * 0.85;
-
-          ctx.beginPath();
-          ctx.arc(
-            cx,
-            cy,
-            radius,
-            startAngle + START_EPS,
-            valueAngle
-          );
-          ctx.stroke();
-
           ctx.restore();
         }
 
@@ -5327,9 +6982,24 @@ function saveAMXPanelGeometry(panel) {
           peakFrac = Math.max(0, Math.min(1, px / W));
         }
 
+      } else if (mode === 1) {
+        // Audio Peak uses the same held A peak as bars and mirrored modes.
+        const audioPeakDb = mapAudioLevelsToDb(
+          STATE.levels.audio,
+          CONFIG.audio.minDb,
+          CONFIG.audio.maxDb - CONFIG.audio.minDb
+        ).audioPeakDb;
+        const px = mapDbToX(audioPeakDb, W);
+        peakFrac = Math.max(0, Math.min(1, px / W));
       } else {
-        // Audio Peak (mode 1), Stereo Quality (mode 2) etc
-        peakFrac = frac;
+        // Q uses its own held quality peak in every gauge layout.
+        const qualityPeakDb = STATE.levels.stereoQuality.peakDb;
+        if (Number.isFinite(qualityPeakDb)) {
+          const px = mapDbToX(qualityPeakDb, W);
+          peakFrac = Math.max(0, Math.min(1, px / W));
+        } else {
+          peakFrac = frac;
+        }
       }
 
       drawExternalPeak(
@@ -5349,13 +7019,735 @@ function saveAMXPanelGeometry(panel) {
     }
   }
 
+  function getAnalogVuPeakFrac(key, widthRef, liveFrac) {
+    const minDb = CONFIG.audio.minDb;
+    const range = CONFIG.audio.maxDb - minDb;
+    let peakDb = minDb;
+
+    if (key === "L") {
+      peakDb = STATE.levels.left.peakDb;
+    } else if (key === "R") {
+      peakDb = STATE.levels.right.peakDb;
+    } else if (key === "Q") {
+      peakDb = Number.isFinite(STATE.levels.stereoQuality.peakDb)
+        ? STATE.levels.stereoQuality.peakDb
+        : mapStereoQualityToDb(
+            STATE.levels.stereoQuality.smooth,
+            minDb,
+            range
+          );
+    } else if (key === "A") {
+      peakDb = mapAudioLevelsToDb(
+        STATE.levels.audio,
+        minDb,
+        range
+      ).audioPeakDb;
+    }
+
+    return Math.max(
+      clamp01(liveFrac),
+      fracFromDb(Number.isFinite(peakDb) ? peakDb : minDb, widthRef)
+    );
+  }
+
+  function getAnalogVuReadout(key) {
+    if (key === "L" || key === "R") {
+      const db = key === "L"
+        ? STATE.levels.left.smoothDb
+        : STATE.levels.right.smoothDb;
+      const value = clamp(
+        Number.isFinite(db) ? db : CONFIG.audio.minDb,
+        CONFIG.audio.minDb,
+        CONFIG.audio.maxDb
+      );
+      return `${value.toFixed(1)} dB`;
+    }
+
+    if (key === "Q") {
+      return `${Math.round(clamp(
+        STATE.levels.stereoQuality.smooth,
+        0,
+        120
+      ) || 0)} %`;
+    }
+
+    return `${Math.round(
+      (clamp(STATE.levels.audio.smooth, 0, 255) || 0) /
+        255 * 100
+    )} %`;
+  }
+
+  function getAnalogVuScale(mode) {
+    if (mode === 2) {
+      return ["0", "30", "60", "90", "120"];
+    }
+    if (mode === 1) {
+      return ["0", "25", "50", "75", "100"];
+    }
+    return ["-35", "-25", "-15", "-5", "+5"];
+  }
+
+  function getAnalogCirclePoint(cx, cy, radius, startAngle, endAngle, t) {
+    const angle = startAngle + (endAngle - startAngle) * clamp01(t);
+    return {
+      x: cx + Math.cos(angle) * radius,
+      y: cy + Math.sin(angle) * radius
+    };
+  }
+
+  function getAnalogPeakPathFrac(stateKey, liveFrac, peakFrac, pathLength) {
+    if (!STATE.render) STATE.render = {};
+    const bucket = (STATE.render.analogVuPeak ??= {});
+    const live = clamp01(liveFrac);
+    const held = clamp01(peakFrac);
+
+    if (
+      !CONFIG.display.showPeaks ||
+      STATE.hasStreamObject !== true ||
+      (live <= 0.001 && held <= 0.001)
+    ) {
+      delete bucket[stateKey];
+      return null;
+    }
+
+    const state = (
+      bucket[stateKey] ??= {
+        pos: live,
+        vel: 0,
+        lastPeak: held
+      }
+    );
+    const pixelFrac = 1 / Math.max(1, pathLength);
+    const isNewPeak = held > state.lastPeak + 0.5 * pixelFrac;
+    const target = isNewPeak
+      ? Math.min(1, held + 8 * pixelFrac)
+      : live;
+    state.lastPeak = held;
+
+    if (target > state.pos) {
+      state.pos = target;
+      state.vel = 0;
+    } else {
+      state.vel += (target - state.pos) * 0.28;
+      state.vel *= 0.78;
+      state.pos += state.vel;
+    }
+
+    state.pos = Math.max(live, Math.min(1, state.pos));
+    return state.pos;
+  }
+
+  function drawAnalogVuInstrument(
+    ctx,
+    frame,
+    key,
+    mode,
+    liveFrac,
+    peakFrac,
+    readoutText,
+    compact,
+    fontFamily
+  ) {
+    const { x, y, w, h } = frame;
+    const colors = ACTIVE_THEME.colors;
+    const peakColor = colors.peak;
+    const accentColor = getFmDxAccentColor();
+    const frameRadius = compact ? 5.2 : 8;
+    const rim = compact ? 3.4 : 5.2;
+    const inner = {
+      x: x + rim,
+      y: y + rim,
+      w: w - rim * 2,
+      h: h - rim * 2
+    };
+    const innerRadius = Math.max(3, frameRadius - 2);
+    const pivotX = inner.x + inner.w / 2;
+    const pivotY = inner.y + inner.h - (compact ? 2.2 : 3.5);
+    const arcInset = compact ? 3 : 5;
+    // The needle length is a true, invariant radius. The ticker is an exact
+    // segment of that same circle; only its visible angular span is clipped
+    // to the horizontal room available in each frame.
+    const arcTopInset = compact ? 2.5 : 4;
+    const needleRadius = Math.max(8, pivotY - (inner.y + arcTopInset));
+    const availableHalfWidth = Math.max(4, inner.w / 2 - arcInset);
+    const maxHalfSpan = compact ? 1.22 : 1.20;
+    const widthHalfSpan = Math.asin(Math.min(1, availableHalfWidth / needleRadius));
+    const halfSpan = Math.min(maxHalfSpan, widthHalfSpan);
+    const arcStartAngle = -Math.PI / 2 - halfSpan;
+    const arcEndAngle = -Math.PI / 2 + halfSpan;
+    const approximatePathLength = Math.max(
+      1,
+      needleRadius * (arcEndAngle - arcStartAngle)
+    );
+    // Fixed FM-DX accent with light and shadow passes for a cylindrical,
+    // three-dimensional metal rim. It is intentionally independent of the
+    // AudioMetrix low/mid/high palette.
+    const frameGradient = ctx.createLinearGradient(x, y, x + w, y + h);
+    frameGradient.addColorStop(0.00, accentColor);
+    frameGradient.addColorStop(0.18, "rgba(255,255,255,0.88)");
+    frameGradient.addColorStop(0.38, accentColor);
+    frameGradient.addColorStop(0.76, "rgba(0,0,0,0.78)");
+    frameGradient.addColorStop(1.00, accentColor);
+    // Gauge-like theme halo around the frame.
+    if (CONFIG.display.glowIntensity > 0) {
+      ctx.save();
+      ctx.globalAlpha = 0.48 * CONFIG.display.glowIntensity;
+      ctx.filter = `blur(${compact ? 3.5 : 6}px)`;
+      ctx.strokeStyle = frameGradient;
+      ctx.lineWidth = compact ? 4.7 : 7;
+      ctx.beginPath();
+      ctx.roundRect(x + rim / 2, y + rim / 2, w - rim, h - rim, frameRadius);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // Dark support plus thick, clean gauge-style gradient frame.
+    ctx.save();
+    ctx.fillStyle = "rgba(2,4,7,0.94)";
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, frameRadius);
+    ctx.fill();
+    ctx.strokeStyle = frameGradient;
+    ctx.lineWidth = rim;
+    ctx.beginPath();
+    ctx.roundRect(
+      x + rim / 2,
+      y + rim / 2,
+      w - rim,
+      h - rim,
+      Math.max(2, frameRadius - rim / 3)
+    );
+    ctx.stroke();
+    ctx.restore();
+
+    // Recessed inner glass without the former white/black pillow emboss.
+    ctx.save();
+    ctx.shadowColor = "rgba(0,0,0,0.72)";
+    ctx.shadowBlur = compact ? 3 : 5;
+    ctx.fillStyle = "rgba(2,5,8,0.88)";
+    ctx.beginPath();
+    ctx.roundRect(inner.x, inner.y, inner.w, inner.h, innerRadius);
+    ctx.fill();
+    ctx.restore();
+
+    ctx.save();
+    ctx.globalAlpha = 0.42;
+    ctx.strokeStyle = frameGradient;
+    ctx.lineWidth = compact ? 0.8 : 1.15;
+    ctx.beginPath();
+    ctx.roundRect(
+      inner.x + 0.5,
+      inner.y + 0.5,
+      inner.w - 1,
+      inner.h - 1,
+      innerRadius
+    );
+    ctx.stroke();
+    ctx.restore();
+
+    // Recessed glass face.
+    ctx.save();
+    ctx.beginPath();
+    ctx.roundRect(inner.x, inner.y, inner.w, inner.h, innerRadius);
+    ctx.clip();
+    const face = ctx.createLinearGradient(0, inner.y, 0, inner.y + inner.h);
+    face.addColorStop(0, "rgba(12,16,21,0.78)");
+    face.addColorStop(0.58, "rgba(4,7,11,0.88)");
+    face.addColorStop(1, "rgba(0,1,3,0.94)");
+    ctx.fillStyle = face;
+    ctx.fillRect(inner.x, inner.y, inner.w, inner.h);
+
+    // Theme-coloured instrument face: low/mid/high are softly blended into
+    // the dark recessed base, beneath the glass and every readable element.
+    const themeFace = ctx.createLinearGradient(
+      inner.x,
+      inner.y + inner.h,
+      inner.x + inner.w,
+      inner.y
+    );
+    themeFace.addColorStop(0.00, colors.low);
+    themeFace.addColorStop(0.50, colors.mid);
+    themeFace.addColorStop(1.00, colors.high);
+    ctx.save();
+    ctx.globalAlpha = compact ? 0.30 : 0.34;
+    ctx.filter = `blur(${compact ? 3 : 5}px)`;
+    ctx.fillStyle = themeFace;
+    ctx.fillRect(inner.x - 4, inner.y - 4, inner.w + 8, inner.h + 8);
+    ctx.restore();
+
+    // Dark edge vignette preserves depth and ticker/readout contrast.
+    const retroFace = ctx.createRadialGradient(
+      pivotX,
+      inner.y + inner.h * 0.34,
+      0,
+      pivotX,
+      inner.y + inner.h * 0.40,
+      Math.max(inner.w * 0.62, inner.h)
+    );
+    retroFace.addColorStop(0.00, "rgba(255,255,255,0.025)");
+    retroFace.addColorStop(0.50, "rgba(0,0,0,0.08)");
+    retroFace.addColorStop(1.00, "rgba(0,0,0,0.46)");
+    ctx.fillStyle = retroFace;
+    ctx.fillRect(inner.x, inner.y, inner.w, inner.h);
+
+    ctx.save();
+    ctx.globalAlpha = 0.38;
+    ctx.strokeStyle = "rgba(255,225,178,0.08)";
+    ctx.lineWidth = 0.45;
+    for (let textureY = inner.y + 2.5; textureY < inner.y + inner.h; textureY += 4) {
+      ctx.beginPath();
+      ctx.moveTo(inner.x + 2, textureY);
+      ctx.lineTo(inner.x + inner.w - 2, textureY);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // Stronger broad reflection beneath the readable graphics.
+    const underGlass = ctx.createLinearGradient(
+      inner.x,
+      inner.y,
+      inner.x + inner.w,
+      inner.y + inner.h
+    );
+    underGlass.addColorStop(0.00, "rgba(255,255,255,0.13)");
+    underGlass.addColorStop(0.18, "rgba(255,255,255,0.055)");
+    underGlass.addColorStop(0.42, "rgba(255,255,255,0.02)");
+    underGlass.addColorStop(0.72, "rgba(0,0,0,0.10)");
+    underGlass.addColorStop(1.00, "rgba(255,255,255,0.025)");
+    ctx.globalAlpha = 1;
+    ctx.filter = `blur(${compact ? 2.5 : 4}px)`;
+    ctx.fillStyle = underGlass;
+    ctx.fillRect(inner.x, inner.y, inner.w, inner.h);
+    ctx.restore();
+
+    // Double concentric ticker arc. The outer/upper arc is the stronger
+    // instrument rim; the inner/lower arc retains the former fine line.
+    const innerTickerRadius = Math.max(
+      4,
+      needleRadius - (compact ? 3.2 : 5)
+    );
+    const warningStartFrac =
+      mode === 1 ? 70 / 100 :
+      mode === 2 ? 100 / 120 :
+      null;
+    const warningColor =
+      mode === 1 ? "#ff3131" :
+      mode === 2 ? "#ffd400" :
+      null;
+    const warningStartAngle = warningStartFrac === null
+      ? null
+      : arcStartAngle + (arcEndAngle - arcStartAngle) * warningStartFrac;
+
+    // Glow pass for the complete double arc, followed by a stronger coloured
+    // warning-zone halo for Q and A.
+    if (CONFIG.display.glowIntensity > 0) {
+      ctx.save();
+      ctx.lineCap = "round";
+      ctx.filter = `blur(${compact ? 2.4 : 3.8}px)`;
+      ctx.globalAlpha = 0.36 * CONFIG.display.glowIntensity;
+      ctx.strokeStyle = "rgba(255,255,255,0.72)";
+
+      [
+        [needleRadius, compact ? 1.8 : 2.6],
+        [innerTickerRadius, compact ? 1.1 : 1.55]
+      ].forEach(([radius, lineWidth]) => {
+        ctx.lineWidth = lineWidth;
+        ctx.beginPath();
+        ctx.arc(pivotX, pivotY, radius, arcStartAngle, arcEndAngle);
+        ctx.stroke();
+      });
+
+      if (warningColor && warningStartAngle !== null) {
+        ctx.globalAlpha = 0.72 * CONFIG.display.glowIntensity;
+        ctx.strokeStyle = warningColor;
+        [
+          [needleRadius, compact ? 2.0 : 3.0],
+          [innerTickerRadius, compact ? 1.25 : 1.8]
+        ].forEach(([radius, lineWidth]) => {
+          ctx.lineWidth = lineWidth;
+          ctx.beginPath();
+          ctx.arc(pivotX, pivotY, radius, warningStartAngle, arcEndAngle);
+          ctx.stroke();
+        });
+      }
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.strokeStyle = "rgba(255,255,255,0.54)";
+    ctx.lineWidth = compact ? 1.35 : 2.0;
+    ctx.beginPath();
+    ctx.arc(
+      pivotX,
+      pivotY,
+      needleRadius,
+      arcStartAngle,
+      arcEndAngle
+    );
+    ctx.stroke();
+
+    ctx.strokeStyle = "rgba(255,255,255,0.34)";
+    ctx.lineWidth = compact ? 0.8 : 1.1;
+    ctx.beginPath();
+    ctx.arc(
+      pivotX,
+      pivotY,
+      innerTickerRadius,
+      arcStartAngle,
+      arcEndAngle
+    );
+    ctx.stroke();
+
+    // Both concentric lines adopt the exact Q/A warning colour beyond the
+    // corresponding 100/70 threshold.
+    if (warningColor && warningStartAngle !== null) {
+      ctx.strokeStyle = warningColor;
+      ctx.lineWidth = compact ? 1.35 : 2.0;
+      ctx.beginPath();
+      ctx.arc(
+        pivotX,
+        pivotY,
+        needleRadius,
+        warningStartAngle,
+        arcEndAngle
+      );
+      ctx.stroke();
+
+      ctx.lineWidth = compact ? 0.8 : 1.1;
+      ctx.beginPath();
+      ctx.arc(
+        pivotX,
+        pivotY,
+        innerTickerRadius,
+        warningStartAngle,
+        arcEndAngle
+      );
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    const tickCount = 20;
+    const scaleLabels = getAnalogVuScale(mode);
+    for (let i = 0; i <= tickCount; i++) {
+      const f = i / tickCount;
+      const point = getAnalogCirclePoint(
+        pivotX,
+        pivotY,
+        needleRadius,
+        arcStartAngle,
+        arcEndAngle,
+        f
+      );
+      const dx = pivotX - point.x;
+      const dy = pivotY - point.y;
+      const distance = Math.max(1, Math.hypot(dx, dy));
+      const nx = dx / distance;
+      const ny = dy / distance;
+      const major = i % 5 === 0;
+      const tickLength = major
+        ? (compact ? 5.5 : 9)
+        : (compact ? 3.2 : 5.5);
+      const zoneColor =
+        warningColor && warningStartFrac !== null && f >= warningStartFrac
+          ? warningColor
+          : "rgba(255,255,255,0.76)";
+
+      ctx.save();
+      ctx.strokeStyle = zoneColor;
+      ctx.lineWidth = major ? (compact ? 1 : 1.3) : 0.65;
+      if (CONFIG.display.glowIntensity > 0) {
+        ctx.shadowColor = zoneColor;
+        ctx.shadowBlur = (compact ? 2.2 : 3.4) * CONFIG.display.glowIntensity;
+      }
+      ctx.beginPath();
+      ctx.moveTo(point.x, point.y);
+      ctx.lineTo(
+        point.x + nx * tickLength,
+        point.y + ny * tickLength
+      );
+      ctx.stroke();
+      ctx.restore();
+
+      if (major) {
+        const labelDistance = tickLength + (compact ? 4 : 7.5);
+        ctx.save();
+        ctx.fillStyle = zoneColor;
+        ctx.font = `600 ${compact ? 5.2 : 7}px ${fontFamily}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        if (CONFIG.display.glowIntensity > 0) {
+          ctx.shadowColor = zoneColor;
+          ctx.shadowBlur = (compact ? 1.8 : 2.8) * CONFIG.display.glowIntensity;
+        }
+        ctx.fillText(
+          scaleLabels[i / 5],
+          point.x + nx * labelDistance,
+          point.y + ny * labelDistance
+        );
+        ctx.restore();
+      }
+    }
+
+    // Channel label bottom-left; readout bottom-right.
+    ctx.save();
+    ctx.fillStyle = "rgba(255,255,255,0.92)";
+    ctx.font = `700 13px ${fontFamily}`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "bottom";
+    ctx.fillText(
+      key,
+      inner.x + (compact ? 4 : 7),
+      inner.y + inner.h - (compact ? 2 : 4)
+    );
+    ctx.restore();
+
+    if (
+      CONFIG.display.showReadouts &&
+      STATE.hasStreamObject === true
+    ) {
+      ctx.save();
+      ctx.fillStyle = "#ffffff";
+      ctx.font = `600 ${compact ? 10 : 13}px ${fontFamily}`;
+      ctx.textAlign = "right";
+      ctx.textBaseline = "bottom";
+      ctx.shadowColor = "rgba(0,0,0,0.95)";
+      ctx.shadowBlur = 3;
+      ctx.fillText(
+        readoutText,
+        inner.x + inner.w - (compact ? 4 : 7),
+        inner.y + inner.h - (compact ? 2 : 4)
+      );
+      ctx.restore();
+    }
+
+    // Longer, thicker 3D theme-high needle ending exactly on the ticker arc.
+    const needleTip = getAnalogCirclePoint(
+      pivotX,
+      pivotY,
+      needleRadius,
+      arcStartAngle,
+      arcEndAngle,
+      liveFrac
+    );
+    if (CONFIG.display.glowIntensity > 0 && liveFrac > 0) {
+      ctx.save();
+      ctx.globalAlpha = 0.76 * CONFIG.display.glowIntensity;
+      ctx.filter = `blur(${compact ? 3 : 5}px)`;
+      ctx.strokeStyle = colors.high;
+      ctx.lineWidth = compact ? 3.6 : 5.4;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(pivotX, pivotY);
+      ctx.lineTo(needleTip.x, needleTip.y);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.strokeStyle = "rgba(0,0,0,0.82)";
+    ctx.lineWidth = compact ? 2.8 : 4.0;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(pivotX, pivotY);
+    ctx.lineTo(needleTip.x, needleTip.y);
+    ctx.stroke();
+    ctx.strokeStyle = colors.high;
+    ctx.lineWidth = compact ? 2.1 : 3.1;
+    ctx.stroke();
+    ctx.globalAlpha = 0.42;
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = compact ? 0.55 : 0.8;
+    ctx.stroke();
+    ctx.restore();
+
+    // Slightly larger peak bead moving directly on the ticker path.
+    const peakPathFrac = getAnalogPeakPathFrac(
+      `${key}:${Math.round(x)}:${Math.round(y)}:${Math.round(w)}:${Math.round(h)}`,
+      liveFrac,
+      peakFrac,
+      approximatePathLength
+    );
+    if (peakPathFrac !== null) {
+      const peakPoint = getAnalogCirclePoint(
+        pivotX,
+        pivotY,
+        needleRadius,
+        arcStartAngle,
+        arcEndAngle,
+        peakPathFrac
+      );
+      ctx.save();
+      ctx.fillStyle = peakColor;
+      ctx.beginPath();
+      ctx.arc(
+        peakPoint.x,
+        peakPoint.y,
+        compact ? 3.1 : 4.1,
+        0,
+        Math.PI * 2
+      );
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // Metallic lower hub remains unchanged in character.
+    ctx.save();
+    const hubRadius = compact ? 3.6 : 4.7;
+    const hub = ctx.createRadialGradient(
+      pivotX - 1,
+      pivotY - 1,
+      0,
+      pivotX,
+      pivotY,
+      hubRadius + 1
+    );
+    hub.addColorStop(0, "rgba(255,255,255,0.92)");
+    hub.addColorStop(0.34, colors.high);
+    hub.addColorStop(1, "rgba(0,0,0,0.92)");
+    ctx.fillStyle = hub;
+    ctx.beginPath();
+    ctx.arc(pivotX, pivotY, hubRadius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    // Clear but stronger final glass reflections.
+    ctx.save();
+    ctx.beginPath();
+    ctx.roundRect(inner.x, inner.y, inner.w, inner.h, innerRadius);
+    ctx.clip();
+    const topGloss = ctx.createLinearGradient(
+      0,
+      inner.y,
+      0,
+      inner.y + inner.h * 0.55
+    );
+    topGloss.addColorStop(0, "rgba(255,255,255,0.13)");
+    topGloss.addColorStop(0.30, "rgba(255,255,255,0.04)");
+    topGloss.addColorStop(1, "rgba(255,255,255,0.00)");
+    ctx.filter = `blur(${compact ? 3 : 5}px)`;
+    ctx.fillStyle = topGloss;
+    ctx.fillRect(inner.x, inner.y, inner.w, inner.h * 0.55);
+    ctx.globalAlpha = 0.055;
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath();
+    ctx.moveTo(inner.x + inner.w * 0.08, inner.y);
+    ctx.lineTo(inner.x + inner.w * 0.32, inner.y);
+    ctx.lineTo(inner.x + inner.w * 0.56, inner.y + inner.h);
+    ctx.lineTo(inner.x + inner.w * 0.42, inner.y + inner.h);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+
+    // Crisp, coloured frame edge matching the visual language of gauges.
+    ctx.save();
+    ctx.globalAlpha = 0.72;
+    ctx.strokeStyle = frameGradient;
+    ctx.lineWidth = compact ? 1.2 : 1.8;
+    ctx.beginPath();
+    ctx.roundRect(x + 0.8, y + 0.8, w - 1.6, h - 1.6, frameRadius);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function renderAnalogVu(ctx, canvas, layout) {
+    const renderedWidth = getCanvasRenderedWidth(canvas);
+    const width = renderedWidth > 40
+      ? renderedWidth
+      : getCanvasLogicalWidth(canvas);
+    if (!width) return;
+
+    const full = layout === "full";
+    const desiredHeight = 100;
+    if (
+      getCanvasLogicalWidth(canvas) !== width ||
+      getCanvasLogicalHeight(canvas) !== desiredHeight
+    ) {
+      resizeCanvasIfNeeded(canvas, width, desiredHeight);
+      ctx = canvas.getContext("2d");
+    }
+    applyCanvasHiDpiTransform(canvas);
+    canvas.style.height = `${desiredHeight}px`;
+
+    const wrapperHeight = desiredHeight;
+    if (STATE.dom.contentWrapper) {
+      STATE.dom.contentWrapper.style.height = `${wrapperHeight}px`;
+      STATE.dom.contentWrapper.style.minHeight = `${wrapperHeight}px`;
+    }
+
+    ctx.clearRect(0, 0, width, desiredHeight);
+
+    const keys = full
+      ? ["L", "R", "Q", "A"]
+      : layout === "sa"
+        ? ["Q", "A"]
+        : ["L", "R"];
+    const pad = 3;
+    const gapX = 5;
+    const gapY = full ? 3 : 0;
+    const columns = 2;
+    const rows = full ? 2 : 1;
+    const frameW = (width - pad * 2 - gapX) / columns;
+    const frameH =
+      (desiredHeight - pad * 2 - gapY * (rows - 1)) / rows;
+    const inheritedFont = STATE.dom.title
+      ? getComputedStyle(STATE.dom.title)
+      : null;
+    const analogFontFamily =
+      inheritedFont?.fontFamily || "sans-serif";
+
+    keys.forEach((key, index) => {
+      const column = index % 2;
+      const row = Math.floor(index / 2);
+      const frame = {
+        x: pad + column * (frameW + gapX),
+        y: pad + row * (frameH + gapY),
+        w: frameW,
+        h: frameH
+      };
+      const meter = computeFracAndMode(layout, index, width);
+      const peakFrac = getAnalogVuPeakFrac(
+        key,
+        width,
+        meter.frac
+      );
+      const readoutText = getThrottledCanvasReadout(
+        `analogVu:${layout}`,
+        index,
+        getAnalogVuReadout(key)
+      );
+      drawAnalogVuInstrument(
+        ctx,
+        frame,
+        key,
+        meter.mode,
+        meter.frac,
+        peakFrac,
+        readoutText,
+        full,
+        analogFontFamily
+      );
+    });
+  }
+
   // Tile title helper
   function getTileTitle(layout, render, useMirrored) {
+    if (layout === "equalizer") {
+      return CONFIG.display.equalizerRenderMode === "spectrum"
+        ? "16-BAND SPECTRUM"
+        : "16-BAND EQ";
+    }
+    if (layout === "vuHybrid") {
+      return CONFIG.display.hybridMode === "audio10"
+        ? "AUDIO LEVELS & 10B EQ"
+        : "STEREO LEVELS & 12B EQ";
+    }
+
     if (layout === "full") return "AUDIO LEVELS";
 
     if (layout === "sa") return "ST. QUALITY / AUDIO PEAK";
 
-    if (render === "gauges" || useMirrored) {
+    if (render === "gauges" || render === "analogVu" || useMirrored) {
       return "STEREO LEVELS";
     }
 
@@ -5455,7 +7847,10 @@ function saveAMXPanelGeometry(panel) {
     const gaugeLabelA     = STATE.dom.gaugeLabelA;
 
     const layout = CONFIG.display.layoutMode;
-    const render = CONFIG.display.renderMode;
+    const render =
+      layout === "equalizer" || layout === "vuHybrid"
+        ? "bars"
+        : CONFIG.display.renderMode;
 
     const useMirrored =
       render === "mirrored" &&
@@ -5474,6 +7869,8 @@ function saveAMXPanelGeometry(panel) {
     // SELECT ACTIVE CANVAS
     if (render === "gauges") {
       setCanvasActive("gauges");
+    } else if (render === "analogVu") {
+      setCanvasActive("analogVu");
     } else if (useMirrored) {
       setCanvasActive("mirrored");
     } else {
@@ -5485,11 +7882,20 @@ function saveAMXPanelGeometry(panel) {
     // canvas position
     if (STATE.dom.canvasNormal && STATE._canvasNormalBaseTop != null) {
       STATE.dom.canvasNormal.style.top = STATE._canvasNormalBaseTop;
+      STATE.dom.canvasNormal.style.left = STATE._canvasNormalBaseLeft;
+      STATE.dom.canvasNormal.style.width = STATE._canvasNormalBaseWidth;
+    }
+
+    if (STATE.dom.canvasGauges) {
+      STATE.dom.canvasGauges.style.top = "5px";
+      STATE.dom.canvasGauges.style.left = "5px";
+      STATE.dom.canvasGauges.style.width = "calc(100% - 10px)";
     }
 
     // wrapper height
     if (STATE.dom.contentWrapper) {
       STATE.dom.contentWrapper.style.height = "";
+      STATE.dom.contentWrapper.style.minHeight = `${WRAPPER_HEIGHT}px`;
     }
 
     // hide gauge overlay by default
@@ -5551,6 +7957,93 @@ function saveAMXPanelGeometry(panel) {
         (INNER_BASE_TOP + barH + gap + barH / 2 - 12) + "px";
     }
 
+    // EQUALIZER — isolated vertical-bars layout
+    if (layout === "equalizer") {
+      if (STATE.dom.labels.left)  STATE.dom.labels.left.style.display  = "none";
+      if (STATE.dom.labels.right) STATE.dom.labels.right.style.display = "none";
+      if (STATE.dom.labels.q)     STATE.dom.labels.q.style.display     = "none";
+      if (STATE.dom.labels.a)     STATE.dom.labels.a.style.display     = "none";
+      if (STATE.dom.scales.left)  STATE.dom.scales.left.style.display  = "none";
+      if (STATE.dom.scales.right) STATE.dom.scales.right.style.display = "none";
+
+      if (STATE.dom.readouts) {
+        Object.values(STATE.dom.readouts).forEach(el => {
+          if (el) el.style.display = "none";
+        });
+      }
+
+      if (STATE.dom.canvasNormal) {
+        STATE.dom.canvasNormal.style.top = "-2px";
+        STATE.dom.canvasNormal.style.left = "5px";
+        STATE.dom.canvasNormal.style.width = "calc(100% - 10px)";
+      }
+
+      setTitleText(
+        CONFIG.display.equalizerRenderMode === "spectrum"
+          ? "16-BAND SPECTRUM"
+          : "16-BAND EQ"
+      );
+      return;
+    }
+
+    // VU HYBRID — isolated vertical meters + spectrum layout
+    if (layout === "vuHybrid") {
+      if (STATE.dom.labels.left)  STATE.dom.labels.left.style.display  = "none";
+      if (STATE.dom.labels.right) STATE.dom.labels.right.style.display = "none";
+      if (STATE.dom.labels.q)     STATE.dom.labels.q.style.display     = "none";
+      if (STATE.dom.labels.a)     STATE.dom.labels.a.style.display     = "none";
+      if (STATE.dom.scales.left)  STATE.dom.scales.left.style.display  = "none";
+      if (STATE.dom.scales.right) STATE.dom.scales.right.style.display = "none";
+
+      if (STATE.dom.readouts) {
+        Object.values(STATE.dom.readouts).forEach(el => {
+          if (el) el.style.display = "none";
+        });
+      }
+
+      if (STATE.dom.canvasNormal) {
+        STATE.dom.canvasNormal.style.top = "-2px";
+        STATE.dom.canvasNormal.style.left = "5px";
+        STATE.dom.canvasNormal.style.width = "calc(100% - 10px)";
+      }
+
+      setTitleText(
+        CONFIG.display.hybridMode === "audio10"
+          ? "AUDIO LEVELS & 10B EQ"
+          : "STEREO LEVELS & 12B EQ"
+      );
+      return;
+    }
+
+    // ANALOG VU — all labels, scales and values are painted inside the glass.
+    if (render === "analogVu") {
+      if (STATE.dom.labels.left)  STATE.dom.labels.left.style.display  = "none";
+      if (STATE.dom.labels.right) STATE.dom.labels.right.style.display = "none";
+      if (STATE.dom.labels.q)     STATE.dom.labels.q.style.display     = "none";
+      if (STATE.dom.labels.a)     STATE.dom.labels.a.style.display     = "none";
+      if (STATE.dom.scales.left)  STATE.dom.scales.left.style.display  = "none";
+      if (STATE.dom.scales.right) STATE.dom.scales.right.style.display = "none";
+
+      if (STATE.dom.readouts) {
+        Object.values(STATE.dom.readouts).forEach(el => {
+          if (el) el.style.display = "none";
+        });
+      }
+
+      if (STATE.dom.gaugeOverlay) {
+        STATE.dom.gaugeOverlay.style.display = "none";
+      }
+
+      if (STATE.dom.canvasGauges) {
+        STATE.dom.canvasGauges.style.top = "0px";
+        STATE.dom.canvasGauges.style.left = "5px";
+        STATE.dom.canvasGauges.style.width = "calc(100% - 10px)";
+      }
+
+      setTitleText(getTileTitle(layout, render, useMirrored));
+      return;
+    }
+
     // GAUGES MODE
     if (render === "gauges") {
 
@@ -5594,7 +8087,7 @@ function saveAMXPanelGeometry(panel) {
 
         if (gaugeLabelLeft) {
           setTextIfChanged(gaugeLabelLeft, "L");
-          gaugeLabelLeft.style.left = "11.5%";
+          gaugeLabelLeft.style.left = `${getGaugeCenterFractions(layout)[0] * 100}%`;
           gaugeLabelLeft.style.top = TOP;
           gaugeLabelLeft.style.transform = TRANSFORM;
           gaugeLabelLeft.style.display = "";
@@ -5602,7 +8095,7 @@ function saveAMXPanelGeometry(panel) {
 
         if (gaugeLabelRight) {
           setTextIfChanged(gaugeLabelRight, "R");
-          gaugeLabelRight.style.left = "38.5%";
+          gaugeLabelRight.style.left = `${getGaugeCenterFractions(layout)[1] * 100}%`;
           gaugeLabelRight.style.top = TOP;
           gaugeLabelRight.style.transform = TRANSFORM;
           gaugeLabelRight.style.display = "";
@@ -5610,7 +8103,7 @@ function saveAMXPanelGeometry(panel) {
 
         if (gaugeLabelQ) {
           setTextIfChanged(gaugeLabelQ, "Q");
-          gaugeLabelQ.style.left = "65.5%";
+          gaugeLabelQ.style.left = `${getGaugeCenterFractions(layout)[2] * 100}%`;
           gaugeLabelQ.style.top = TOP;
           gaugeLabelQ.style.transform = TRANSFORM;
           gaugeLabelQ.style.display = "";
@@ -5618,7 +8111,7 @@ function saveAMXPanelGeometry(panel) {
 
         if (gaugeLabelA) {
           setTextIfChanged(gaugeLabelA, "A");
-          gaugeLabelA.style.left = "92%";
+          gaugeLabelA.style.left = `${getGaugeCenterFractions(layout)[3] * 100}%`;
           gaugeLabelA.style.top = TOP;
           gaugeLabelA.style.transform = TRANSFORM;
           gaugeLabelA.style.display = "";
@@ -5638,14 +8131,14 @@ function saveAMXPanelGeometry(panel) {
 
         // restore correct 2-gauge positions
         if (gaugeLabelLeft) {
-          gaugeLabelLeft.style.left = "calc(25% - 6px)";
+          gaugeLabelLeft.style.left = `${getGaugeCenterFractions(layout)[0] * 100}%`;
           gaugeLabelLeft.style.top = TOP;
           gaugeLabelLeft.style.transform = TRANSFORM;
           gaugeLabelLeft.style.display = "";
         }
 
         if (gaugeLabelRight) {
-          gaugeLabelRight.style.left = "calc(75% + 16px)";
+          gaugeLabelRight.style.left = `${getGaugeCenterFractions(layout)[1] * 100}%`;
           gaugeLabelRight.style.top = TOP;
           gaugeLabelRight.style.transform = TRANSFORM;
           gaugeLabelRight.style.display = "";
@@ -5665,7 +8158,9 @@ function saveAMXPanelGeometry(panel) {
         }
       }
 
-      // NUMERIC LABELS
+      // NUMERIC LABELS — same geometry source as gauges, centre labels and outputs
+      applyGaugeNumericGeometry(layout);
+
       if (layout === "lr") {
         ["Left", "Right"].forEach(side => {
           const g = STATE.dom["gaugeNums" + side];
@@ -5955,6 +8450,8 @@ function saveAMXPanelGeometry(panel) {
 
       // SAVE BASE TOP OF NORMAL CANVAS (for restoring after full mode)
       STATE._canvasNormalBaseTop = STATE.dom.canvasNormal.style.top;
+      STATE._canvasNormalBaseLeft = STATE.dom.canvasNormal.style.left;
+      STATE._canvasNormalBaseWidth = STATE.dom.canvasNormal.style.width;
 
       // MIRRORED MODE CANVAS
       STATE.dom.canvasMirror = document.createElement("canvas");
@@ -5972,8 +8469,8 @@ function saveAMXPanelGeometry(panel) {
       STATE.dom.canvasGauges.style.cssText = `
         position:absolute;
         top:5px;
-        left:${CONFIG.display.dimensions.canvasLeft}px;
-        width:calc(100% - ${CONFIG.display.dimensions.canvasLeft + 5}px);
+        left:5px;
+        width:calc(100% - 10px);
         display:none;
       `;
       STATE.dom.contentWrapper.appendChild(STATE.dom.canvasGauges);
@@ -5983,20 +8480,36 @@ function saveAMXPanelGeometry(panel) {
       STATE.dom.canvas = STATE.dom.canvasNormal;
 
       readLayoutOnce();
+      STATE.layout.dpr = getAMXRenderDpr();
 
       const w = STATE.layout.width;
       const barH = CONFIG.display.dimensions.barHeight;
       const gap = CONFIG.display.dimensions.spacing;
 
       const safeWidth = w && w > 40 ? w : 300;
+      const trackWidth = Math.max(1, safeWidth - CONFIG.display.dimensions.canvasLeft - 5);
+      const gaugesWidth = Math.max(1, safeWidth - 10);
+      const mirrorWidth = Math.max(
+        1,
+        safeWidth
+          - Math.max(4, CONFIG.display.dimensions.canvasLeft - 20)
+          - Math.max(8, CONFIG.display.dimensions.canvasLeft - 15)
+      );
       const normalHeight = barH * 2 + gap;
 
 
       // NORMAL canvas always gets size
       resizeCanvasIfNeeded(
         STATE.dom.canvasNormal,
-        safeWidth,
+        trackWidth,
         normalHeight
+      );
+
+      // MIRRORED canvas uses its own wider left/right offsets.
+      resizeCanvasIfNeeded(
+        STATE.dom.canvasMirror,
+        mirrorWidth,
+        getMirroredLayoutMetrics().singlePanelHeight
       );
       requestRender();
 
@@ -6006,7 +8519,7 @@ function saveAMXPanelGeometry(panel) {
 
         resizeCanvasIfNeeded(
           STATE.dom.canvasGauges,
-          safeWidth,
+          gaugesWidth,
           gaugesHeight
         );
       }
@@ -6269,12 +8782,9 @@ function saveAMXPanelGeometry(panel) {
       STATE.dom.gaugeLabelQ = createGaugeCenterLabel();
       STATE.dom.gaugeLabelA = createGaugeCenterLabel();
 
-      // Overlay anchoring (same as canvasGauges)
-      const GAUGE_OVERLAY_LEFT  = CONFIG.display.dimensions.canvasLeft;
-      const GAUGE_OVERLAY_W_SUB = (CONFIG.display.dimensions.canvasLeft + 5);
-
-      STATE.dom.gaugeOverlay.style.left  = GAUGE_OVERLAY_LEFT + "px";
-      STATE.dom.gaugeOverlay.style.right = GAUGE_OVERLAY_W_SUB + "px";
+      // Overlay anchoring exactly matches the symmetric gauges canvas.
+      STATE.dom.gaugeOverlay.style.left  = "5px";
+      STATE.dom.gaugeOverlay.style.right = "5px";
 
       // Append overlay above canvases
       STATE.dom.contentWrapper.appendChild(STATE.dom.gaugeOverlay);
@@ -6326,31 +8836,8 @@ function saveAMXPanelGeometry(panel) {
         end:   createGaugeNumber()
       };
 
-      // LEFT GAUGE
-      STATE.dom.gaugeNumsLeft.start.style.left = "2%";
-      STATE.dom.gaugeNumsLeft.start.style.top  = "75%";
-
-      STATE.dom.gaugeNumsLeft.mid.style.left   = "7%";
-      STATE.dom.gaugeNumsLeft.mid.style.top    = "10%";
-
-      STATE.dom.gaugeNumsLeft.high.style.left  = "38%";
-      STATE.dom.gaugeNumsLeft.high.style.top   = "10%";
-
-      STATE.dom.gaugeNumsLeft.end.style.left   = "45%";
-      STATE.dom.gaugeNumsLeft.end.style.top    = "75%";
-
-      // RIGHT GAUGE
-      STATE.dom.gaugeNumsRight.start.style.left = "59%";
-      STATE.dom.gaugeNumsRight.start.style.top  = "75%";
-
-      STATE.dom.gaugeNumsRight.mid.style.left   = "64%";
-      STATE.dom.gaugeNumsRight.mid.style.top    = "10%";
-
-      STATE.dom.gaugeNumsRight.high.style.left  = "95%";
-      STATE.dom.gaugeNumsRight.high.style.top   = "10%";
-
-      STATE.dom.gaugeNumsRight.end.style.left   = "102%";
-      STATE.dom.gaugeNumsRight.end.style.top    = "75%";
+      // Positions are assigned dynamically by applyGaugeNumericGeometry()
+      // from the same geometry model used by the canvas, centre labels and outputs.
 
       function createReadoutEl() {
         const el = document.createElement("div");
@@ -6371,10 +8858,6 @@ function saveAMXPanelGeometry(panel) {
         return el;
       }
 
-      // FINAL INITIAL VISUAL SYNC (AFTER ALL DOM EXISTS)
-      applyVisualState();
-      renderMeters();
-
       // Insert tile after freq panel
       const path = window.location.pathname;
       const isExcludedPage =
@@ -6390,6 +8873,16 @@ function saveAMXPanelGeometry(panel) {
       } else {
         return;
       }
+
+      // Resolve Automatic only after the tile is connected and inherits the
+      // live FM-DX CSS palette. The first canvas paint must never use the
+      // pre-DOM fallback.
+      refreshFmDxCssPalette(true);
+      refreshAutomaticTheme(true);
+
+      // FINAL INITIAL VISUAL SYNC (AFTER ALL DOM EXISTS AND THEME IS LIVE)
+      applyVisualState();
+      renderMeters();
 
       // Skin inheritance (sync fonts/colors)
       function inheritTextStyles() {
@@ -6580,10 +9073,21 @@ function saveAMXPanelGeometry(panel) {
       function cleanupAudioGraph() {
         const a = STATE.audio || {};
 
+        try {
+          if (a.splitter && a.analyserEqualizerLeft) {
+            a.splitter.disconnect(a.analyserEqualizerLeft);
+          }
+          if (a.splitter && a.analyserEqualizerRight) {
+            a.splitter.disconnect(a.analyserEqualizerRight);
+          }
+        } catch (e) {}
+
         [
           a.splitter,
           a.analyserLeft,
           a.analyserRight,
+          a.analyserEqualizerLeft,
+          a.analyserEqualizerRight,
           a.analyserMid,
           a.analyserSide,
           a.analyserPeak,
@@ -6593,7 +9097,7 @@ function saveAMXPanelGeometry(panel) {
           a.mergerMS
         ].forEach(safeDisconnect);
 
-        ["left", "right", "audio"].forEach(k => {
+        ["left", "right", "audio", "quality"].forEach(k => {
           STATE.peakHoldUntil[k] = 0;
         });
       }
@@ -6609,14 +9113,38 @@ function saveAMXPanelGeometry(panel) {
 
       function resetAudioState() {
         cleanupAudioGraph();
+        STATE.hasStreamObject = false;
+        clearTransientRenderState();
+
+        if (STATE.levels && STATE.levels.equalizer) {
+          STATE.levels.equalizer.values.fill(0);
+          STATE.levels.equalizer.peaks.fill(0);
+          STATE.levels.equalizer.dbValues.fill(-100);
+          STATE.levels.equalizer.peakHoldUntil.fill(0);
+          STATE.levels.equalizer.lastUpdateTs = 0;
+        }
+        [
+          STATE.levels?.hybridStereo12,
+          STATE.levels?.hybridAudio10
+        ].filter(Boolean).forEach(spectrum => {
+          spectrum.values.fill(0);
+          spectrum.peaks.fill(0);
+          spectrum.dbValues.fill(-100);
+          spectrum.peakHoldUntil.fill(0);
+          spectrum.lastUpdateTs = 0;
+        });
 
         STATE.audio = {
           context: null,
           splitter: null,
           analyserLeft: null,
           analyserRight: null,
+          analyserEqualizerLeft: null,
+          analyserEqualizerRight: null,
           dataLeft: null,
           dataRight: null,
+          dataEqualizerLeft: null,
+          dataEqualizerRight: null,
           timeLeft: null,
           timeRight: null,
           mergerMS: null,
@@ -6629,7 +9157,10 @@ function saveAMXPanelGeometry(panel) {
           highPassFilter: null,
           lowPassFilter: null,
           dataPeak: null,
-          source: null
+          source: null,
+          sourceMode: null,
+          sourceLabel: null,
+          sourceSignature: null
         };
       }
 
@@ -6672,6 +9203,145 @@ function saveAMXPanelGeometry(panel) {
         return { instantDb, smoothDb };
       }
 
+      const spectrumCalibrationCache = new Map();
+
+      function getSpectrumCalibration(frequency) {
+        const cached = spectrumCalibrationCache.get(frequency);
+        if (cached) return cached;
+
+        let nearestIndex = 0;
+        let nearestDistance = Infinity;
+        for (let i = 0; i < EQ_CENTER_FREQUENCIES.length; i++) {
+          const distance = Math.abs(
+            Math.log2(frequency / EQ_CENTER_FREQUENCIES[i])
+          );
+          if (distance < nearestDistance) {
+            nearestDistance = distance;
+            nearestIndex = i;
+          }
+        }
+        const calibration = {
+          gain: EQ_PREAMP_GAINS[nearestIndex],
+          floor: EQ_FLOOR_LEVELS[nearestIndex]
+        };
+        spectrumCalibrationCache.set(frequency, calibration);
+        return calibration;
+      }
+
+      function updateEqualizerLevels(
+        now,
+        spectrumState = STATE.levels.equalizer,
+        frequencies = EQ_CENTER_FREQUENCIES
+      ) {
+        const a = STATE.audio;
+        const eq = spectrumState;
+        const analyserLeft = a.analyserEqualizerLeft;
+        const analyserRight = a.analyserEqualizerRight;
+        const spectrumLeft = a.dataEqualizerLeft;
+        const spectrumRight = a.dataEqualizerRight;
+        if (!analyserLeft || !analyserRight || !spectrumLeft || !spectrumRight) return;
+
+        analyserLeft.getByteFrequencyData(spectrumLeft);
+        analyserRight.getByteFrequencyData(spectrumRight);
+
+        const sampleRate = (a.context && a.context.sampleRate) || 48000;
+        const nyquist = sampleRate / 2;
+        const binCount = Math.min(spectrumLeft.length, spectrumRight.length);
+        const deltaSeconds = eq.lastUpdateTs > 0
+          ? Math.min(0.1, Math.max(0, (now - eq.lastUpdateTs) / 1000))
+          : 1 / 30;
+        eq.lastUpdateTs = now;
+
+        for (let band = 0; band < frequencies.length; band++) {
+          const targetBin = Math.min(
+            binCount - 1,
+            Math.max(
+              0,
+              Math.floor((frequencies[band] / nyquist) * binCount)
+            )
+          );
+          const startBin = Math.max(0, targetBin - 2);
+          const endBin = Math.min(binCount - 1, targetBin + 2);
+
+          let peakValue = 0;
+          for (let bin = startBin; bin <= endBin; bin++) {
+            const combined = (spectrumLeft[bin] + spectrumRight[bin]) / 2;
+            if (combined > peakValue) peakValue = combined;
+          }
+
+          const analyserMinDb = analyserLeft.minDecibels;
+          const analyserMaxDb = analyserLeft.maxDecibels;
+          const rawDb =
+            analyserMinDb +
+            (peakValue / 255) * (analyserMaxDb - analyserMinDb);
+          const gainedDb = clamp(
+            rawDb + CONFIG.audio.dbGain,
+            analyserMinDb,
+            analyserMaxDb
+          );
+          // Preserve the proven eq5 visual response while allowing the dB
+          // readout to retain headroom above -30 dB.
+          const visualCeilingDb = -30;
+          const visualDb = clamp(
+            gainedDb,
+            analyserMinDb,
+            visualCeilingDb
+          );
+          const gainedByte =
+            ((visualDb - analyserMinDb) /
+              (visualCeilingDb - analyserMinDb)) *
+            255;
+          const calibration = getSpectrumCalibration(
+            frequencies[band]
+          );
+          const balancedPeak = gainedByte * calibration.gain;
+          const floor = calibration.floor;
+          eq.dbValues[band] =
+            balancedPeak > floor ? gainedDb : -100;
+          const normalized =
+            balancedPeak > floor
+              ? (balancedPeak - floor) / (255 - floor)
+              : 0;
+          let target = clamp(
+            Math.pow(normalized, 1 / EQ_SENSITIVITY),
+            0,
+            1
+          );
+
+          const previous = eq.values[band] || 0;
+          if (Math.abs(target - previous) < EQ_HYSTERESIS) {
+            target = previous;
+          }
+
+          const attackBase =
+            0.08 + CONFIG.audio.attackSpeed * 0.42;
+          const releaseBase =
+            0.015 + CONFIG.audio.releaseSpeed * 0.12;
+          const frameScale = Math.max(0.01, deltaSeconds * 60);
+          const attackAlpha =
+            1 - Math.pow(1 - attackBase, frameScale);
+          const releaseAlpha =
+            1 - Math.pow(1 - releaseBase, frameScale);
+          const next =
+            target > previous
+              ? previous + (target - previous) * attackAlpha
+              : previous + (target - previous) * releaseAlpha;
+          eq.values[band] = next < 0.008 ? 0 : next;
+
+          if (next >= (eq.peaks[band] || 0)) {
+            eq.peaks[band] = next;
+            eq.peakHoldUntil[band] = now + CONFIG.audio.peakHoldMs;
+          } else if (now >= (eq.peakHoldUntil[band] || 0)) {
+            eq.peaks[band] = Math.max(
+              next,
+              (eq.peaks[band] || 0) -
+                (0.15 + CONFIG.audio.releaseSpeed * 0.55) *
+                  deltaSeconds
+            );
+          }
+        }
+      }
+
       function updatePeak(instDb, peakDb, side, now) {
         const minDb = CONFIG.audio.minDb;
 
@@ -6691,17 +9361,107 @@ function saveAMXPanelGeometry(panel) {
         return Math.max(minDb, peakDb - CONFIG.audio.peakDecayDbPerFrame);
       }
 
-      function initAudioSystem() {
+      function resolveAudioSource() {
+        // AudioMetrix must not be tied to one specific FM-DX audio path.
+        // Prefer an active HD Radio WebAudio tap when available, then fall back
+        // to the standard FM-DX analogue stream node.
+        try {
+          const hdNode = window.hdRadioAnalyserNode || window.hdRadioAudioNode || null;
+          const hdCtx = hdNode && hdNode.context ? hdNode.context : null;
+
+          if (hdNode && hdCtx && hdCtx.state !== "closed") {
+            return {
+              mode: "hdradio",
+              label: "HD Radio",
+              context: hdCtx,
+              source: hdNode,
+              signature: `hdradio:${hdCtx.sampleRate || 0}:${hdNode.constructor?.name || "AudioNode"}`
+            };
+          }
+        } catch (e) {}
+
         try {
           if (
             typeof Stream !== "undefined" &&
             Stream?.Fallback?.Player?.Amplification &&
             Stream?.Fallback?.Audio
           ) {
-            if (!STATE.audio.context) {
-              STATE.audio.context = Stream.Fallback.Audio;
-              STATE.audio.source = Stream.Fallback.Player.Amplification;
+            const ctx = Stream.Fallback.Audio;
+            const src = Stream.Fallback.Player.Amplification;
+
+            if (ctx && src && ctx.state !== "closed") {
+              return {
+                mode: "analog",
+                label: "FM-DX Analog",
+                context: ctx,
+                source: src,
+                signature: `analog:${ctx.sampleRate || 0}:${src.constructor?.name || "AudioNode"}`
+              };
             }
+          }
+        } catch (e) {}
+
+        return null;
+      }
+
+      function isAudioTransportPlaying() {
+        // FM-DX keeps its WebAudio graph/node alive after Stop. The transport
+        // button is the authoritative state: fa-stop means audio is playing,
+        // fa-play means it is stopped. This also changes synchronously on each
+        // Play/Stop click, unlike the retained analyser source.
+        const transportIcon = document.querySelector(
+          ".playbutton .fa-solid"
+        );
+        if (transportIcon) {
+          return transportIcon.classList.contains("fa-stop");
+        }
+
+        // Compatibility fallback for installations without the standard
+        // FM-DX transport button.
+        try {
+          if (STATE.audio?.sourceMode === "analog") {
+            return typeof Stream !== "undefined" && Stream !== null;
+          }
+        } catch (e) {}
+
+        // Optional explicit HD Radio transport flags, when supplied by the
+        // host/plugin. A boolean false is meaningful and must not be skipped.
+        const hdFlags = [
+          window.hdRadioIsPlaying,
+          window.isHDRadioPlaying,
+          window.hdRadioPlaying
+        ];
+        const explicitHdFlag = hdFlags.find(
+          value => typeof value === "boolean"
+        );
+        if (typeof explicitHdFlag === "boolean") {
+          return explicitHdFlag;
+        }
+
+        const hdMedia =
+          window.hdRadioAudioElement ||
+          window.hdRadioAudio ||
+          null;
+        if (hdMedia && typeof hdMedia.paused === "boolean") {
+          return !hdMedia.paused && !hdMedia.ended;
+        }
+
+        // Last-resort compatibility for an HD analyser node that exists only
+        // while its transport is active.
+        return STATE.audio?.sourceMode === "hdradio" &&
+          !!STATE.audio?.source;
+      }
+
+      function initAudioSystem() {
+        try {
+          const resolved = resolveAudioSource();
+
+          if (resolved && resolved.context && resolved.source) {
+            STATE.audio.context = resolved.context;
+            STATE.audio.source = resolved.source;
+            STATE.audio.sourceMode = resolved.mode;
+            STATE.audio.sourceLabel = resolved.label;
+            STATE.audio.sourceSignature = resolved.signature;
 
             const ctx = STATE.audio.context;
             const src = STATE.audio.source;
@@ -6738,6 +9498,29 @@ function saveAMXPanelGeometry(panel) {
             src.connect(STATE.audio.splitter);
             STATE.audio.splitter.connect(STATE.audio.analyserLeft,  0);
             STATE.audio.splitter.connect(STATE.audio.analyserRight, 1);
+
+            // EQUALIZER — dedicated high-resolution, display-only spectrum tap.
+            // It is never connected back into the playback path.
+            STATE.audio.analyserEqualizerLeft = ctx.createAnalyser();
+            STATE.audio.analyserEqualizerRight = ctx.createAnalyser();
+
+            STATE.audio.analyserEqualizerLeft.fftSize = 4096;
+            STATE.audio.analyserEqualizerRight.fftSize = 4096;
+            STATE.audio.analyserEqualizerLeft.minDecibels = -100;
+            STATE.audio.analyserEqualizerRight.minDecibels = -100;
+            STATE.audio.analyserEqualizerLeft.maxDecibels = -10;
+            STATE.audio.analyserEqualizerRight.maxDecibels = -10;
+            STATE.audio.analyserEqualizerLeft.smoothingTimeConstant = 0.85;
+            STATE.audio.analyserEqualizerRight.smoothingTimeConstant = 0.85;
+
+            STATE.audio.dataEqualizerLeft = new Uint8Array(
+              STATE.audio.analyserEqualizerLeft.frequencyBinCount
+            );
+            STATE.audio.dataEqualizerRight = new Uint8Array(
+              STATE.audio.analyserEqualizerRight.frequencyBinCount
+            );
+            STATE.audio.splitter.connect(STATE.audio.analyserEqualizerLeft, 0);
+            STATE.audio.splitter.connect(STATE.audio.analyserEqualizerRight, 1);
 
             // MID / SIDE ENGINE (SAFE VERSION)
             // derived from splitter, NO ChannelMerger
@@ -6819,7 +9602,7 @@ function saveAMXPanelGeometry(panel) {
 
             if (AMX_DEBUG) {
               console.log(
-                "%c[Stereo INIT] True stereo split engaged (L/R + safe Mid/Side).",
+                `%c[AudioMetrix INIT] Source: ${STATE.audio.sourceLabel || STATE.audio.sourceMode || "unknown"} — true stereo split engaged (L/R + safe Mid/Side).`,
                 "color: cyan; font-weight: bold;"
               );
             }
@@ -6832,6 +9615,29 @@ function saveAMXPanelGeometry(panel) {
           console.error("[AudioMetrix] initAudioSystem failed:", e);
           setTimeout(initAudioSystem, 1000);
         }
+      }
+
+      function encodeSpectrumValues(values, multiplier, fallback) {
+        let encoded = "";
+        for (let i = 0; i < values.length; i++) {
+          if (i > 0) encoded += ",";
+          encoded += Math.round(
+            (values[i] || fallback) * multiplier
+          );
+        }
+        return encoded;
+      }
+
+      function buildSpectrumStateSignature(spectrumState) {
+        if (!spectrumState) return "";
+
+        return (
+          encodeSpectrumValues(spectrumState.values, 200, 0) +
+          "|" +
+          encodeSpectrumValues(spectrumState.peaks, 200, 0) +
+          "|" +
+          encodeSpectrumValues(spectrumState.dbValues, 1, -100)
+        );
       }
 
       // RENDER LOOP HOOK
@@ -6848,8 +9654,8 @@ function saveAMXPanelGeometry(panel) {
         // Keep existing width; only ensure the normal canvas has a valid height.
         if (STATE.dom.canvasNormal) {
           const currentWidth =
-            STATE.dom.canvasNormal.width && STATE.dom.canvasNormal.width > 40
-              ? STATE.dom.canvasNormal.width
+            getCanvasLogicalWidth(STATE.dom.canvasNormal) > 40
+              ? getCanvasLogicalWidth(STATE.dom.canvasNormal)
               : 300;
 
           resizeCanvasIfNeeded(
@@ -6866,6 +9672,10 @@ function saveAMXPanelGeometry(panel) {
 
       // UPDATE METERS
       function updateMetersFrame() {
+        // Also runs while the audio analysers are not ready, allowing the
+        // Automatic theme to replace its startup fallback after a refresh.
+        refreshAutomaticTheme();
+
         if (
           !STATE.audio ||
           !STATE.audio.analyserLeft ||
@@ -6877,12 +9687,26 @@ function saveAMXPanelGeometry(panel) {
         }
 
         try {
+          // Playback state, not mere WebAudio-node existence, controls every
+          // peak/readout visibility transition.
+          STATE.hasStreamObject = isAudioTransportPlaying();
+
           // Adaptive audio cadence (single decision point)
-          const runAudio = shouldRunAudio();
+          const equalizerActive =
+            CONFIG.display.layoutMode === "equalizer" ||
+            CONFIG.display.layoutMode === "vuHybrid";
+          const runAudio =
+            equalizerActive ? true : shouldRunAudio();
 
           if (runAudio) {
             const layoutMode = CONFIG.display.layoutMode;
-            const nonLRLayout = (layoutMode !== "lr");
+            const nonLRLayout =
+              layoutMode !== "lr" &&
+              layoutMode !== "equalizer" &&
+              !(
+                layoutMode === "vuHybrid" &&
+                CONFIG.display.hybridMode === "stereo12"
+              );
             
             const audioCfg = CONFIG.audio;
             const minDb = audioCfg.minDb;
@@ -6922,6 +9746,24 @@ function saveAMXPanelGeometry(panel) {
               (typeof performance !== "undefined" && performance.now)
                 ? performance.now()
                 : Date.now();
+
+            if (layoutMode === "equalizer") {
+              updateEqualizerLevels(nowTs);
+            } else if (layoutMode === "vuHybrid") {
+              if (CONFIG.display.hybridMode === "audio10") {
+                updateEqualizerLevels(
+                  nowTs,
+                  STATE.levels.hybridAudio10,
+                  HYBRID_AUDIO_10_FREQUENCIES
+                );
+              } else {
+                updateEqualizerLevels(
+                  nowTs,
+                  STATE.levels.hybridStereo12,
+                  HYBRID_STEREO_12_FREQUENCIES
+                );
+              }
+            }
 
             // PEAKS (hold + decay)
             STATE.levels.left.peakDb = updatePeak(
@@ -7137,6 +9979,17 @@ function saveAMXPanelGeometry(panel) {
 
               STATE.levels.stereoQuality.instant = qInstant;
               STATE.levels.stereoQuality.smooth  = qSmooth;
+              const qSmoothDb = mapStereoQualityToDb(
+                qSmooth,
+                minDb,
+                maxDb - minDb
+              );
+              STATE.levels.stereoQuality.peakDb = updatePeak(
+                qSmoothDb,
+                STATE.levels.stereoQuality.peakDb,
+                "quality",
+                nowTs
+              );
 
               // DEBUG (richer)
               if (AMX_DEBUG) {
@@ -7216,7 +10069,12 @@ function saveAMXPanelGeometry(panel) {
 
           // FRAME THROTTLING
           const __now = performance.now();
-          if (__now - _lastRenderTime < FRAME_INTERVAL) {
+          const activeFrameInterval =
+            CONFIG.display.layoutMode === "equalizer" ||
+            CONFIG.display.layoutMode === "vuHybrid"
+              ? 1000 / 60
+              : FRAME_INTERVAL;
+          if (__now - _lastRenderTime < activeFrameInterval) {
             RENDER_GATE.rafId = requestAnimationFrame(updateMetersFrame);
             return;
           }
@@ -7226,16 +10084,39 @@ function saveAMXPanelGeometry(panel) {
           const Rs = STATE.levels.right.smoothDb;
           const Qs = STATE.levels.stereoQuality.smooth;
           const As = STATE.levels.audio.smooth;
+          const spectrumState =
+            CONFIG.display.layoutMode === "equalizer"
+              ? STATE.levels.equalizer
+              : CONFIG.display.layoutMode === "vuHybrid"
+                ? (
+                    CONFIG.display.hybridMode === "audio10"
+                      ? STATE.levels.hybridAudio10
+                      : STATE.levels.hybridStereo12
+                  )
+                : null;
+          const eqSignature =
+            buildSpectrumStateSignature(spectrumState);
 
           const EPS_DB = 0.05;
           const EPS_PCT = 0.5;
 
+          const streamState = STATE.hasStreamObject === true;
+          const streamChanged = streamState !== _lastDrawn.Stream;
+          if (
+            streamChanged &&
+            !streamState &&
+            STATE.render?.canvasReadouts
+          ) {
+            STATE.render.canvasReadouts = {};
+          }
           const dirtyValues =
             _lastDrawn.L === null ||
             Math.abs(Ls - _lastDrawn.L) > EPS_DB ||
             Math.abs(Rs - _lastDrawn.R) > EPS_DB ||
             Math.abs(Qs - _lastDrawn.Q) > EPS_PCT ||
-            Math.abs(As - _lastDrawn.A) > EPS_PCT;
+            Math.abs(As - _lastDrawn.A) > EPS_PCT ||
+            (spectrumState && eqSignature !== _lastDrawn.EQ) ||
+            streamChanged;
 
           const manualDirty = (RENDER_GATE.dirty === true);
 
@@ -7244,12 +10125,27 @@ function saveAMXPanelGeometry(panel) {
             _lastDrawn.R = Rs;
             _lastDrawn.Q = Qs;
             _lastDrawn.A = As;
+            _lastDrawn.EQ = eqSignature;
+            _lastDrawn.Stream = streamState;
           }
 
           // DRAW EVERYTHING (GATED)
           if (manualDirty || dirtyValues) {
             renderMeters();
             RENDER_GATE.dirty = false;
+          }
+
+          // STOP must blank DOM readouts immediately, independently of the
+          // user-selected readout refresh cadence.
+          if (
+            STATE.hasStreamObject !== true &&
+            STATE.dom.readouts
+          ) {
+            Object.values(STATE.dom.readouts).forEach((el) => {
+              if (el && el.textContent !== "") {
+                el.textContent = "";
+              }
+            });
           }
 
           // READOUTS — REAL-TIME UPDATE (THROTTLED)
@@ -7283,11 +10179,9 @@ function saveAMXPanelGeometry(panel) {
                 ? STATE.levels.stereoQuality.smooth
                 : 0;
 
-              // Real transport state from FM-DX 3LAS frontend
+              // Compatible transport state (analogue Stream or HD Radio tap).
               const hasStreamObject =
-                (typeof Stream !== "undefined" && Stream !== null);
-
-              STATE.hasStreamObject = hasStreamObject;
+                STATE.hasStreamObject === true;
 
               // Helper for dB formatting on minDb
               const formatDb =
@@ -7363,32 +10257,37 @@ function saveAMXPanelGeometry(panel) {
         RENDER_GATE.rafId = requestAnimationFrame(updateMetersFrame);
       }
 
-      // AUTO REBIND WHEN FM-DX RECREATES AUDIO NODES
+      // AUTO REBIND WHEN FM-DX OR COMPATIBLE PLUGINS RECREATE AUDIO NODES
       const AUTO_REBIND_INTERVAL_MS = 1000;
-      let last = null;
+      let lastSourceSignature = null;
+      let lastSourceNode = null;
 
       setInterval(() => {
         try {
-          const hasStream =
-            typeof Stream !== "undefined" &&
-            Stream?.Fallback?.Player?.Amplification &&
-            Stream?.Fallback?.Audio;
+          const resolved = resolveAudioSource();
 
-          if (!hasStream) {
-            last = null;
+          if (!resolved || !resolved.context || !resolved.source) {
+            lastSourceSignature = null;
+            lastSourceNode = null;
             return;
           }
 
-          const node = Stream.Fallback.Player.Amplification;
-          const ctx  = Stream.Fallback.Audio;
-
-          if (!node || !ctx) {
-            last = null;
-            return;
+          if (!lastSourceNode && !lastSourceSignature) {
+            lastSourceNode = resolved.source;
+            lastSourceSignature = resolved.signature;
           }
 
-          if (node !== last) {
-            last = node;
+          const changed =
+            resolved.source !== lastSourceNode ||
+            resolved.signature !== lastSourceSignature ||
+            !STATE.audio ||
+            STATE.audio.source !== resolved.source ||
+            STATE.audio.context !== resolved.context ||
+            STATE.audio.sourceMode !== resolved.mode;
+
+          if (changed) {
+            lastSourceNode = resolved.source;
+            lastSourceSignature = resolved.signature;
             stopRenderingLoop();
             resetAudioState();
             initAudioSystem();
@@ -7400,7 +10299,9 @@ function saveAMXPanelGeometry(panel) {
             !STATE.audio.context ||
             !STATE.audio.source ||
             !STATE.audio.analyserLeft ||
-            !STATE.audio.analyserRight
+            !STATE.audio.analyserRight ||
+            !STATE.audio.analyserEqualizerLeft ||
+            !STATE.audio.analyserEqualizerRight
           ) {
             stopRenderingLoop();
             resetAudioState();

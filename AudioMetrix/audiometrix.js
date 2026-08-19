@@ -1,12 +1,26 @@
+/*
+ * AudioMetrix v5.1
+ * FM-DX Webserver audio metering / visualization plugin
+ *
+ * v5.1 highlights:
+ * - Phase 2 core audit and lifecycle cleanup
+ * - Float32 RMS / sample-peak precision
+ * - MAX L/R + CLIP admin diagnostics
+ * - Optimized EQ / Hybrid analysis cadence with smooth 60 Hz visuals
+ * - RMS+PEAK naming for Audio (A) meter
+ * - Stereo Oscilloscope with Lines, Filled, Dots, Steps,
+ *   Persistence, Carrier / Envelope and Spindle visual styles
+ */
+
 (() => {
   // ─────────────────────────────────────────────────────────
-  // AUDIO METRIX 5.0.0 — RELEASE
+  // AUDIO METRIX 5.1.0 — RELEASE
   // THEME ENGINE • SETTINGS UI • RENDER ENGINE • AUDIO ENGINE
   // ─────────────────────────────────────────────────────────
 
   // PLUGIN METADATA
   const AMX_PLUGIN_NAME        = "AudioMetrix";
-  const AMX_VERSION            = "5.0";
+  const AMX_VERSION            = "5.1";
   const AMX_CHECK_FOR_UPDATES  = true;
   const AMX_UPDATE_URL         =
     "https://raw.githubusercontent.com/MCelliotG/Audiometrix-plugin-for-FMDX-Webservers/main/AudioMetrix/audiometrix.js";
@@ -68,6 +82,7 @@
     Q: null,
     A: null,
     EQ: null,
+    Scope: null,
     Stream: null
   };
 
@@ -113,6 +128,7 @@
   const STORAGE_RENDER        = "AMX_RENDER_MODE";
   const STORAGE_HYBRID_MODE   = "AMX_HYBRID_MODE";
   const STORAGE_EQ_RENDER     = "AMX_EQ_RENDER_MODE";
+  const STORAGE_SCOPE_STYLE   = "AMX_OSCILLOSCOPE_STYLE";
   const STORAGE_ATTACK        = "AMX_ATTACK_SPEED";
   const STORAGE_RELEASE       = "AMX_RELEASE_SPEED";
   const STORAGE_PEAK_HOLD     = "AMX_PEAK_HOLD_MS";
@@ -120,6 +136,26 @@
   const STORAGE_PANEL_TOP     = "AMX_PANEL_TOP";
   const STORAGE_PANEL_WIDTH   = "AMX_PANEL_WIDTH";
   const STORAGE_PANEL_HEIGHT  = "AMX_PANEL_HEIGHT";
+  const STORAGE_DIAGNOSTICS   = "AMX_ADMIN_DIAGNOSTICS";
+
+  const AMX_RUNTIME = {
+    destroyed: false,
+    pageVisible: document.visibilityState !== "hidden",
+    autoRebindTimer: null,
+    autoRebindState: "startup",
+    autoRebindLastCheck: 0,
+    diagnosticsTimer: null,
+    diagnosticsEl: null,
+    visibilityHandler: null,
+    themeObserver: null,
+    skinObserver: null,
+    skinObserverRaf: 0,
+    contentResizeObserver: null,
+    barsResizeRaf: null,
+    windowHandlers: [],
+    pendingTimeouts: new Set(),
+    initRetryTimer: null
+  };
   const MIRRORED_LAYOUTS = ["lr", "sa", "full"];
   const EQ_CENTER_FREQUENCIES = [
     30, 50, 80, 125, 200, 315, 500, 800,
@@ -139,6 +175,11 @@
   ];
   const EQ_SENSITIVITY = 0.8;
   const EQ_HYSTERESIS = 0.006;
+
+  // Raw sample-peak monitoring. This is deliberately independent from
+  // meter smoothing, user dB gain and visual calibration.
+  const SAMPLE_CLIP_THRESHOLD = 0.985; // ≈ -0.13 dBFS
+  const SAMPLE_CLIP_HOLD_MS = 1500;
   const EQ_LABEL_ANCHORS = [
     { index: 0, text: "30" },
     { index: 3, text: "125" },
@@ -198,6 +239,21 @@
 
   function getGaugeCenterFractions(layout) {
     return getGaugeGeometry(layout).centers;
+  }
+
+  function getGaugeHorizontalInset(layout) {
+    // Full Gauges uses the nearly edge-to-edge canvas introduced for
+    // 305px mobile clearance. Two-gauge layouts retain the original inset.
+    return layout === "full" ? 1 : 5;
+  }
+
+  function syncGaugeOverlayGeometry(layout) {
+    const overlay = STATE.dom.gaugeOverlay;
+    if (!overlay) return;
+
+    const inset = getGaugeHorizontalInset(layout);
+    overlay.style.left = inset + "px";
+    overlay.style.right = inset + "px";
   }
 
   function applyGaugeNumericGeometry(layout) {
@@ -474,7 +530,7 @@
   // PART 1 — THEME ENGINE • SETTINGS UI • CONFIG • STATE
   // ─────────────────────────────────────────────────────
 
-  // External peak
+  // External peak — unified PLAY/floor visibility across all render modes
   function drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW, gauge, barPeakWidth, barPeakStep) {
     // GLOBAL TOGGLE
     if (!CONFIG.display.showPeaks) return;
@@ -496,8 +552,9 @@
       ? `g:${tx}:${ty}:${Math.round((gauge.cx || 0) * 10)}:${Math.round((gauge.cy || 0) * 10)}:${Math.round((gauge.r || 0) * 10)}:${Math.round((gauge.startAngle || 0) * 1000)}:${Math.round((gauge.sweepAngle || 0) * 1000)}`
       : `b:${tx}:${ty}:${Math.round(y)}:${Math.round(effectiveW)}`;
 
-    // Once both the live value and the held value reach the visual floor,
-    // remove the physics state and stop drawing the indicator altogether.
+    // Visual-floor state is NOT a hide condition while transport is playing.
+    // Peak indicators must remain visible and settle at the beginning/bottom
+    // of their scale even when both live and held values reach 0 / min dB.
     const atVisualFloor = gauge
       ? (
           Math.abs(gauge.normLevel || 0) <= 0.001 &&
@@ -507,11 +564,6 @@
           Math.abs(levelX || 0) <= 0.5 &&
           Math.abs(peakX || 0) <= 0.5
         );
-
-    if (atVisualFloor) {
-      delete bucket[stateKey];
-      return;
-    }
 
     // Same visibility rule as readouts
     const hasStreamObject = STATE.hasStreamObject === true;
@@ -545,7 +597,9 @@
       const fillX = Math.max(0, Math.min(levelX, barW));
       const peakBarX = Math.max(0, Math.min(peakX, barW));
 
-      base = Math.min(barW - 2, fillX + 1);
+      base = atVisualFloor
+        ? 0
+        : Math.min(barW - 2, fillX + 1);
       min  = base;
       max  = barW + PEAK_THROW_PX;
 
@@ -565,10 +619,12 @@
         gauge.startAngle + gauge.normLevel * gauge.sweepAngle;
 
       const angleEps = gauge.sweepAngle * 0.015;
-      base = Math.min(
-        gauge.startAngle + gauge.sweepAngle,
-        fillAngle + angleEps
-      );
+      base = atVisualFloor
+        ? gauge.startAngle
+        : Math.min(
+            gauge.startAngle + gauge.sweepAngle,
+            fillAngle + angleEps
+          );
 
       min = base;
       max = gauge.startAngle + gauge.sweepAngle;
@@ -711,7 +767,7 @@
     // 6) Build gradient
     const grad = tctx.createLinearGradient(0, 0, width, 0);
 
-    // ===== AUDIO PEAK =====
+    // ===== RMS+PEAK (A) =====
     if (mode === 1) {
       grad.addColorStop(0.00, low);
       grad.addColorStop(mid_pos, mid);
@@ -1394,7 +1450,7 @@
   }
 
   try {
-    new MutationObserver(() => {
+    AMX_RUNTIME.themeObserver = new MutationObserver(() => {
       try {
         refreshAutomaticTheme();
 
@@ -1404,7 +1460,8 @@
           e
         );
       }
-    }).observe(document.body, {
+    });
+    AMX_RUNTIME.themeObserver.observe(document.body, {
       attributes: true,
       subtree: true,
       attributeFilter: ["class", "style"]
@@ -1438,10 +1495,15 @@
     display: {
       glowIntensity: loadLSBool(STORAGE_GLOW_ENABLED, false) ? 1 : 0,
       barStyle: loadLSEnum(STORAGE_BARSTYLE, "simple", VALID_STYLES),
-      layoutMode: loadLSEnum(STORAGE_LAYOUT, "lr", ["lr", "sa", "full", "equalizer", "vuHybrid"]),
+      layoutMode: loadLSEnum(STORAGE_LAYOUT, "lr", ["lr", "sa", "full", "equalizer", "vuHybrid", "oscilloscope"]),
       renderMode: loadLSEnum(STORAGE_RENDER, "bars", ["bars", "gauges", "mirrored", "analogVu"]),
       hybridMode: loadLSEnum(STORAGE_HYBRID_MODE, "stereo12", HYBRID_MODES),
       equalizerRenderMode: loadLSEnum(STORAGE_EQ_RENDER, "bars", ["bars", "spectrum"]),
+      oscilloscopeStyle: loadLSEnum(
+        STORAGE_SCOPE_STYLE,
+        "lines",
+        ["lines", "filled", "dots", "steps", "persistence", "envelope", "spindle"]
+      ),
       showPeaks: loadLSBool(STORAGE_SHOW_PEAKS, false),
       showReadouts: loadLSBool(STORAGE_SHOW_READOUTS, false),
       dimensions: {
@@ -1450,7 +1512,7 @@
         labelLeft: 5,
         canvasLeft: 25,
         borderRadius: "20px",
-        minTileWidth: 335,
+        minTileWidth: 350,
         tileWidthPercent: 32.9
       },
       defaultTitle: "STEREO LEVELS"
@@ -1470,6 +1532,10 @@
       analyserEqualizerLeft: null,
       analyserEqualizerRight: null,
       analyserPeak: null,
+      midSideGainLToM: null,
+      midSideGainRToM: null,
+      midSideGainLToS: null,
+      midSideGainRToS: null,
       bassFilter: null,
       highPassFilter: null,
       lowPassFilter: null,
@@ -1487,6 +1553,26 @@
       min: 1,
       max: 4,
       lastEnergy: 0
+    },
+
+    // EQ/Hybrid stays visually updated at 60Hz. Only the expensive
+    // 4096-point spectrum snapshot is sampled at a lower cadence.
+    spectrumCadence: {
+      frame: 0,
+      interval: 2
+    },
+
+    oscilloscope: {
+      peakHistoryLeft: [],
+      peakHistoryRight: [],
+      peakDisplayLeft: 0,
+      peakDisplayRight: 0,
+      peakHoldUntilLeft: 0,
+      peakHoldUntilRight: 0,
+      persistenceLeft: [],
+      persistenceRight: [],
+      persistenceFrame: 0,
+      lastTs: 0
     },
 
     levels: {
@@ -1509,6 +1595,7 @@
       },
       equalizer: {
         values: new Array(EQ_BAND_COUNT).fill(0),
+        targetValues: new Array(EQ_BAND_COUNT).fill(0),
         peaks: new Array(EQ_BAND_COUNT).fill(0),
         dbValues: new Array(EQ_BAND_COUNT).fill(-100),
         peakHoldUntil: new Array(EQ_BAND_COUNT).fill(0),
@@ -1516,6 +1603,7 @@
       },
       hybridStereo12: {
         values: new Array(HYBRID_STEREO_12_FREQUENCIES.length).fill(0),
+        targetValues: new Array(HYBRID_STEREO_12_FREQUENCIES.length).fill(0),
         peaks: new Array(HYBRID_STEREO_12_FREQUENCIES.length).fill(0),
         dbValues: new Array(HYBRID_STEREO_12_FREQUENCIES.length).fill(-100),
         peakHoldUntil: new Array(HYBRID_STEREO_12_FREQUENCIES.length).fill(0),
@@ -1523,6 +1611,7 @@
       },
       hybridAudio10: {
         values: new Array(HYBRID_AUDIO_10_FREQUENCIES.length).fill(0),
+        targetValues: new Array(HYBRID_AUDIO_10_FREQUENCIES.length).fill(0),
         peaks: new Array(HYBRID_AUDIO_10_FREQUENCIES.length).fill(0),
         dbValues: new Array(HYBRID_AUDIO_10_FREQUENCIES.length).fill(-100),
         peakHoldUntil: new Array(HYBRID_AUDIO_10_FREQUENCIES.length).fill(0),
@@ -1569,6 +1658,30 @@
       quality: 0
     },
 
+    monitoring: {
+      maxSamplePeak: {
+        left: 0,
+        right: 0
+      },
+      maxSamplePeakDb: {
+        left: -120,
+        right: -120
+      },
+      clipUntil: {
+        left: 0,
+        right: 0
+      },
+      clipped: {
+        left: false,
+        right: false
+      },
+      clipCount: {
+        left: 0,
+        right: 0
+      },
+      lastResetTs: 0
+    },
+
     meta: {
       updateAvailable: false,
       remoteVersion: null
@@ -1613,6 +1726,179 @@
       safeLSSet(STORAGE_ENABLE, cb.checked ? "true" : "false");
       window.location.reload();
     });
+  }
+
+
+  function isAdminDiagnosticsEnabled() {
+    return safeLSGet(STORAGE_DIAGNOSTICS) === "true";
+  }
+
+  function isFMdxAdmin() {
+    // FM-DX renders this quick dashboard only for authenticated admins.
+    // Using a server-rendered admin-only DOM marker avoids exposing the
+    // diagnostics control to ordinary users.
+    return !!document.querySelector(".admin-quick-dashboard");
+  }
+
+
+  function ensureDiagnosticsOverlay() {
+    if (!isFMdxAdmin() || !isAdminDiagnosticsEnabled()) {
+      if (AMX_RUNTIME.diagnosticsEl) {
+        AMX_RUNTIME.diagnosticsEl.remove();
+        AMX_RUNTIME.diagnosticsEl = null;
+      }
+      return null;
+    }
+
+    if (AMX_RUNTIME.diagnosticsEl?.isConnected) {
+      return AMX_RUNTIME.diagnosticsEl;
+    }
+
+    const el = document.createElement("div");
+    el.id = "amx-admin-diagnostics";
+
+    // Use explicit inline properties instead of a cssText block. Some FM-DX
+    // theme/plugin rules can override generic DIV sizing/display properties;
+    // explicit dimensions also prevent the overlay collapsing into a dot.
+    Object.assign(el.style, {
+      position: "fixed",
+      display: "block",
+      boxSizing: "border-box",
+      right: "12px",
+      bottom: "12px",
+      zIndex: "2147483000",
+      width: "390px",
+      minWidth: "300px",
+      maxWidth: "calc(100vw - 24px)",
+      minHeight: "112px",
+      height: "auto",
+      padding: "10px 12px",
+      margin: "0",
+      borderRadius: "10px",
+      background: "rgba(8, 10, 12, 0.78)",
+      backdropFilter: "blur(14px) saturate(135%)",
+      WebkitBackdropFilter: "blur(14px) saturate(135%)",
+      border: "1px solid rgba(255,255,255,.18)",
+      boxShadow: "0 8px 28px rgba(0,0,0,.35)",
+      color: "#eeeeee",
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+      fontSize: "11px",
+      fontWeight: "400",
+      lineHeight: "1.45",
+      textAlign: "left",
+      whiteSpace: "pre-wrap",
+      overflow: "visible",
+      opacity: "1",
+      visibility: "visible",
+      pointerEvents: "none",
+      transform: "none"
+    });
+    el.textContent =
+      "AudioMetrix — ADMIN DIAGNOSTICS\n" +
+      "Initializing runtime data…";
+
+    document.body.appendChild(el);
+    AMX_RUNTIME.diagnosticsEl = el;
+    return el;
+  }
+
+  function updateDiagnosticsOverlay() {
+    const el = ensureDiagnosticsOverlay();
+    if (!el) return;
+
+    try {
+      const ctx = STATE.audio?.context || null;
+      const canvas =
+        STATE.dom?.canvasNormal ||
+        STATE.dom?.canvasBars ||
+        STATE.dom?.canvasGauges ||
+        null;
+
+      // Do not depend on the locally-scoped isAudioTransportPlaying()
+      // helper. FM-DX's transport icon is authoritative and globally visible.
+      const transportIcon = document.querySelector(".playbutton .fa-solid");
+      const transport = transportIcon
+        ? (transportIcon.classList.contains("fa-stop") ? "PLAY" : "STOP")
+        : "unknown";
+
+      let logicalW = 0;
+      let logicalH = 0;
+      if (canvas) {
+        logicalW =
+          Number(canvas._amxLogicalWidth) ||
+          Math.round(canvas.getBoundingClientRect?.().width || 0);
+        logicalH =
+          Number(canvas._amxLogicalHeight) ||
+          Math.round(canvas.getBoundingClientRect?.().height || 0);
+      }
+
+      const dpr = Math.max(
+        1,
+        Math.min(Number(window.devicePixelRatio) || 1, 2)
+      );
+
+      let renderState = "unknown";
+      try {
+        renderState =
+          typeof RENDER_GATE !== "undefined" &&
+          RENDER_GATE?.rafId != null
+            ? "active"
+            : "paused";
+      } catch (_) {}
+
+      const lastRebind = AMX_RUNTIME.autoRebindLastCheck
+        ? Math.round(
+            (Date.now() - AMX_RUNTIME.autoRebindLastCheck) / 1000
+          ) + "s ago"
+        : "-";
+
+      const formatMonitorDb = (value) =>
+        Number.isFinite(value) && value > -119
+          ? value.toFixed(1)
+          : "-∞";
+
+      const getMonitorClipLabel = (channel) => {
+        const m = STATE.monitoring;
+        if (!m) return "-";
+        const active = performance.now() < (m.clipUntil?.[channel] || 0);
+        const count = m.clipCount?.[channel] || 0;
+        return active ? `CLIP(${count})` : (count ? `mem(${count})` : "OK");
+      };
+
+      el.textContent =
+        `AudioMetrix ${AMX_VERSION} — ADMIN DIAGNOSTICS\n` +
+        `Page: ${document.visibilityState} | Render: ${renderState} | Transport: ${transport}\n` +
+        `AudioContext: ${ctx?.state || "none"} @ ${ctx?.sampleRate || "-"} Hz\n` +
+        `Source: ${STATE.audio?.sourceLabel || STATE.audio?.sourceMode || "none"}\n` +
+        `MAX L/R: ${formatMonitorDb(STATE.monitoring?.maxSamplePeakDb?.left)} / ${formatMonitorDb(STATE.monitoring?.maxSamplePeakDb?.right)} dBFS | ` +
+        `CLIP: ${getMonitorClipLabel("left")} / ${getMonitorClipLabel("right")}\n` +
+        `Rebind: ${AMX_RUNTIME.autoRebindState || "unknown"} | last ${lastRebind}\n` +
+        `Layout: ${CONFIG.display?.layoutMode || "-"} | RenderMode: ${CONFIG.display?.renderMode || "-"}\n` +
+        `Canvas: ${Math.round(logicalW)}×${Math.round(logicalH)} | DPR ${dpr.toFixed(2)} | FPS gate ${
+          ["equalizer", "vuHybrid", "oscilloscope"].includes(CONFIG.display?.layoutMode) ? 60 : 30
+        }`;
+
+      el.style.borderColor = "rgba(255,255,255,.18)";
+    } catch (err) {
+      // Diagnostics must diagnose failures, never become one.
+      el.textContent =
+        `AudioMetrix ${AMX_VERSION} — ADMIN DIAGNOSTICS\n` +
+        `Diagnostics update error: ${err?.message || String(err)}\n` +
+        `Page: ${document.visibilityState}\n` +
+        `AudioContext: ${STATE.audio?.context?.state || "none"}\n` +
+        `Source: ${STATE.audio?.sourceMode || "none"}`;
+      el.style.borderColor = "rgba(255,120,120,.55)";
+
+      if (AMX_DEBUG) {
+        console.warn("[AudioMetrix] diagnostics update failed:", err);
+      }
+    }
+  }
+
+  function startDiagnosticsLoop() {
+    if (AMX_RUNTIME.diagnosticsTimer) clearInterval(AMX_RUNTIME.diagnosticsTimer);
+    updateDiagnosticsOverlay();
+    AMX_RUNTIME.diagnosticsTimer = setInterval(updateDiagnosticsOverlay, 750);
   }
 
   // STEREO SOFT MESSAGE CSS
@@ -1718,6 +2004,338 @@
     document.addEventListener("keydown", onKey);
   }
 
+  // ================================================================
+  // FLOATING SETTINGS PANEL MODULE
+  // All panel geometry, styling, scrolling, drag/resize and UI code
+  // is intentionally kept together in this section.
+  // ================================================================
+
+  function injectAMXPanelStyles() {
+    if (!document.getElementById("amx-sliders-css")) {
+      const css = document.createElement("style");
+      css.id = "amx-sliders-css";
+      css.textContent = `
+        #peak-hold-slider,
+        #attack-slider,
+        #release-slider,
+        #gain-slider {
+          -webkit-appearance: none !important;
+          appearance: none !important;
+          height: 22px !important;
+          border-radius: 22px !important;
+          background: var(--color-1) !important;
+          border: 2px solid var(--color-3) !important;
+          cursor: pointer !important;
+          outline: none !important;
+        }
+
+        #peak-hold-slider,
+        #attack-slider,
+        #release-slider,
+        #gain-slider {
+          width: 40% !important;
+          min-width: 115px !important;
+        }
+
+        #peak-hold-slider::-webkit-slider-thumb,
+        #attack-slider::-webkit-slider-thumb,
+        #release-slider::-webkit-slider-thumb,
+        #gain-slider::-webkit-slider-thumb {
+          -webkit-appearance: none !important;
+          width: 20px !important;
+          height: 20px !important;
+          border-radius: 50% !important;
+          background: var(--color-5) !important;
+          cursor: pointer !important;
+        }
+
+        #peak-hold-slider::-moz-range-thumb,
+        #attack-slider::-moz-range-thumb,
+        #release-slider::-moz-range-thumb,
+        #gain-slider::-moz-range-thumb {
+          width: 20px !important;
+          height: 20px !important;
+          border-radius: 50% !important;
+          background: var(--color-5) !important;
+          cursor: pointer !important;
+        }
+
+        #peak-hold-slider::-webkit-slider-runnable-track,
+        #attack-slider::-webkit-slider-runnable-track,
+        #release-slider::-webkit-slider-runnable-track,
+        #gain-slider::-webkit-slider-runnable-track,
+        #peak-hold-slider::-moz-range-track,
+        #attack-slider::-moz-range-track,
+        #release-slider::-moz-range-track,
+        #gain-slider::-moz-range-track {
+          height: 22px !important;
+          border-radius: 22px !important;
+          background: var(--color-1) !important;
+          border: 2px solid var(--color-3) !important;
+        }
+
+        .audio-row {
+          display: flex;
+          align-items: center;
+          gap: 4px !important;
+          margin-top: 4px;
+        }
+
+        .audio-row span.text-small:first-child {
+          min-width: 80px !important;
+          text-align: left;
+        }
+
+        .audio-row span.text-small:last-child {
+          min-width: 35px !important;
+          text-align: right;
+        }
+
+        .amx-settings-section {
+          width: 100%;
+          box-sizing: border-box;
+          margin: 6px 0 3px 0;
+          padding: 0 2px;
+          clear: both;
+          display: block;
+          flex: 0 0 100%;
+        }
+
+        .amx-settings-section::after {
+          content: "";
+          display: block;
+          width: 100%;
+          height: 1px;
+          margin-top: 1px;
+          background: var(--color-3);
+          opacity: 0.9;
+        }
+
+        .amx-settings-section-title {
+          text-align: left;
+          font-size: 14px;
+          line-height: 1.15;
+          font-weight: 600;
+          letter-spacing: 0.65px;
+          color: var(--color-4);
+          text-transform: uppercase;
+          opacity: 0.96;
+        }
+
+
+        /* Compact selector selected-fields only.
+           FM-DX dropdown.css gives .dropdown a fixed 48px height and its
+           input height:100%, so both wrapper and input must be resized.
+           The .options dropdown menu itself is intentionally untouched. */
+        #amx-floating-panel .form-group > .dropdown {
+          height: 34px !important;
+          min-height: 34px !important;
+          box-sizing: border-box !important;
+          border-radius: 5px !important;
+        }
+
+        #amx-floating-panel .form-group > .dropdown > input.form-control,
+        #amx-floating-panel .form-group > .dropdown > input[type="text"][readonly] {
+          height: 34px !important;
+          min-height: 34px !important;
+          line-height: 24px !important;
+          padding: 4px 28px 4px 12px !important;
+          box-sizing: border-box !important;
+          border-radius: 5px !important;
+        }
+
+        #amx-floating-panel .form-group > .dropdown.opened > input {
+          border-radius: 5px 5px 0 0 !important;
+        }
+
+        #amx-floating-panel .form-group > .dropdown.opened.dropdown-up > input {
+          border-radius: 0 0 5px 5px !important;
+        }
+
+        /* Re-center the FM-DX dropdown arrow for the shorter field. */
+        #amx-floating-panel .form-group > .dropdown::before {
+          top: 50% !important;
+          transform: translateY(-50%) rotate(-45deg) !important;
+        }
+
+        #amx-floating-panel .form-group > .dropdown.opened::before {
+          top: 50% !important;
+          transform: translateY(-50%) rotate(-225deg) !important;
+        }
+
+        /* Keep the selector title aligned to its own line rather than
+           inheriting the old 48px control rhythm. */
+        #amx-floating-panel .form-group > label.form-label {
+          line-height: 1.15 !important;
+          min-height: 0 !important;
+          height: auto !important;
+          margin-top: 0 !important;
+          margin-bottom: 3px !important;
+        }
+
+        /* Compact vertical rhythm inside the floating settings panel. */
+        #amx-floating-panel .form-group {
+          margin-top: 2px !important;
+          margin-bottom: 2px !important;
+        }
+
+        #amx-floating-panel .selectgroup {
+          margin-top: 1px !important;
+          margin-bottom: 1px !important;
+        }
+
+        /* Use the Audio Response slider rhythm as the common vertical rhythm. */
+        #amx-floating-panel .audio-row {
+          margin-top: 2px !important;
+          margin-bottom: 2px !important;
+        }
+
+        #amx-floating-panel label.form-label {
+          margin-top: 2px !important;
+          margin-bottom: 2px !important;
+        }
+
+        #amx-floating-panel .form-group + .form-group {
+          margin-top: 2px !important;
+        }
+
+        #amx-floating-panel .amx-settings-section + .form-group,
+        #amx-floating-panel .amx-settings-section + .selectgroup {
+          margin-top: 2px !important;
+        }
+
+        #amx-admin-diagnostics-setting .switch {
+          transform: scale(0.62);
+          transform-origin: right center;
+          margin-right: -8px;
+        }
+
+        /* Compact only the real layout box of switch rows.
+           The switches themselves keep their original transform:scale(...)
+           and horizontal placement exactly as in the working version. */
+        #amx-floating-panel .form-group.amx-compact-row {
+          height: 22px !important;
+          min-height: 22px !important;
+          max-height: 22px !important;
+          margin-top: 0 !important;
+          margin-bottom: 3px !important;
+          padding-top: 0 !important;
+          padding-bottom: 0 !important;
+          overflow: visible !important;
+        }
+
+        #amx-floating-panel .form-group.amx-compact-row > div {
+          height: 22px !important;
+          min-height: 22px !important;
+          max-height: 22px !important;
+          margin-top: 0 !important;
+          margin-bottom: 0 !important;
+          padding-top: 0 !important;
+          padding-bottom: 0 !important;
+          overflow: visible !important;
+        }
+
+        #amx-floating-panel #amx-admin-diagnostics-setting {
+          margin-top: 8px !important;
+        }
+
+        /* Diagnostics has two text lines, so it must not inherit the
+           22px compact switch-row height used by Glow/Peaks/Readouts. */
+        #amx-floating-panel .form-group.amx-diagnostics-row {
+          height: auto !important;
+          min-height: 34px !important;
+          max-height: none !important;
+          margin-bottom: 2px !important;
+          padding-top: 0 !important;
+          padding-bottom: 0 !important;
+          overflow: visible !important;
+        }
+
+        #amx-floating-panel .form-group.amx-diagnostics-row > div {
+          height: auto !important;
+          min-height: 34px !important;
+          max-height: none !important;
+          margin: 0 !important;
+          padding: 0 !important;
+          overflow: visible !important;
+        }
+
+        /* Final vertical rhythm for regular settings rows.
+           Audio Response slider rows intentionally stay tighter. */
+        #amx-floating-panel .form-group,
+        #amx-floating-panel .selectgroup {
+          margin-top: 8px !important;
+          margin-bottom: 8px !important;
+        }
+
+        #amx-floating-panel .audio-row {
+          margin-top: 2px !important;
+          margin-bottom: 2px !important;
+        }
+
+        /* Glass scrollbar colored from the selected-field accent. */
+        #amx-floating-panel #amx-panel-content {
+          scrollbar-width: thin;
+          scrollbar-color:
+            color-mix(in srgb, var(--color-4) 72%, transparent)
+            rgba(255,255,255,.05);
+        }
+
+        #amx-floating-panel #amx-panel-content::-webkit-scrollbar {
+          width: 8px;
+        }
+
+        #amx-floating-panel #amx-panel-content::-webkit-scrollbar-track {
+          margin: 4px 0;
+          border-radius: 4px;
+          background: rgba(255,255,255,.04);
+          box-shadow: inset 0 0 4px rgba(0,0,0,.28);
+        }
+
+        #amx-floating-panel #amx-panel-content::-webkit-scrollbar-thumb {
+          min-height: 28px;
+          border-radius: 4px;
+          border: 1px solid
+            color-mix(in srgb, var(--color-4) 48%, rgba(255,255,255,.18));
+          background:
+            linear-gradient(
+              90deg,
+              color-mix(in srgb, var(--color-4) 54%, transparent),
+              color-mix(in srgb, var(--color-4) 90%, rgba(255,255,255,.16)),
+              color-mix(in srgb, var(--color-4) 54%, transparent)
+            );
+          box-shadow:
+            inset 0 1px 1px rgba(255,255,255,.26),
+            inset 0 -1px 2px rgba(0,0,0,.24),
+            0 0 6px color-mix(in srgb, var(--color-4) 16%, transparent);
+        }
+
+        #amx-floating-panel #amx-panel-content::-webkit-scrollbar-thumb:hover {
+          background:
+            linear-gradient(
+              90deg,
+              color-mix(in srgb, var(--color-4) 66%, transparent),
+              var(--color-4),
+              color-mix(in srgb, var(--color-4) 66%, transparent)
+            );
+        }
+
+        /* --------------------------------
+           BAR STYLE DISABLED (gauges)
+        -------------------------------- */
+        .form-group.is-disabled {
+          opacity: 0.35;
+          filter: grayscale(1);
+        }
+
+        .form-group.is-disabled .dropdown {
+          pointer-events: none;
+        }
+      `;
+      document.head.appendChild(css);
+    }
+  }
+
   function ensureAMXSettingsLayer() {
     let layer = document.getElementById("amx-settings-layer");
     if (layer) return layer;
@@ -1762,53 +2380,56 @@
     return layer;
   }
 
+function isAMXMobileViewport() {
+  return (window.innerWidth || document.documentElement.clientWidth || 0) <= 767;
+}
+
 function saveAMXPanelGeometry(panel) {
   if (!panel) return;
 
-  const left = parseInt(panel.style.left, 10);
-  const top = parseInt(panel.style.top, 10);
-  const width = parseInt(panel.style.width, 10);
-  const height =
-    parseInt(panel.style.height, 10) ||
-    parseInt(panel.style.maxHeight, 10);
+  const rect = panel.getBoundingClientRect();
+  const left = Math.round(rect.left);
+  const top = Math.round(rect.top);
+  const width = Math.round(rect.width);
+  const height = Math.round(rect.height);
 
-  if (!isNaN(left)) safeLSSet(STORAGE_PANEL_LEFT, left);
-  if (!isNaN(top)) safeLSSet(STORAGE_PANEL_TOP, top);
-  if (!isNaN(width)) safeLSSet(STORAGE_PANEL_WIDTH, width);
-  if (!isNaN(height)) safeLSSet(STORAGE_PANEL_HEIGHT, height);
+  if (Number.isFinite(left)) safeLSSet(STORAGE_PANEL_LEFT, left);
+  if (Number.isFinite(top)) safeLSSet(STORAGE_PANEL_TOP, top);
+  if (Number.isFinite(width)) safeLSSet(STORAGE_PANEL_WIDTH, width);
+  if (Number.isFinite(height)) safeLSSet(STORAGE_PANEL_HEIGHT, height);
 }
 
   function restoreAMXPanelGeometry(panel) {
     if (!panel) return false;
-  
+
+    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    const margin = isAMXMobileViewport() ? 8 : 0;
+
     const left = loadLSInt(STORAGE_PANEL_LEFT, NaN);
     const top = loadLSInt(STORAGE_PANEL_TOP, NaN);
     const width = loadLSInt(STORAGE_PANEL_WIDTH, NaN);
     const height = loadLSInt(STORAGE_PANEL_HEIGHT, NaN);
-  
+
     let restored = false;
-  
+    const maxW = Math.max(160, vw - margin * 2);
+    const minW = Math.min(290, maxW);
+
     if (!isNaN(width) && width > 0) {
-      panel.style.width = width + "px";
+      panel.style.width = Math.min(Math.max(minW, width), maxW) + "px";
       restored = true;
+    } else {
+      panel.style.width = minW + "px";
     }
-  
+
     if (!isNaN(height) && height > 0) {
-      panel.style.height = height + "px";
-      panel.style.maxHeight = height + "px";
-  
-      if (panel._amxContentArea) {
-        const topBarHeight = 36;
-        const paddingVertical = 24;
-        const contentMax = height - topBarHeight - paddingVertical;
-        if (contentMax > 80) {
-          panel._amxContentArea.style.maxHeight = contentMax + "px";
-        }
-      }
-  
+      const maxH = Math.max(140, vh - margin * 2);
+      panel.style.height = Math.min(Math.max(140, height), maxH) + "px";
       restored = true;
+    } else {
+      panel.style.height = "auto";
     }
-  
+
     if (!isNaN(left) && !isNaN(top)) {
       panel.style.left = left + "px";
       panel.style.top = top + "px";
@@ -1817,49 +2438,71 @@ function saveAMXPanelGeometry(panel) {
       panel._amxUserMoved = true;
       restored = true;
     }
-  
+
     if (!isNaN(width) || !isNaN(height)) {
       panel._amxUserResized = true;
     }
-  
+
     return restored;
   }
 
   function clampAMXPanelToViewport(panel) {
     if (!panel) return;
-  
+
     const vw = window.innerWidth || document.documentElement.clientWidth || 0;
     const vh = window.innerHeight || document.documentElement.clientHeight || 0;
-  
-    const rect = panel.getBoundingClientRect();
-  
-    let left = parseInt(panel.style.left, 10);
-    let top = parseInt(panel.style.top, 10);
-    let width = parseInt(panel.style.width, 10);
-    let height = parseInt(panel.style.height, 10) || rect.height;
-  
-    if (isNaN(width) || width <= 0) width = rect.width;
-    if (isNaN(height) || height <= 0) height = rect.height;
-  
-    const minVisible = 40;
-    const maxLeft = Math.max(0, vw - minVisible);
-    const maxTop = Math.max(0, vh - minVisible);
-  
-    if (isNaN(left)) left = rect.left;
-    if (isNaN(top)) top = rect.top;
-  
-    if (left + minVisible > vw) left = maxLeft;
-    if (top + minVisible > vh) top = maxTop;
-  
-    if (left < 0) left = 0;
-    if (top < 0) top = 0;
-  
-    panel.style.left = left + "px";
-    panel.style.top = top + "px";
+    const mobile = isAMXMobileViewport();
+    const margin = mobile ? 8 : 0;
+
+    let rect = panel.getBoundingClientRect();
+    let left = Number.isFinite(parseFloat(panel.style.left))
+      ? parseFloat(panel.style.left)
+      : rect.left;
+    let top = Number.isFinite(parseFloat(panel.style.top))
+      ? parseFloat(panel.style.top)
+      : rect.top;
+
+    if (mobile) {
+      const maxW = Math.max(160, vw - margin * 2);
+      const minW = Math.min(290, maxW);
+      let width = rect.width;
+
+      if (width < minW || width > maxW) {
+        width = Math.min(Math.max(width, minW), maxW);
+        panel.style.width = Math.round(width) + "px";
+        rect = panel.getBoundingClientRect();
+      }
+
+      const maxH = Math.max(140, vh - margin * 2);
+      let height = rect.height;
+
+      if (height > maxH) {
+        panel.style.height = Math.round(maxH) + "px";
+        height = maxH;
+      }
+
+      const maxLeft = Math.max(margin, vw - rect.width - margin);
+      const maxTop = Math.max(margin, vh - height - margin);
+
+      left = Math.min(Math.max(left, margin), maxLeft);
+      top = Math.min(Math.max(top, margin), maxTop);
+    } else {
+      const minVisible = 40;
+      const maxLeft = Math.max(0, vw - minVisible);
+      const maxTop = Math.max(0, vh - minVisible);
+
+      if (left + minVisible > vw) left = maxLeft;
+      if (top + minVisible > vh) top = maxTop;
+      if (left < 0) left = 0;
+      if (top < 0) top = 0;
+    }
+
+    panel.style.left = Math.round(left) + "px";
+    panel.style.top = Math.round(top) + "px";
     panel.style.right = "auto";
     panel.style.bottom = "auto";
-  
-    saveAMXPanelGeometry(panel);
+
+    updateAMXContentScrolling(panel);
   }
 
   function createAMXFloatingPanel() {
@@ -1870,6 +2513,9 @@ function saveAMXPanelGeometry(panel) {
     panel.style.position = "fixed";
     panel.style.zIndex = "100000";
     panel.style.display = "none";
+    panel.style.flexDirection = "column";
+    panel.style.boxSizing = "border-box";
+    panel.style.overflow = "hidden";
     panel.style.pointerEvents = "auto";
 
     // Touch & selection safety (mobile + desktop)
@@ -1878,11 +2524,11 @@ function saveAMXPanelGeometry(panel) {
     panel.style.webkitUserSelect = "none";
 
     // Sizing
-    panel.style.width = "280px";
+    panel.style.width = "290px";
 
     // padding and appearance
     panel.style.padding = "12px";
-    panel.style.borderRadius = "14px";
+    panel.style.borderRadius = "10px";
 
     panel.style.background = "rgba(18, 20, 22, 0.72)";
     panel.style.backdropFilter = "blur(18px) saturate(140%)";
@@ -1970,14 +2616,16 @@ function saveAMXPanelGeometry(panel) {
       e.stopPropagation(); // important on mobile
 
       const willOpen = panel.style.display === "none";
-      panel.style.display = willOpen ? "block" : "none";
+      panel.style.display = willOpen ? "flex" : "none";
 
       if (willOpen) {
         const restored = restoreAMXPanelGeometry(panel);
+
         if (!restored) {
           positionAMXFloatingPanel(panel, container);
+          settleAMXPanelLayout(panel, true);
         } else {
-          clampAMXPanelToViewport(panel);
+          settleAMXPanelLayout(panel, true);
         }
       }
     };
@@ -2018,54 +2666,129 @@ function saveAMXPanelGeometry(panel) {
 
   // FLOATING SETTINGS PANEL — POSITION / DRAG / RESIZE / UI
   // ─────────────────────────────────────────────────────────
+  function updateAMXContentScrolling(panel) {
+    if (!panel || !panel._amxContentArea || panel.style.display === "none") return;
+
+    const content = panel._amxContentArea;
+    const topBar = panel._amxTopBar;
+
+    panel.style.display = "flex";
+    panel.style.flexDirection = "column";
+    panel.style.overflow = "hidden";
+
+    if (topBar) {
+      topBar.style.flex = "0 0 auto";
+      topBar.style.minHeight = "30px";
+    }
+
+    content.style.flex = "1 1 auto";
+    content.style.minHeight = "0";
+    content.style.maxHeight = "none";
+    content.style.overflowX = "hidden";
+    content.style.overflowY = "auto";
+    content.style.webkitOverflowScrolling = "touch";
+  }
+
+  function scheduleAMXContentScrollingUpdate(panel) {
+    requestAnimationFrame(() => updateAMXContentScrolling(panel));
+  }
+
+  function settleAMXPanelLayout(panel, saveAfter = false) {
+    if (!panel || panel.style.display === "none") return;
+
+    // Mobile browsers can report stale geometry immediately after
+    // orientation/restore. Two animation frames allow fonts, floats,
+    // viewport and flex sizing to settle before the final clamp/scroll pass.
+    requestAnimationFrame(() => {
+      clampAMXPanelToViewport(panel);
+      updateAMXContentScrolling(panel);
+
+      requestAnimationFrame(() => {
+        clampAMXPanelToViewport(panel);
+        updateAMXContentScrolling(panel);
+
+        // Never keep a scroll offset that is now beyond the real content.
+        const content = panel._amxContentArea;
+        if (content) {
+          const maxScroll = Math.max(
+            0,
+            content.scrollHeight - content.clientHeight
+          );
+          if (content.scrollTop > maxScroll) {
+            content.scrollTop = maxScroll;
+          }
+        }
+
+        if (saveAfter) {
+          saveAMXPanelGeometry(panel);
+        }
+      });
+    });
+  }
+
   function positionAMXFloatingPanel(panel, container) {
     if (!panel || !container) return;
 
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
+    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    const mobile = isAMXMobileViewport();
     const margin = 8;
 
-    const panelW = parseInt(panel.style.width, 10) || 320;
-    const tileRect = container.getBoundingClientRect();
-
-    const ps = document.getElementById("ps-container");
-    const psRect = ps ? ps.getBoundingClientRect() : null;
-    const anchorTop = psRect ? Math.round(psRect.top) : 12;
-
-    // reset
-    panel.style.top = "auto";
-    panel.style.left = "auto";
+    panel.style.display = "flex";
+    panel.style.flexDirection = "column";
+    panel.style.overflow = "hidden";
     panel.style.right = "auto";
     panel.style.bottom = "auto";
 
-    const isPortrait = vh > vw || vw < 520;
+    const maxW = Math.max(160, vw - margin * 2);
+    const minW = Math.min(290, maxW);
+    panel.style.minWidth = minW + "px";
+    panel.style.maxWidth = maxW + "px";
 
-    if (isPortrait) {
-      const top = Math.round(tileRect.bottom + margin);
-      const left = Math.max(margin, Math.round((vw - panelW) / 2));
+    let panelW = parseFloat(panel.style.width);
+    if (!Number.isFinite(panelW)) panelW = 290;
+    panelW = Math.min(Math.max(panelW, minW), maxW);
+    panel.style.width = Math.round(panelW) + "px";
+    panel.style.minHeight = "140px";
 
-      panel.style.top = top + "px";
-      panel.style.left = left + "px";
-      panel.style.maxHeight = Math.round(vh * 0.7) + "px";
-      panel.style.overflowY = "hidden";
-    } else {
-      let left = Math.round(tileRect.left - panelW - margin);
-      if (left < margin) left = margin;
+    const tileRect = container.getBoundingClientRect();
+    const ps = document.getElementById("ps-container");
+    const psRect = ps ? ps.getBoundingClientRect() : null;
+    const anchorTop = psRect ? Math.max(margin, Math.round(psRect.top)) : margin;
 
-      panel.style.top = anchorTop + "px";
-      panel.style.left = left + "px";
-      panel.style.maxHeight = Math.round(vh - anchorTop - margin) + "px";
-      panel.style.overflowY = "hidden";
+    let left = Math.round(tileRect.left - panelW - margin);
+    if (left < margin) {
+      left = mobile
+        ? Math.max(margin, Math.round((vw - panelW) / 2))
+        : margin;
+    }
+    if (left + panelW > vw - margin) {
+      left = Math.max(margin, vw - panelW - margin);
     }
 
-    // UPDATE INNER CONTENT HEIGHT (stable scroll)
-    if (panel._amxContentArea) {
-      const topBarHeight = 36;
-      const paddingVertical = 24;
-      const panelMax = parseInt(panel.style.maxHeight, 10);
+    panel.style.left = left + "px";
+    panel.style.top = anchorTop + "px";
 
-      const contentMax = panelMax - topBarHeight - paddingVertical;
-      panel._amxContentArea.style.maxHeight = contentMax + "px";
+    const availableH = Math.max(140, vh - anchorTop - margin);
+    panel.style.maxHeight = availableH + "px";
+
+    if (!panel._amxUserResized) {
+      panel.style.height = "auto";
+      requestAnimationFrame(() => {
+        const r = panel.getBoundingClientRect();
+        if (r.height > availableH) {
+          panel.style.height = availableH + "px";
+        }
+        clampAMXPanelToViewport(panel);
+        updateAMXContentScrolling(panel);
+      });
+    } else {
+      const currentH = parseFloat(panel.style.height);
+      if (Number.isFinite(currentH) && currentH > availableH) {
+        panel.style.height = availableH + "px";
+      }
+      clampAMXPanelToViewport(panel);
+      updateAMXContentScrolling(panel);
     }
   }
 
@@ -2078,13 +2801,17 @@ function saveAMXPanelGeometry(panel) {
     function requestReposition() {
       if (panel.style.display === "none") return;
 
-      // store user position and size
-      if (panel._amxUserMoved || panel._amxUserResized) return;
-
       if (!ticking) {
         ticking = true;
         requestAnimationFrame(function () {
-          positionAMXFloatingPanel(panel, container);
+          if (panel._amxUserMoved || panel._amxUserResized) {
+            clampAMXPanelToViewport(panel);
+            updateAMXContentScrolling(panel);
+            settleAMXPanelLayout(panel, true);
+          } else {
+            positionAMXFloatingPanel(panel, container);
+            settleAMXPanelLayout(panel, true);
+          }
           ticking = false;
         });
       }
@@ -2093,12 +2820,21 @@ function saveAMXPanelGeometry(panel) {
     window.addEventListener("scroll", requestReposition, { passive: true });
     window.addEventListener("resize", requestReposition);
     window.addEventListener("orientationchange", requestReposition);
+
+    AMX_RUNTIME.windowHandlers.push(
+      ["scroll", requestReposition, { passive: true }],
+      ["resize", requestReposition, undefined],
+      ["orientationchange", requestReposition, undefined]
+    );
   }
 
   function createPointerHandlers({ onMove, onUp }) {
     function getPoint(e) {
       if (e.touches && e.touches.length) {
         return e.touches[0];
+      }
+      if (e.changedTouches && e.changedTouches.length) {
+        return e.changedTouches[0];
       }
 
       return e;
@@ -2115,6 +2851,7 @@ function saveAMXPanelGeometry(panel) {
       document.removeEventListener("mouseup", upHandler);
       document.removeEventListener("touchmove", moveHandler);
       document.removeEventListener("touchend", upHandler);
+      document.removeEventListener("touchcancel", upHandler);
 
       if (typeof onUp === "function") {
         onUp(e, getPoint(e));
@@ -2126,6 +2863,7 @@ function saveAMXPanelGeometry(panel) {
       document.addEventListener("mouseup", upHandler);
       document.addEventListener("touchmove", moveHandler, { passive: false });
       document.addEventListener("touchend", upHandler);
+      document.addEventListener("touchcancel", upHandler);
     }
 
     return {
@@ -2173,14 +2911,22 @@ function saveAMXPanelGeometry(panel) {
         let newLeft = startLeft + dx;
         let newTop = startTop + dy;
   
+        const mobile = isAMXMobileViewport();
+        const viewportMargin = mobile ? 8 : 0;
         const minVisibleX = 80;
         const minVisibleY = 36;
-  
-        const minLeft = Math.min(0, vw - panelW);
-        const maxLeft = Math.max(0, vw - minVisibleX);
-  
-        const minTop = 0;
-        const maxTop = Math.max(0, vh - minVisibleY);
+
+        const minLeft = mobile
+          ? viewportMargin
+          : Math.min(0, vw - panelW);
+        const maxLeft = mobile
+          ? Math.max(viewportMargin, vw - panelW - viewportMargin)
+          : Math.max(0, vw - minVisibleX);
+
+        const minTop = mobile ? viewportMargin : 0;
+        const maxTop = mobile
+          ? Math.max(viewportMargin, vh - panelH - viewportMargin)
+          : Math.max(0, vh - minVisibleY);
   
         if (newLeft < minLeft) newLeft = minLeft;
         if (newLeft > maxLeft) newLeft = maxLeft;
@@ -2252,30 +2998,51 @@ function saveAMXPanelGeometry(panel) {
     if (!panel || panel._amxResizeEnabled) return;
     panel._amxResizeEnabled = true;
   
-    const corners = [
-      { dir: "nw", cursor: "nwse-resize" },
-      { dir: "ne", cursor: "nesw-resize" },
-      { dir: "sw", cursor: "nesw-resize" },
-      { dir: "se", cursor: "nwse-resize" }
+    const handles = [
+      { dir: "n",  cursor: "ns-resize",   type: "edge" },
+      { dir: "s",  cursor: "ns-resize",   type: "edge" },
+      { dir: "w",  cursor: "ew-resize",   type: "edge" },
+      { dir: "e",  cursor: "ew-resize",   type: "edge" },
+      { dir: "nw", cursor: "nwse-resize", type: "corner" },
+      { dir: "ne", cursor: "nesw-resize", type: "corner" },
+      { dir: "sw", cursor: "nesw-resize", type: "corner" },
+      { dir: "se", cursor: "nwse-resize", type: "corner" }
     ];
-  
-    corners.forEach(cfg => {
+
+    handles.forEach(cfg => {
       const grip = document.createElement("div");
       grip.className = "amx-resize-handle amx-resize-" + cfg.dir;
       grip.dataset.amxNoDrag = "1";
       grip.style.position = "absolute";
-      grip.style.width = "16px";
-      grip.style.height = "16px";
       grip.style.zIndex = "30";
       grip.style.cursor = cfg.cursor;
       grip.style.userSelect = "none";
       grip.style.touchAction = "none";
       grip.style.background = "transparent";
-  
+
+      // Keep resize hit-zones INSIDE the panel. Because the panel uses
+      // overflow:hidden, external hit-zones are clipped and hard to grab.
+      if (cfg.type === "corner") {
+        grip.style.width = "32px";
+        grip.style.height = "32px";
+      } else if (cfg.dir === "n" || cfg.dir === "s") {
+        grip.style.left = "24px";
+        grip.style.right = "24px";
+        grip.style.height = "18px";
+      } else {
+        grip.style.top = "24px";
+        grip.style.bottom = "24px";
+        grip.style.width = "18px";
+      }
+
       if (cfg.dir.includes("n")) grip.style.top = "0";
       if (cfg.dir.includes("s")) grip.style.bottom = "0";
       if (cfg.dir.includes("w")) grip.style.left = "0";
       if (cfg.dir.includes("e")) grip.style.right = "0";
+
+      grip.style.touchAction = "none";
+      grip.style.webkitUserSelect = "none";
+      grip.style.userSelect = "none";
   
       panel.appendChild(grip);
   
@@ -2298,8 +3065,8 @@ function saveAMXPanelGeometry(panel) {
           const vw = window.innerWidth || document.documentElement.clientWidth || 0;
           const vh = window.innerHeight || document.documentElement.clientHeight || 0;
   
-          const minW = 260;
-          const minH = 220;
+          const minW = 290;
+          const minH = 140;
   
           let newW = startW;
           let newH = startH;
@@ -2367,17 +3134,11 @@ function saveAMXPanelGeometry(panel) {
           panel.style.right = "auto";
           panel.style.bottom = "auto";
           panel.style.width = newW + "px";
-          panel.style.maxHeight = newH + "px";
           panel.style.height = newH + "px";
+          panel.style.minHeight = minH + "px";
+          panel.style.maxHeight = Math.max(minH, window.innerHeight - newTop - 8) + "px";
   
-          if (panel._amxContentArea) {
-            const topBarHeight = 36;
-            const paddingVertical = 24;
-            const contentMax = newH - topBarHeight - paddingVertical;
-            if (contentMax > 80) {
-              panel._amxContentArea.style.maxHeight = contentMax + "px";
-            }
-          }
+          scheduleAMXContentScrollingUpdate(panel);
   
           panel._amxUserMoved = true;
           panel._amxUserResized = true;
@@ -2433,6 +3194,7 @@ function saveAMXPanelGeometry(panel) {
       topBar.style.padding = "0 8px 0 10px";
       topBar.style.marginBottom = "6px";
       topBar.style.background = "transparent";
+      topBar.style.flex = "0 0 auto";
 
       const title = document.createElement("div");
       title.id = "amx-panel-title";
@@ -2489,8 +3251,13 @@ function saveAMXPanelGeometry(panel) {
       content.style.width = "100%";
       content.style.boxSizing = "border-box";
       content.style.padding = "4px 0 0 0";
+      content.style.display = "flow-root";
+      content.style.flex = "1 1 auto";
+      content.style.minHeight = "0";
       content.style.overflowY = "auto";
-      content.style.maxHeight = "200px";
+      content.style.overflowX = "hidden";
+      content.style.maxHeight = "none";
+      content.style.webkitOverflowScrolling = "touch";
 
       // UPDATE BANNER
       const updateBanner = document.createElement("div");
@@ -2519,107 +3286,23 @@ function saveAMXPanelGeometry(panel) {
       panel._amxContentArea = content;
       panel._amxTopBar = topBar;
 
+      if (typeof ResizeObserver === "function") {
+        const panelOverflowObserver = new ResizeObserver(() => {
+          if (panel.style.display !== "none") {
+            scheduleAMXContentScrollingUpdate(panel);
+          }
+        });
+        panelOverflowObserver.observe(panel);
+        panel._amxOverflowObserver = panelOverflowObserver;
+      }
+
       applyAMXUpdateBanner();
 
       // Enable dragging + resize
       enableAMXPanelDragging(panel, title);
       enableAMXPanelResize(panel);
 
-      // SHARED SLIDER CSS (inject ONCE)
-      if (!document.getElementById("amx-sliders-css")) {
-        const css = document.createElement("style");
-        css.id = "amx-sliders-css";
-        css.textContent = `
-          #peak-hold-slider,
-          #attack-slider,
-          #release-slider,
-          #gain-slider {
-            -webkit-appearance: none !important;
-            appearance: none !important;
-            height: 22px !important;
-            border-radius: 22px !important;
-            background: var(--color-1) !important;
-            border: 2px solid var(--color-3) !important;
-            cursor: pointer !important;
-            outline: none !important;
-          }
-
-          #peak-hold-slider,
-          #attack-slider,
-          #release-slider,
-          #gain-slider {
-            width: 40% !important;
-            min-width: 115px !important;
-          }
-
-          #peak-hold-slider::-webkit-slider-thumb,
-          #attack-slider::-webkit-slider-thumb,
-          #release-slider::-webkit-slider-thumb,
-          #gain-slider::-webkit-slider-thumb {
-            -webkit-appearance: none !important;
-            width: 20px !important;
-            height: 20px !important;
-            border-radius: 50% !important;
-            background: var(--color-5) !important;
-            cursor: pointer !important;
-          }
-
-          #peak-hold-slider::-moz-range-thumb,
-          #attack-slider::-moz-range-thumb,
-          #release-slider::-moz-range-thumb,
-          #gain-slider::-moz-range-thumb {
-            width: 20px !important;
-            height: 20px !important;
-            border-radius: 50% !important;
-            background: var(--color-5) !important;
-            cursor: pointer !important;
-          }
-
-          #peak-hold-slider::-webkit-slider-runnable-track,
-          #attack-slider::-webkit-slider-runnable-track,
-          #release-slider::-webkit-slider-runnable-track,
-          #gain-slider::-webkit-slider-runnable-track,
-          #peak-hold-slider::-moz-range-track,
-          #attack-slider::-moz-range-track,
-          #release-slider::-moz-range-track,
-          #gain-slider::-moz-range-track {
-            height: 22px !important;
-            border-radius: 22px !important;
-            background: var(--color-1) !important;
-            border: 2px solid var(--color-3) !important;
-          }
-
-          .audio-row {
-            display: flex;
-            align-items: center;
-            gap: 4px !important;
-            margin-top: 4px;
-          }
-
-          .audio-row span.text-small:first-child {
-            min-width: 80px !important;
-            text-align: left;
-          }
-
-          .audio-row span.text-small:last-child {
-            min-width: 35px !important;
-            text-align: right;
-          }
-
-          /* --------------------------------
-             BAR STYLE DISABLED (gauges)
-          -------------------------------- */
-          .form-group.is-disabled {
-            opacity: 0.35;
-            filter: grayscale(1);
-          }
-
-          .form-group.is-disabled .dropdown {
-            pointer-events: none;
-          }
-        `;
-        document.head.appendChild(css);
-      }
+      injectAMXPanelStyles();
 
       function bindDropdown(input, optionsSelector, onSelect) {
         if (!input) return;
@@ -2646,6 +3329,18 @@ function saveAMXPanelGeometry(panel) {
           opts.classList.remove("opened");
         };
       }
+
+      function appendSettingsSectionTitle(label) {
+        const title = document.createElement("div");
+        title.className = "amx-settings-section amx-settings-section-title";
+        title.dataset.amxNoDrag = "1";
+        title.textContent = label;
+        content.appendChild(title);
+        return title;
+      }
+
+      // THEMING
+      appendSettingsSectionTitle("THEMING");
 
       // THEME SELECTOR
       const themeDiv = document.createElement("div");
@@ -2703,6 +3398,7 @@ function saveAMXPanelGeometry(panel) {
       // BAR STYLE AVAILABILITY (renderMode dependent)
       function updateBarStyleAvailability() {
         const disabled =
+          CONFIG.display.layoutMode === "oscilloscope" ||
           (
             CONFIG.display.layoutMode === "equalizer" &&
             CONFIG.display.equalizerRenderMode === "spectrum"
@@ -2710,11 +3406,13 @@ function saveAMXPanelGeometry(panel) {
           (
             CONFIG.display.layoutMode !== "equalizer" &&
             CONFIG.display.layoutMode !== "vuHybrid" &&
+            CONFIG.display.layoutMode !== "oscilloscope" &&
             (
               CONFIG.display.renderMode === "gauges" ||
               CONFIG.display.renderMode === "analogVu"
             )
           );
+
         styleDiv.classList.toggle("is-disabled", disabled);
       }
 
@@ -2762,6 +3460,43 @@ function saveAMXPanelGeometry(panel) {
         requestRender();
       });
 
+      // GLOW ENABLE / DISABLE
+      {
+        const wrapper = document.createElement("div");
+        wrapper.className = "form-group amx-compact-row";
+        wrapper.innerHTML = `
+          <div style="display:flex; align-items:center;">
+            <label class="form-label">
+              <i class="fa-solid m-right-10"></i>ENABLE GLOW ON BARS
+            </label>
+            <div class="switch"
+                 style="display:flex;
+                        transform:scale(0.6);
+                        transform-origin:left center;
+                        margin-left:30px;">
+              <input type="checkbox" id="glow-toggle">
+              <label for="glow-toggle"></label>
+            </div>
+          </div>
+        `;
+
+        content.appendChild(wrapper);
+
+        const cb = wrapper.querySelector("#glow-toggle");
+        cb.checked = CONFIG.display.glowIntensity === 1;
+
+        cb.addEventListener("change", () => {
+          safeLSSet(STORAGE_GLOW_ENABLED, cb.checked ? "true" : "false");
+          CONFIG.display.glowIntensity = cb.checked ? 1 : 0;
+          invalidateVisualCaches();
+          requestRender();
+        });
+      }
+
+
+      // DISPLAY
+      appendSettingsSectionTitle("DISPLAY");
+
       // LAYOUT MODE SELECTOR
       const layoutDiv = document.createElement("div");
       layoutDiv.className = "form-group";
@@ -2771,10 +3506,11 @@ function saveAMXPanelGeometry(panel) {
           <input type="text" id="amx-layout-input" class="form-control" readonly>
           <div id="amx-layout-options" class="options">
             <div class="option" data-value="lr">Stereo levels</div>
-            <div class="option" data-value="sa">Stereo quality &amp; Audio peak</div>
+            <div class="option" data-value="sa">Stereo quality &amp; RMS+Peak</div>
             <div class="option" data-value="full">Audio levels (Full mode)</div>
             <div class="option" data-value="equalizer">Equalizer</div>
             <div class="option" data-value="vuHybrid">Vu Hybrid</div>
+            <div class="option" data-value="oscilloscope">Oscilloscope</div>
           </div>
         </div>
       `;
@@ -2784,13 +3520,14 @@ function saveAMXPanelGeometry(panel) {
       const savedLayout = CONFIG.display.layoutMode;
       layoutInput.value =
         savedLayout === "lr" ? "Stereo levels" :
-        savedLayout === "sa" ? "Stereo quality & Audio peak" :
+        savedLayout === "sa" ? "Stereo quality & RMS+Peak" :
         savedLayout === "full" ? "Audio levels (Full mode)" :
         savedLayout === "vuHybrid" ? "Vu Hybrid" :
+        savedLayout === "oscilloscope" ? "Oscilloscope" :
         "Equalizer";
 
       bindDropdown(layoutInput, "#amx-layout-options", (val) => {
-        if (!["lr", "sa", "full", "equalizer", "vuHybrid"].includes(val)) return;
+        if (!["lr", "sa", "full", "equalizer", "vuHybrid", "oscilloscope"].includes(val)) return;
         CONFIG.display.layoutMode = val;
         safeLSSet("AMX_LAYOUT_MODE", val);
 
@@ -2885,12 +3622,21 @@ function saveAMXPanelGeometry(panel) {
           return;
         }
 
+        if (CONFIG.display.layoutMode === "oscilloscope") {
+          if (!["lines", "filled", "dots", "steps", "persistence", "envelope", "spindle"].includes(val)) return;
+          CONFIG.display.oscilloscopeStyle = val;
+          safeLSSet(STORAGE_SCOPE_STYLE, val);
+          invalidateVisualCaches();
+          requestRender();
+          return;
+        }
+
         if (
           val === "mirrored" &&
           !MIRRORED_LAYOUTS.includes(CONFIG.display.layoutMode)
         ) {
           showAMXSoftMessage(
-            "Mirrored mode is only available with Stereo levels, Stereo quality & Audio peak, or Full mode.",
+            "Mirrored mode is only available with Stereo levels, Stereo quality & RMS+Peak, or Full mode.",
             "fa-triangle-exclamation"
           );
         
@@ -2939,6 +3685,28 @@ function saveAMXPanelGeometry(panel) {
           return;
         }
 
+        if (CONFIG.display.layoutMode === "oscilloscope") {
+          options.innerHTML = `
+            <div class="option" data-value="lines">Lines</div>
+            <div class="option" data-value="filled">Filled</div>
+            <div class="option" data-value="dots">Dots</div>
+            <div class="option" data-value="steps">Steps</div>
+            <div class="option" data-value="persistence">Persistence</div>
+            <div class="option" data-value="envelope">Carrier / Envelope</div>
+            <div class="option" data-value="spindle">Spindle</div>
+          `;
+
+          renderInput.value =
+            CONFIG.display.oscilloscopeStyle === "filled" ? "Filled" :
+            CONFIG.display.oscilloscopeStyle === "dots" ? "Dots" :
+            CONFIG.display.oscilloscopeStyle === "steps" ? "Steps" :
+            CONFIG.display.oscilloscopeStyle === "persistence" ? "Persistence" :
+            CONFIG.display.oscilloscopeStyle === "envelope" ? "Carrier / Envelope" :
+            CONFIG.display.oscilloscopeStyle === "spindle" ? "Spindle" :
+            "Lines";
+          return;
+        }
+
         options.innerHTML = `
           <div class="option" data-value="bars">Bars</div>
           <div class="option" data-value="mirrored">Mirrored</div>
@@ -2955,43 +3723,10 @@ function saveAMXPanelGeometry(panel) {
 
       syncRenderSelectorOptions();
 
-      // GLOW ENABLE / DISABLE
-      {
-        const wrapper = document.createElement("div");
-        wrapper.className = "form-group";
-        wrapper.innerHTML = `
-          <div style="display:flex; align-items:center;">
-            <label class="form-label">
-              <i class="fa-solid m-right-10"></i>ENABLE GLOW ON BARS
-            </label>
-            <div class="switch"
-                 style="display:flex;
-                        transform:scale(0.6);
-                        transform-origin:left center;
-                        margin-left:30px;">
-              <input type="checkbox" id="glow-toggle">
-              <label for="glow-toggle"></label>
-            </div>
-          </div>
-        `;
-
-        content.appendChild(wrapper);
-
-        const cb = wrapper.querySelector("#glow-toggle");
-        cb.checked = CONFIG.display.glowIntensity === 1;
-
-        cb.addEventListener("change", () => {
-          safeLSSet(STORAGE_GLOW_ENABLED, cb.checked ? "true" : "false");
-          CONFIG.display.glowIntensity = cb.checked ? 1 : 0;
-          invalidateVisualCaches();
-          requestRender();
-        });
-      }
-
       // SHOW PEAK INDICATOR
       {
         const wrapper = document.createElement("div");
-        wrapper.className = "form-group";
+        wrapper.className = "form-group amx-compact-row";
         wrapper.innerHTML = `
           <div style="display:flex; align-items:center;">
             <label class="form-label">
@@ -3028,7 +3763,7 @@ function saveAMXPanelGeometry(panel) {
 
       // SHOW REAL-TIME VALUES
       const readoutsDiv = document.createElement("div");
-      readoutsDiv.className = "form-group";
+      readoutsDiv.className = "form-group amx-compact-row";
       readoutsDiv.innerHTML = `
         <div style="display:flex; align-items:center;">
           <label class="form-label">
@@ -3059,12 +3794,13 @@ function saveAMXPanelGeometry(panel) {
         requestRender();
       });
 
+      // AUDIO RESPONSE
+      appendSettingsSectionTitle("AUDIO RESPONSE");
+
       // AUDIO RESPONSE PANEL
       const audioDiv = document.createElement("div");
       audioDiv.className = "form-group";
       audioDiv.innerHTML = `
-        <label class="form-label"><i class="fa-solid m-right-10"></i>AUDIO RESPONSE</label>
-
         <div class="audio-row">
           <span class="text-small">Peak hold (ms)</span>
           <input id="peak-hold-slider" type="range" min="50" max="2000" step="50" />
@@ -3090,6 +3826,60 @@ function saveAMXPanelGeometry(panel) {
         </div>
       `;
       content.appendChild(audioDiv);
+
+
+      // ADMIN-ONLY DIAGNOSTICS
+      // This section is not created at all for normal users.
+      if (isFMdxAdmin()) {
+        appendSettingsSectionTitle("DIAGNOSTICS");
+
+        const diagnosticsDiv = document.createElement("div");
+        diagnosticsDiv.className = "form-group amx-diagnostics-row";
+        diagnosticsDiv.id = "amx-admin-diagnostics-setting";
+        diagnosticsDiv.dataset.amxNoDrag = "1";
+
+        const diagnosticsRow = document.createElement("div");
+        diagnosticsRow.style.display = "flex";
+        diagnosticsRow.style.alignItems = "center";
+        diagnosticsRow.style.justifyContent = "space-between";
+        diagnosticsRow.style.gap = "10px";
+
+        const diagnosticsLabel = document.createElement("div");
+        diagnosticsLabel.innerHTML = `
+          <div class="text-small text-bold">ADMIN RUNTIME DATA</div>
+          <div class="text-small" style="opacity:.68; margin-top:2px;">
+            Audio / rendering information
+          </div>
+        `;
+
+        const diagnosticsSwitch = document.createElement("div");
+        diagnosticsSwitch.className = "switch";
+        diagnosticsSwitch.style.display = "flex";
+        diagnosticsSwitch.style.alignItems = "center";
+        diagnosticsSwitch.innerHTML = `
+          <input type="checkbox" id="amx-diagnostics-toggle">
+          <label for="amx-diagnostics-toggle"></label>
+        `;
+
+        diagnosticsRow.appendChild(diagnosticsLabel);
+        diagnosticsRow.appendChild(diagnosticsSwitch);
+        diagnosticsDiv.appendChild(diagnosticsRow);
+        content.appendChild(diagnosticsDiv);
+
+        const diagnosticsCb =
+          diagnosticsSwitch.querySelector("#amx-diagnostics-toggle");
+
+        diagnosticsCb.checked = isAdminDiagnosticsEnabled();
+        diagnosticsCb.addEventListener("change", () => {
+          safeLSSet(
+            STORAGE_DIAGNOSTICS,
+            diagnosticsCb.checked ? "true" : "false"
+          );
+
+          // Apply immediately; no page refresh required.
+          updateDiagnosticsOverlay();
+        });
+      }
 
       // PEAK HOLD
       const peakHoldSlider = document.getElementById("peak-hold-slider");
@@ -3208,6 +3998,10 @@ function saveAMXPanelGeometry(panel) {
     dirty: false
   };
 
+  // ================================================================
+  // END FLOATING SETTINGS PANEL MODULE
+  // ================================================================
+
   function requestRender() {
     RENDER_GATE.dirty = true;
 
@@ -3224,6 +4018,16 @@ function saveAMXPanelGeometry(panel) {
 
   function shouldRunAudio() {
     const c = STATE.audioCadence;
+    c.frame++;
+
+    if (c.frame < c.interval) return false;
+
+    c.frame = 0;
+    return true;
+  }
+
+  function shouldReadSpectrumSnapshot() {
+    const c = STATE.spectrumCadence;
     c.frame++;
 
     if (c.frame < c.interval) return false;
@@ -3646,12 +4450,13 @@ function saveAMXPanelGeometry(panel) {
       }
     }
 
-    // Gauge labels live in an overlay inset by 5px on both sides, whereas
-    // readouts are direct children of the full content wrapper. Convert the
-    // shared normalized centre to the equivalent wrapper coordinate exactly.
+    // Gauge labels live inside an inset overlay, while readouts are direct
+    // children of the full wrapper. Convert the same normalized gauge centre
+    // using the exact active overlay/canvas inset.
     function gaugeReadoutLeft(centerFraction) {
       const f = clamp01(centerFraction);
-      const insetCorrection = 5 - 10 * f;
+      const inset = getGaugeHorizontalInset(layout);
+      const insetCorrection = inset - (inset * 2) * f;
       const sign = insetCorrection < 0 ? "-" : "+";
       return `calc(${f * 100}% ${sign} ${Math.abs(insetCorrection)}px)`;
     }
@@ -3695,6 +4500,20 @@ function saveAMXPanelGeometry(panel) {
         showAt(rightBottomKey, xOut, yBottom, "translate(-100%, -70%)");
       }
 
+      return;
+    }
+
+    // OSCILLOSCOPE — L/R readouts aligned with the two enlarged lanes.
+    if (layout === "oscilloscope") {
+      const scopeHeight = 94;
+      const scopeGap = 6;
+      const scopeLaneH = (scopeHeight - scopeGap) / 2;
+      const scopeTopCenter = scopeLaneH * 0.58 - 2;
+      const scopeBottomCenter =
+        scopeLaneH + scopeGap + scopeLaneH * 0.58 - 2;
+
+      showAt("L", xOut, scopeTopCenter + "px", T);
+      showAt("R", xOut, scopeBottomCenter + "px", T);
       return;
     }
 
@@ -5328,8 +6147,7 @@ function saveAMXPanelGeometry(panel) {
   ) {
     if (
       !CONFIG.display.showPeaks ||
-      STATE.hasStreamObject !== true ||
-      Math.max(levelNorm, peakNorm) * Math.max(1, height) <= 0.5
+      STATE.hasStreamObject !== true
     ) return;
 
     const level = clamp(levelNorm, 0, 1);
@@ -5422,10 +6240,9 @@ function saveAMXPanelGeometry(panel) {
     const pixelNorm = 1 / Math.max(1, height);
     const live = clamp(levelNorm, 0, 1);
     const held = clamp(heldPeakNorm, 0, 1);
-    if (live <= 0.5 * pixelNorm && held <= 0.5 * pixelNorm) {
-      delete bucket[stateKey];
-      return 0;
-    }
+    const atVisualFloor =
+      live <= 0.5 * pixelNorm &&
+      held <= 0.5 * pixelNorm;
 
     const state = (
       bucket[stateKey] ??= {
@@ -5435,10 +6252,12 @@ function saveAMXPanelGeometry(panel) {
       }
     );
 
-    const base = Math.min(
-      1,
-      live + pixelNorm
-    );
+    const base = atVisualFloor
+      ? 0
+      : Math.min(
+          1,
+          live + pixelNorm
+        );
     const throwNorm = 8 * pixelNorm;
     const isNewPeak =
       held > state.lastPeak + 0.5 * pixelNorm;
@@ -6020,8 +6839,7 @@ function saveAMXPanelGeometry(panel) {
 
     if (
       CONFIG.display.showPeaks &&
-      STATE.hasStreamObject === true &&
-      eq.peaks.some(value => (value || 0) * plotH > 0.5)
+      STATE.hasStreamObject === true
     ) {
       const peakLine = new Path2D();
       peakLine.moveTo(pointX(0), levelY(eq.peaks[0]));
@@ -6374,12 +7192,783 @@ function saveAMXPanelGeometry(panel) {
   }
 
   // METERS RENDERER
+
+  // ─────────────────────────────────────────────────────────
+  // STEREO OSCILLOSCOPE — Float32 L/R waveform, no extra analyser
+  // ─────────────────────────────────────────────────────────
+  function findScopeTrigger(samples) {
+    if (!samples || samples.length < 8) return 0;
+
+    // Positive-going zero crossing in the first half stabilizes the waveform
+    // without adding DSP or a second time-domain buffer.
+    const limit = Math.max(2, Math.floor(samples.length * 0.5));
+    for (let i = 1; i < limit; i++) {
+      if (samples[i - 1] < 0 && samples[i] >= 0) {
+        return i;
+      }
+    }
+    return 0;
+  }
+
+  function createScopeThemeGradient(ctx, x, width) {
+    // Reuse the exact horizontal low→mid→high gradient engine of LR Bars.
+        return createBarsLinearGradient(ctx, width, 0);
+  }
+
+  function getScopeSmoothedSample(samples, index) {
+    if (!samples || !samples.length) return 0;
+
+    const i = Math.max(0, Math.min(samples.length - 1, index));
+    let sum = 0;
+    let count = 0;
+
+    // Small visual-only smoothing, keeping the trace uniform and fluid.
+    for (let k = -2; k <= 2; k++) {
+      const j = i + k;
+      if (j >= 0 && j < samples.length) {
+        sum += samples[j] || 0;
+        count++;
+      }
+    }
+
+    return Math.max(-1, Math.min(1, count ? sum / count : 0));
+  }
+
+  function getScopeGainLinear() {
+    return Math.pow(10, (CONFIG.audio.dbGain || 0) / 20);
+  }
+
+  function getScopeResponseScale(channel) {
+    const levels =
+      channel === "right"
+        ? STATE.levels.right
+        : STATE.levels.left;
+
+    const minDb = CONFIG.audio.minDb;
+    const maxDb = CONFIG.audio.maxDb;
+    const range = Math.max(1, maxDb - minDb);
+
+    const db = clamp(
+      Number.isFinite(levels.smoothDb) ? levels.smoothDb : minDb,
+      minDb,
+      maxDb
+    );
+
+    // The waveform still preserves its real shape, but its visible excursion
+    // follows the same smoothed level response as L/R Bars.
+    const normalized = Math.max(0, Math.min(1, (db - minDb) / range));
+    return 0.48 + normalized * 0.52;
+  }
+
+  function getScopeInstantPeak(samples) {
+    if (!samples || !samples.length) return 0;
+    const gain = getScopeGainLinear();
+    let peak = 0;
+
+    for (let i = 0; i < samples.length; i++) {
+      const v = Math.abs((samples[i] || 0) * gain);
+      if (v > peak) peak = v;
+    }
+
+    return Math.min(1.5, peak);
+  }
+
+  function updateScopePeakHistory(channel, samples, now, historyLength) {
+    const scope = STATE.oscilloscope;
+    if (!scope) return [];
+
+    const isRight = channel === "right";
+    const history = isRight
+      ? scope.peakHistoryRight
+      : scope.peakHistoryLeft;
+
+    const displayKey = isRight ? "peakDisplayRight" : "peakDisplayLeft";
+    const holdKey = isRight ? "peakHoldUntilRight" : "peakHoldUntilLeft";
+
+    const instantPeak = getScopeInstantPeak(samples);
+    let displayed = scope[displayKey] || 0;
+
+    const attack = Math.max(0.01, Math.min(1, CONFIG.audio.attackSpeed));
+    const release = Math.max(0.01, Math.min(1, CONFIG.audio.releaseSpeed));
+
+    if (instantPeak >= displayed) {
+      // Same attack idea as the bars: rise toward the new peak.
+      displayed += (instantPeak - displayed) * attack;
+      scope[holdKey] = now + CONFIG.audio.peakHoldMs;
+    } else if (now >= (scope[holdKey] || 0)) {
+      // After hold expires, release smoothly toward the live signal.
+      displayed += (instantPeak - displayed) * release;
+    }
+
+    if (displayed < 0.001) displayed = 0;
+    scope[displayKey] = displayed;
+
+    history.push(displayed);
+
+    const maxLen = Math.max(32, Math.floor(historyLength));
+    if (history.length > maxLen) {
+      history.splice(0, history.length - maxLen);
+    }
+
+    return history;
+  }
+
+  function getScopeWaveformPoints(
+    samples,
+    trigger,
+    x,
+    yCenter,
+    width,
+    amplitude,
+    channel
+  ) {
+    if (!samples || samples.length < 2 || width <= 1) return [];
+
+    const available = Math.max(2, samples.length - trigger);
+    const count = Math.min(samples.length, available);
+    const gain = getScopeGainLinear();
+    const responseScale = getScopeResponseScale(channel);
+    const points = new Array(count);
+
+    for (let i = 0; i < count; i++) {
+      const idx = trigger + i;
+      let sample = getScopeSmoothedSample(samples, idx);
+      sample *= gain * responseScale;
+      sample = Math.max(-1.15, Math.min(1.15, sample));
+
+      points[i] = {
+        x: x + (i / Math.max(1, count - 1)) * width,
+        y: yCenter - sample * amplitude
+      };
+    }
+
+    return points;
+  }
+
+  function buildScopeLinePath(ctx, points) {
+    if (!points || points.length < 2) return false;
+
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+
+    for (let i = 1; i < points.length; i++) {
+      ctx.lineTo(points[i].x, points[i].y);
+    }
+
+    return true;
+  }
+
+  function buildScopeStepPath(ctx, points) {
+    if (!points || points.length < 2) return false;
+
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+
+    for (let i = 1; i < points.length; i++) {
+      const prev = points[i - 1];
+      const cur = points[i];
+      const midX = (prev.x + cur.x) / 2;
+
+      ctx.lineTo(midX, prev.y);
+      ctx.lineTo(midX, cur.y);
+      ctx.lineTo(cur.x, cur.y);
+    }
+
+    return true;
+  }
+
+  function drawScopeGlowPasses(ctx, points, gradient, activeAlpha) {
+    if (CONFIG.display.glowIntensity <= 0) return;
+
+    const glow = Math.max(0, CONFIG.display.glowIntensity);
+
+    ctx.save();
+    ctx.strokeStyle = gradient;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.globalAlpha = activeAlpha * 0.18;
+    ctx.lineWidth = 8 + glow * 2.4;
+    ctx.filter = `blur(${3 + glow * 2.2}px)`;
+    if (buildScopeLinePath(ctx, points)) ctx.stroke();
+    ctx.restore();
+
+    ctx.save();
+    ctx.strokeStyle = gradient;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.globalAlpha = activeAlpha * 0.28;
+    ctx.lineWidth = 5.5 + glow * 1.15;
+    ctx.filter = `blur(${1.5 + glow * 0.95}px)`;
+    if (buildScopeLinePath(ctx, points)) ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawScopePersistence(ctx, points, gradient, activeAlpha, channel) {
+    const scope = STATE.oscilloscope;
+    const history = channel === "right" ? scope.persistenceRight : scope.persistenceLeft;
+
+    scope.persistenceFrame = (scope.persistenceFrame + 1) % 2;
+    if (scope.persistenceFrame === 0) {
+      const stride = Math.max(1, Math.floor(points.length / 180));
+      const snapshot = [];
+      for (let i = 0; i < points.length; i += stride) snapshot.push({ x: points[i].x, y: points[i].y });
+      history.push(snapshot);
+      if (history.length > 8) history.shift();
+    }
+
+    for (let h = 0; h < history.length; h++) {
+      const age = (h + 1) / history.length;
+      ctx.save();
+      ctx.strokeStyle = gradient;
+      ctx.lineWidth = 1.1 + age * 0.9;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.globalAlpha = activeAlpha * (0.08 + age * 0.22);
+      if (buildScopeLinePath(ctx, history[h])) ctx.stroke();
+      ctx.restore();
+    }
+
+    if (CONFIG.display.glowIntensity > 0) drawScopeGlowPasses(ctx, points, gradient, activeAlpha * 0.72);
+
+    ctx.save();
+    ctx.strokeStyle = gradient;
+    ctx.lineWidth = 2.3;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.globalAlpha = activeAlpha * 1.0;
+    if (buildScopeLinePath(ctx, points)) ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawScopeEnvelope(ctx, points, gradient, activeAlpha, yCenter) {
+    const bucketCount = Math.max(28, Math.min(72, Math.round(points.length / 6)));
+    const bucketSize = Math.max(1, Math.floor(points.length / bucketCount));
+    const upper = [];
+    const lower = [];
+
+    for (let b = 0; b < bucketCount; b++) {
+      const from = b * bucketSize;
+      const to = Math.min(points.length, from + bucketSize);
+      if (from >= points.length) break;
+
+      let maxDeviation = 0;
+      let px = points[from].x;
+      for (let i = from; i < to; i++) {
+        maxDeviation = Math.max(maxDeviation, Math.abs(points[i].y - yCenter));
+        px = points[i].x;
+      }
+      upper.push({ x: px, y: yCenter - maxDeviation });
+      lower.push({ x: px, y: yCenter + maxDeviation });
+    }
+
+    ctx.save();
+    ctx.strokeStyle = gradient;
+    ctx.lineWidth = 1.0;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.globalAlpha = activeAlpha * 0.78;
+    if (buildScopeLinePath(ctx, points)) ctx.stroke();
+    ctx.restore();
+
+    for (const trace of [upper, lower]) {
+      if (CONFIG.display.glowIntensity > 0) {
+        ctx.save();
+        ctx.strokeStyle = gradient;
+        ctx.lineWidth = 4.2;
+        ctx.globalAlpha = activeAlpha * 0.18;
+        ctx.filter = `blur(${1.5 + CONFIG.display.glowIntensity * 0.8}px)`;
+        if (buildScopeLinePath(ctx, trace)) ctx.stroke();
+        ctx.restore();
+      }
+      ctx.save();
+      ctx.strokeStyle = gradient;
+      ctx.lineWidth = 2.25;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.globalAlpha = activeAlpha * 0.98;
+      if (buildScopeLinePath(ctx, trace)) ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+
+  function drawScopeSpindle(ctx, points, gradient, activeAlpha, yCenter) {
+    if (!points || points.length < 8) return;
+
+    // Build a slow amplitude envelope from the real waveform.
+    // This produces the repeated fusiform / AM lobes seen on a real scope.
+    const bucketCount = Math.max(
+      34,
+      Math.min(86, Math.round(points.length / 5))
+    );
+    const bucketSize = Math.max(
+      1,
+      Math.floor(points.length / bucketCount)
+    );
+
+    const envelope = [];
+
+    for (let b = 0; b < bucketCount; b++) {
+      const from = b * bucketSize;
+      const to = Math.min(points.length, from + bucketSize);
+      if (from >= points.length) break;
+
+      let maxDeviation = 0;
+      let x = points[from].x;
+
+      for (let i = from; i < to; i++) {
+        const deviation = Math.abs(points[i].y - yCenter);
+        if (deviation > maxDeviation) {
+          maxDeviation = deviation;
+        }
+        x = points[i].x;
+      }
+
+      envelope.push({
+        x,
+        amp: maxDeviation
+      });
+    }
+
+    if (envelope.length < 3) return;
+
+    // Smooth envelope slightly so each lobe looks spindle-shaped rather
+    // than jagged, while still following the source audio.
+    const smoothEnvelope = envelope.map((item, i) => {
+      let sum = 0;
+      let count = 0;
+
+      for (let k = -2; k <= 2; k++) {
+        const j = i + k;
+        if (j >= 0 && j < envelope.length) {
+          sum += envelope[j].amp;
+          count++;
+        }
+      }
+
+      return {
+        x: item.x,
+        amp: count ? sum / count : item.amp
+      };
+    });
+
+    const upper = smoothEnvelope.map(p => ({
+      x: p.x,
+      y: yCenter - p.amp
+    }));
+    const lower = smoothEnvelope.map(p => ({
+      x: p.x,
+      y: yCenter + p.amp
+    }));
+
+    // Dense carrier strokes inside the envelope. Their varying height creates
+    // the classic AM / spindle appearance rather than a simple outline.
+    const carrierCount = Math.max(
+      70,
+      Math.min(180, Math.round((points[points.length - 1].x - points[0].x) / 2.2))
+    );
+
+    ctx.save();
+    ctx.strokeStyle = gradient;
+    ctx.lineWidth = 0.72;
+    ctx.globalAlpha = activeAlpha * 0.58;
+
+    if (CONFIG.display.glowIntensity > 0) {
+      ctx.shadowColor = ACTIVE_THEME.colors.mid;
+      ctx.shadowBlur = 1 + CONFIG.display.glowIntensity * 0.9;
+    }
+
+    ctx.beginPath();
+
+    for (let i = 0; i < carrierCount; i++) {
+      const t = i / Math.max(1, carrierCount - 1);
+
+      // Interpolate the slow envelope at this x.
+      const ePos = t * (smoothEnvelope.length - 1);
+      const e0 = Math.floor(ePos);
+      const e1 = Math.min(smoothEnvelope.length - 1, e0 + 1);
+      const mix = ePos - e0;
+      const amp =
+        smoothEnvelope[e0].amp * (1 - mix) +
+        smoothEnvelope[e1].amp * mix;
+
+      const x =
+        points[0].x +
+        t * (points[points.length - 1].x - points[0].x);
+
+      // Fast carrier phase with a tiny phase wobble to avoid sterile
+      // computer-perfect lines and resemble a real oscilloscope trace.
+      const carrier =
+        Math.sin(t * Math.PI * 2 * 24 + Math.sin(t * Math.PI * 6) * 0.35);
+
+      const top = yCenter - amp * Math.abs(carrier);
+      const bottom = yCenter + amp * Math.abs(carrier);
+
+      ctx.moveTo(x, top);
+      ctx.lineTo(x, bottom);
+    }
+
+    ctx.stroke();
+    ctx.restore();
+
+    // Envelope outlines stay brighter and define the spindle lobes.
+    if (CONFIG.display.glowIntensity > 0) {
+      for (const trace of [upper, lower]) {
+        ctx.save();
+        ctx.strokeStyle = gradient;
+        ctx.lineWidth = 4.5;
+        ctx.globalAlpha = activeAlpha * 0.14;
+        ctx.filter = `blur(${1.4 + CONFIG.display.glowIntensity * 0.85}px)`;
+        if (buildScopeLinePath(ctx, trace)) ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    for (const trace of [upper, lower]) {
+      ctx.save();
+      ctx.strokeStyle = gradient;
+      ctx.lineWidth = 1.55;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.globalAlpha = activeAlpha * 0.88;
+      if (buildScopeLinePath(ctx, trace)) ctx.stroke();
+      ctx.restore();
+    }
+
+    // Fine centre carrier line, similar to the bright central body seen
+    // in modulated-signal oscilloscope captures.
+    ctx.save();
+    ctx.strokeStyle = gradient;
+    ctx.lineWidth = 0.8;
+    ctx.globalAlpha = activeAlpha * 0.42;
+    if (buildScopeLinePath(ctx, points)) ctx.stroke();
+    ctx.restore();
+  }
+
+
+  function drawScopeWaveform(ctx, samples, trigger, x, yCenter, width, amplitude, channel) {
+    if (!samples || samples.length < 2 || width <= 1) return;
+
+    const points = getScopeWaveformPoints(samples, trigger, x, yCenter, width, amplitude, channel);
+    if (points.length < 2) return;
+
+    const gradient = createScopeThemeGradient(ctx, x, width);
+    const activeAlpha = STATE.hasStreamObject ? 1 : 0.34;
+    const style = CONFIG.display.oscilloscopeStyle || "lines";
+
+    // LINES = former Glow.
+    if (style === "lines") {
+      drawScopeGlowPasses(ctx, points, gradient, activeAlpha);
+      ctx.save();
+      ctx.strokeStyle = gradient;
+      ctx.lineWidth = 3.8;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.globalAlpha = activeAlpha * 0.99;
+      if (buildScopeLinePath(ctx, points)) ctx.stroke();
+      ctx.restore();
+      return;
+    }
+
+    // FILLED: substantially more opaque, close to Spectrum density.
+    if (style === "filled") {
+      if (CONFIG.display.glowIntensity > 0) {
+        ctx.save();
+        ctx.strokeStyle = gradient;
+        ctx.lineWidth = 5.2;
+        ctx.globalAlpha = activeAlpha * 0.25;
+        ctx.filter = `blur(${2 + CONFIG.display.glowIntensity * 1.2}px)`;
+        if (buildScopeLinePath(ctx, points)) ctx.stroke();
+        ctx.restore();
+      }
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, yCenter);
+      for (let i = 0; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y);
+      ctx.lineTo(points[points.length - 1].x, yCenter);
+      ctx.closePath();
+      ctx.fillStyle = gradient;
+      ctx.globalAlpha = activeAlpha * 0.58;
+      ctx.fill();
+      ctx.restore();
+
+      ctx.save();
+      ctx.strokeStyle = gradient;
+      ctx.lineWidth = 2.5;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.globalAlpha = activeAlpha;
+      if (buildScopeLinePath(ctx, points)) ctx.stroke();
+      ctx.restore();
+      return;
+    }
+
+    // DOTS: deliberately larger phosphor dots.
+    if (style === "dots") {
+      const step = Math.max(3, Math.round(points.length / Math.max(30, width / 7)));
+
+      if (CONFIG.display.glowIntensity > 0) {
+        ctx.save();
+        ctx.fillStyle = gradient;
+        ctx.globalAlpha = activeAlpha * 0.25;
+        ctx.filter = `blur(${1.8 + CONFIG.display.glowIntensity}px)`;
+        ctx.beginPath();
+        for (let i = 0; i < points.length; i += step) {
+          ctx.moveTo(points[i].x + 3.4, points[i].y);
+          ctx.arc(points[i].x, points[i].y, 3.4, 0, Math.PI * 2);
+        }
+        ctx.fill();
+        ctx.restore();
+      }
+
+      ctx.save();
+      ctx.fillStyle = gradient;
+      ctx.globalAlpha = activeAlpha;
+      ctx.beginPath();
+      for (let i = 0; i < points.length; i += step) {
+        ctx.moveTo(points[i].x + 2.05, points[i].y);
+        ctx.arc(points[i].x, points[i].y, 2.05, 0, Math.PI * 2);
+      }
+      ctx.fill();
+      ctx.restore();
+      return;
+    }
+
+    // STEPS: fewer, visibly larger sample-and-hold steps.
+    if (style === "steps") {
+      const coarse = [];
+      const targetSteps = Math.max(16, Math.round(width / 18));
+      const stride = Math.max(1, Math.floor(points.length / targetSteps));
+      for (let i = 0; i < points.length; i += stride) coarse.push(points[i]);
+      if (coarse[coarse.length - 1] !== points[points.length - 1]) coarse.push(points[points.length - 1]);
+
+      if (CONFIG.display.glowIntensity > 0) {
+        ctx.save();
+        ctx.strokeStyle = gradient;
+        ctx.lineWidth = 4.2;
+        ctx.globalAlpha = activeAlpha * 0.18;
+        ctx.filter = `blur(${1.5 + CONFIG.display.glowIntensity}px)`;
+        if (buildScopeStepPath(ctx, coarse)) ctx.stroke();
+        ctx.restore();
+      }
+
+      ctx.save();
+      ctx.strokeStyle = gradient;
+      ctx.lineWidth = 2.2;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "square";
+      ctx.globalAlpha = activeAlpha * 0.98;
+      if (buildScopeStepPath(ctx, coarse)) ctx.stroke();
+      ctx.restore();
+      return;
+    }
+
+    if (style === "persistence") {
+      drawScopePersistence(ctx, points, gradient, activeAlpha, channel);
+      return;
+    }
+
+    if (style === "envelope") {
+      drawScopeEnvelope(ctx, points, gradient, activeAlpha, yCenter);
+      return;
+    }
+
+    if (style === "spindle") {
+      drawScopeSpindle(ctx, points, gradient, activeAlpha, yCenter);
+      return;
+    }
+  }
+
+
+  function drawScopePeakHistory(
+    ctx,
+    history,
+    x,
+    yCenter,
+    width,
+    amplitude
+  ) {
+    if (!history || history.length < 2) return;
+
+    ctx.save();
+    ctx.strokeStyle = ACTIVE_THEME.colors.peak;
+    ctx.lineWidth = 1.15;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.globalAlpha = STATE.hasStreamObject ? 0.96 : 0.30;
+
+    if (CONFIG.display.glowIntensity > 0) {
+      ctx.shadowColor = ACTIVE_THEME.colors.peak;
+      ctx.shadowBlur = 2 + CONFIG.display.glowIntensity * 3;
+    }
+
+    ctx.beginPath();
+
+    for (let i = 0; i < history.length; i++) {
+      const norm = Math.max(0, Math.min(1.25, history[i] || 0));
+      const px = x + (i / Math.max(1, history.length - 1)) * width;
+
+      // Independent peak-history line: upper region of each channel lane,
+      // like the held peak line in Spectrum rather than an outline.
+      // Same vertical reference as the main waveform. The held-peak trace
+      // now lives inside the waveform lane rather than floating above it.
+      const py =
+        yCenter -
+        Math.min(1, norm) * amplitude * 0.42;
+
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function renderOscilloscope(ctx, canvas) {
+    const left = STATE.audio.timeLeft;
+    const right = STATE.audio.timeRight;
+    if (!ctx || !canvas || !left || !right) return;
+
+    // Use the full normal canvas area. L/R labels live outside the canvas at
+    // the left, and readouts live at the right edge of the wrapper.
+    const logicalW = getCanvasLogicalWidth(canvas);
+    const targetH = 94;
+
+    if (getCanvasLogicalHeight(canvas) !== targetH) {
+      resizeCanvasIfNeeded(canvas, logicalW, targetH);
+      STATE.dom.ctx = canvas.getContext("2d");
+      ctx = STATE.dom.ctx;
+      applyCanvasHiDpiTransform(canvas);
+    }
+
+    const width = getCanvasLogicalWidth(canvas);
+    const height = getCanvasLogicalHeight(canvas);
+    if (width <= 2 || height <= 2) return;
+
+    ctx.clearRect(0, 0, width, height);
+
+    const padX = 0;
+
+    // EXACT drawable length of normal LR Bars, independent of the user's
+    // stored render mode. This keeps the waveform ending before the readouts.
+    const drawW = Math.max(
+      1,
+      width - CONFIG.display.dimensions.canvasLeft - 26
+    );
+
+    // Two large lanes use almost all available vertical canvas space.
+    const laneGap = 6;
+    const laneH = (height - laneGap) / 2;
+    const topLaneTop = 0;
+    const bottomLaneTop = laneH + laneGap;
+    const topCenter = topLaneTop + laneH * 0.58;
+    const bottomCenter = bottomLaneTop + laneH * 0.58;
+
+    // Much larger excursion than before.
+    const amplitude = laneH * 0.47;
+
+    // Background grid retained.
+    ctx.save();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = ACTIVE_THEME.colors.low;
+    ctx.globalAlpha = 0.20;
+
+    for (let i = 0; i <= 8; i++) {
+      const gx = padX + (drawW * i) / 8;
+      ctx.beginPath();
+      ctx.moveTo(gx, 2);
+      ctx.lineTo(gx, height - 2);
+      ctx.stroke();
+    }
+
+    [topCenter, bottomCenter].forEach(y => {
+      ctx.globalAlpha = 0.32;
+      ctx.beginPath();
+      ctx.moveTo(padX, y);
+      ctx.lineTo(padX + drawW, y);
+      ctx.stroke();
+    });
+
+    ctx.globalAlpha = 0.14;
+    ctx.beginPath();
+    ctx.moveTo(padX, laneH + laneGap / 2);
+    ctx.lineTo(padX + drawW, laneH + laneGap / 2);
+    ctx.stroke();
+    ctx.restore();
+
+    const trigger = findScopeTrigger(left);
+    const now =
+      (typeof performance !== "undefined" && performance.now)
+        ? performance.now()
+        : Date.now();
+
+    drawScopeWaveform(
+      ctx,
+      left,
+      trigger,
+      padX,
+      topCenter,
+      drawW,
+      amplitude,
+      "left"
+    );
+
+    drawScopeWaveform(
+      ctx,
+      right,
+      trigger,
+      padX,
+      bottomCenter,
+      drawW,
+      amplitude,
+      "right"
+    );
+
+    if (CONFIG.display.showPeaks) {
+      const historyLength = Math.max(64, Math.round(drawW / 2));
+
+      const peakLeft = updateScopePeakHistory(
+        "left",
+        left,
+        now,
+        historyLength
+      );
+
+      const peakRight = updateScopePeakHistory(
+        "right",
+        right,
+        now,
+        historyLength
+      );
+
+      drawScopePeakHistory(
+        ctx,
+        peakLeft,
+        padX,
+        topCenter,
+        drawW,
+        amplitude
+      );
+
+      drawScopePeakHistory(
+        ctx,
+        peakRight,
+        padX,
+        bottomCenter,
+        drawW,
+        amplitude
+      );
+    }
+  }
+
+
   function renderMeters() {
     refreshAutomaticTheme();
 
     const layout = CONFIG.display.layoutMode;
     const render =
-      layout === "equalizer" || layout === "vuHybrid"
+      layout === "equalizer" || layout === "vuHybrid" || layout === "oscilloscope"
         ? "bars"
         : CONFIG.display.renderMode;
     const barStyle = CONFIG.display.barStyle;
@@ -6391,7 +7980,7 @@ function saveAMXPanelGeometry(panel) {
     FRAME_GRADIENT_CACHE.clear();
 
     const visualStateKey =
-      `${layout}|${render}|${barStyle}|${showReadouts}|${CONFIG.display.hybridMode}|${CONFIG.display.equalizerRenderMode}`;
+      `${layout}|${render}|${barStyle}|${showReadouts}|${CONFIG.display.hybridMode}|${CONFIG.display.equalizerRenderMode}|${CONFIG.display.oscilloscopeStyle}`;
 
     if (visualStateKey !== _lastVisualStateKey) {
       _lastVisualStateKey = visualStateKey;
@@ -6442,6 +8031,11 @@ function saveAMXPanelGeometry(panel) {
 
     const barH  = CONFIG.display.dimensions.barHeight;
     const gap   = CONFIG.display.dimensions.spacing;
+
+    if (layout === "oscilloscope") {
+      renderOscilloscope(ctx, canvas);
+      return;
+    }
 
     if (layout === "equalizer") {
       if (CONFIG.display.equalizerRenderMode === "spectrum") {
@@ -6983,7 +8577,7 @@ function saveAMXPanelGeometry(panel) {
         }
 
       } else if (mode === 1) {
-        // Audio Peak uses the same held A peak as bars and mirrored modes.
+        // RMS+Peak uses the same held A peak as bars and mirrored modes.
         const audioPeakDb = mapAudioLevelsToDb(
           STATE.levels.audio,
           CONFIG.audio.minDb,
@@ -7103,8 +8697,7 @@ function saveAMXPanelGeometry(panel) {
 
     if (
       !CONFIG.display.showPeaks ||
-      STATE.hasStreamObject !== true ||
-      (live <= 0.001 && held <= 0.001)
+      STATE.hasStreamObject !== true
     ) {
       delete bucket[stateKey];
       return null;
@@ -7743,9 +9336,11 @@ function saveAMXPanelGeometry(panel) {
         : "STEREO LEVELS & 12B EQ";
     }
 
+    if (layout === "oscilloscope") return "STEREO OSCILLOSCOPE";
+
     if (layout === "full") return "AUDIO LEVELS";
 
-    if (layout === "sa") return "ST. QUALITY / AUDIO PEAK";
+    if (layout === "sa") return "ST. QUALITY / RMS+PEAK";
 
     if (render === "gauges" || render === "analogVu" || useMirrored) {
       return "STEREO LEVELS";
@@ -7848,7 +9443,7 @@ function saveAMXPanelGeometry(panel) {
 
     const layout = CONFIG.display.layoutMode;
     const render =
-      layout === "equalizer" || layout === "vuHybrid"
+      layout === "equalizer" || layout === "vuHybrid" || layout === "oscilloscope"
         ? "bars"
         : CONFIG.display.renderMode;
 
@@ -7957,6 +9552,67 @@ function saveAMXPanelGeometry(panel) {
         (INNER_BASE_TOP + barH + gap + barH / 2 - 12) + "px";
     }
 
+    // OSCILLOSCOPE — stereo Float32 waveform using the native LR overlay.
+    if (layout === "oscilloscope") {
+      // Reuse the real Bar-mode L/R labels. Same DOM, font, coordinates.
+      if (STATE.dom.labels.left) {
+        STATE.dom.labels.left.style.display = "";
+        setTextIfChanged(STATE.dom.labels.left, "L");
+      }
+      if (STATE.dom.labels.right) {
+        STATE.dom.labels.right.style.display = "";
+        setTextIfChanged(STATE.dom.labels.right, "R");
+      }
+
+      if (STATE.dom.labels.q) STATE.dom.labels.q.style.display = "none";
+      if (STATE.dom.labels.a) STATE.dom.labels.a.style.display = "none";
+
+      // Numeric dB scales are not meaningful on a raw waveform.
+      if (STATE.dom.scales.left)  STATE.dom.scales.left.style.display  = "none";
+      if (STATE.dom.scales.right) STATE.dom.scales.right.style.display = "none";
+
+      // Scope uses the full wrapper height. The normal Bars canvas normally
+      // starts ~20px lower; keeping that top offset with a 100px scope canvas
+      // caused the bottom overflow seen on mobile/desktop.
+      if (STATE.dom.canvasNormal) {
+        STATE.dom.canvasNormal.style.top = "-2px";
+        STATE.dom.canvasNormal.style.left = STATE._canvasNormalBaseLeft;
+        STATE.dom.canvasNormal.style.width = STATE._canvasNormalBaseWidth;
+        STATE.dom.canvasNormal.style.transform = "";
+      }
+
+      if (STATE.dom.contentWrapper) {
+        STATE.dom.contentWrapper.style.height = WRAPPER_HEIGHT + "px";
+        STATE.dom.contentWrapper.style.minHeight = WRAPPER_HEIGHT + "px";
+      }
+
+      // Native L/R labels, centered on the real 94px scope waveform lanes.
+      const scopeHeight = 94;
+      const laneGap = 6;
+      const laneH = (scopeHeight - laneGap) / 2;
+      const labelTopCenter = laneH * 0.58 - 2;
+      const labelBottomCenter =
+        laneH + laneGap + laneH * 0.58 - 2;
+
+      if (STATE.dom.labels.left) {
+        STATE.dom.labels.left.style.left = "7px";
+        STATE.dom.labels.left.style.top =
+          (labelTopCenter - 12) + "px";
+      }
+
+      if (STATE.dom.labels.right) {
+        STATE.dom.labels.right.style.left = "7px";
+        STATE.dom.labels.right.style.top =
+          (labelBottomCenter - 12) + "px";
+      }
+
+      // Respect the existing Show Real Time Values setting.
+      positionReadouts("oscilloscope", "bars");
+
+      setTitleText("STEREO OSCILLOSCOPE");
+      return;
+    }
+
     // EQUALIZER — isolated vertical-bars layout
     if (layout === "equalizer") {
       if (STATE.dom.labels.left)  STATE.dom.labels.left.style.display  = "none";
@@ -8047,6 +9703,17 @@ function saveAMXPanelGeometry(panel) {
     // GAUGES MODE
     if (render === "gauges") {
 
+      // Full 4-gauge layout needs every available horizontal pixel at the
+      // mobile landscape floor. Keep normal gauge margins elsewhere.
+      if (STATE.dom.canvasGauges) {
+        {
+          const inset = getGaugeHorizontalInset(layout);
+          STATE.dom.canvasGauges.style.left = inset + "px";
+          STATE.dom.canvasGauges.style.width = `calc(100% - ${inset * 2}px)`;
+          syncGaugeOverlayGeometry(layout);
+        }
+      }
+
       // reset numeric labels
       [
         STATE.dom.gaugeNumsLeft?.start,
@@ -8072,8 +9739,10 @@ function saveAMXPanelGeometry(panel) {
       if (STATE.dom.scales.left)  STATE.dom.scales.left.style.display  = "none";
       if (STATE.dom.scales.right) STATE.dom.scales.right.style.display = "none";
 
-      // show gauge overlay
+      // show gauge overlay and keep its coordinate system identical
+      // to the active gauges canvas.
       if (STATE.dom.gaugeOverlay) {
+        syncGaugeOverlayGeometry(layout);
         STATE.dom.gaugeOverlay.style.display = "";
       }
       positionReadouts(layout, render);
@@ -8159,6 +9828,7 @@ function saveAMXPanelGeometry(panel) {
       }
 
       // NUMERIC LABELS — same geometry source as gauges, centre labels and outputs
+      syncGaugeOverlayGeometry(layout);
       applyGaugeNumericGeometry(layout);
 
       if (layout === "lr") {
@@ -8173,7 +9843,7 @@ function saveAMXPanelGeometry(panel) {
         const gRight = STATE.dom.gaugeNumsRight;
         // Stereo Quality
         setGaugeNumericLabels(gLeft, "0", "50", "90", "120%");
-        // Audio Peak
+        // RMS+Peak
         setGaugeNumericLabels(gRight, "0", "30", "70", "120%");
       }
       return;
@@ -8401,14 +10071,65 @@ function saveAMXPanelGeometry(panel) {
     try {
       // Build settings UI
       addAudioMetrixToggle();
+
+      if (window.location.pathname === "/setup") return;
       if (!isStereoEnabled()) return;
 
       // CONTAINER TILE
+      // RESPONSIVE TILE SIZING
+      // Normal desktop: 32.9% flexible width with a comfortable 350px floor.
+      // Narrow desktop: allow the floor to drop to 335px.
+      // Touch/mobile landscape: 32.9% with a 305px floor for Full Gauges clearance.
+      // Mobile portrait: occupy the full row.
+      if (!document.getElementById("amx-responsive-tile-css")) {
+        const responsiveCss = document.createElement("style");
+        responsiveCss.id = "amx-responsive-tile-css";
+        responsiveCss.textContent = `
+          #audiometrix-container {
+            width: 32.9% !important;
+            min-width: 350px !important;
+            max-width: none !important;
+            flex: 0 1 32.9% !important;
+            box-sizing: border-box !important;
+          }
+
+          /* Smaller desktop / laptop resolution. */
+          @media (min-width: 768px) and (max-width: 1199px) and (hover: hover) and (pointer: fine) {
+            #audiometrix-container {
+              min-width: 335px !important;
+            }
+          }
+
+          /* Keep the already-good mobile/tablet landscape behaviour unchanged. */
+          @media (orientation: landscape) and (hover: none) and (pointer: coarse) {
+            #audiometrix-container {
+              width: 32.9% !important;
+              min-width: 305px !important;
+              max-width: none !important;
+              flex: 0 1 32.9% !important;
+            }
+          }
+
+          @media (max-width: 767px) and (orientation: portrait) {
+            #audiometrix-container {
+              width: 100% !important;
+              min-width: 0 !important;
+              max-width: 100% !important;
+              flex: 0 0 100% !important;
+            }
+          }
+        `;
+        document.head.appendChild(responsiveCss);
+      }
+
       STATE.dom.container = document.createElement("div");
       STATE.dom.container.className = "panel-33 hover-brighten tooltip";
       STATE.dom.container.id = "audiometrix-container";
       STATE.dom.container.style.width = CONFIG.display.dimensions.tileWidthPercent + "%";
       STATE.dom.container.style.minWidth = CONFIG.display.dimensions.minTileWidth + "px";
+      STATE.dom.container.style.maxWidth = "none";
+      STATE.dom.container.style.flex = `0 1 ${CONFIG.display.dimensions.tileWidthPercent}%`;
+      STATE.dom.container.style.boxSizing = "border-box";
       STATE.dom.container.style.borderRadius = CONFIG.display.dimensions.borderRadius;
       STATE.dom.container.setAttribute("data-tooltip","Stereo modulation L/R & Q | Audio Peaks");
 
@@ -8525,7 +10246,7 @@ function saveAMXPanelGeometry(panel) {
       }
 
       // FLOATING PANEL REPOSITION ON RESIZE
-      window.addEventListener("resize", () => {
+      const handleAMXWindowResize = () => {
         const panel = document.getElementById("amx-floating-panel");
         const container = STATE.dom.container;
 
@@ -8534,15 +10255,67 @@ function saveAMXPanelGeometry(panel) {
         if (panel && panel.style.display !== "none") {
           positionAMXFloatingPanel(panel, container);
         }
-      });
+      };
 
+      window.addEventListener("resize", handleAMXWindowResize);
       window.addEventListener("orientationchange", refreshLayoutAndCanvas);
+      AMX_RUNTIME.windowHandlers.push(
+        ["resize", handleAMXWindowResize, undefined],
+        ["orientationchange", refreshLayoutAndCanvas, undefined]
+      );
 
       if (typeof ResizeObserver === "function" && STATE.dom.contentWrapper) {
-        const ro = new ResizeObserver(() => {
+        let lastObservedW = -1;
+        let lastObservedH = -1;
+
+        const ro = new ResizeObserver((entries) => {
+          const entry = entries && entries[0];
+          const rect = entry?.contentRect;
+          const nextW = Math.round(rect?.width || 0);
+          const nextH = Math.round(rect?.height || 0);
+
           refreshLayoutAndCanvas();
+
+          // Bars numeric scales are DOM-positioned from their measured width.
+          // On page refresh the FM-DX flex layout may settle AFTER the first
+          // applyVisualState(), so the numbers can retain positions calculated
+          // for the provisional width. Settings changes happened to fix this
+          // because they call applyVisualState() again.
+          //
+          // Re-run the visual layout once the observed size has actually
+          // changed. RAF coalescing prevents ResizeObserver feedback loops.
+          if (nextW !== lastObservedW || nextH !== lastObservedH) {
+            lastObservedW = nextW;
+            lastObservedH = nextH;
+
+            if (AMX_RUNTIME.barsResizeRaf !== null) {
+              cancelAnimationFrame(AMX_RUNTIME.barsResizeRaf);
+            }
+
+            AMX_RUNTIME.barsResizeRaf = requestAnimationFrame(() => {
+              AMX_RUNTIME.barsResizeRaf = null;
+
+              const layout = CONFIG.display.layoutMode;
+              const render =
+                layout === "equalizer" || layout === "vuHybrid"
+                  ? "bars"
+                  : CONFIG.display.renderMode;
+
+              // Only the normal bar layouts need DOM numeric-scale
+              // remeasurement. Other modes already resize correctly.
+              if (
+                render === "bars" &&
+                (layout === "lr" || layout === "sa" || layout === "full")
+              ) {
+                applyVisualState();
+                requestRender();
+              }
+            });
+          }
         });
+
         ro.observe(STATE.dom.contentWrapper);
+        AMX_RUNTIME.contentResizeObserver = ro;
       }
 
       // NATIVE LABELS L/R (normal mode only)
@@ -8782,9 +10555,9 @@ function saveAMXPanelGeometry(panel) {
       STATE.dom.gaugeLabelQ = createGaugeCenterLabel();
       STATE.dom.gaugeLabelA = createGaugeCenterLabel();
 
-      // Overlay anchoring exactly matches the symmetric gauges canvas.
-      STATE.dom.gaugeOverlay.style.left  = "5px";
-      STATE.dom.gaugeOverlay.style.right = "5px";
+      // Overlay anchoring follows the same shared inset as the gauges canvas.
+      STATE.dom.gaugeOverlay.style.left  = getGaugeHorizontalInset("lr") + "px";
+      STATE.dom.gaugeOverlay.style.right = getGaugeHorizontalInset("lr") + "px";
 
       // Append overlay above canvases
       STATE.dom.contentWrapper.appendChild(STATE.dom.gaugeOverlay);
@@ -9041,19 +10814,23 @@ function saveAMXPanelGeometry(panel) {
       };
 
       // Apply skin after DOM builds
-      setTimeout(applySkin, 50);
-      setTimeout(applySkin, 300);
+      [50, 300].forEach(delay => {
+        const timer = setTimeout(() => {
+          AMX_RUNTIME.pendingTimeouts.delete(timer);
+          if (!AMX_RUNTIME.destroyed) applySkin();
+        }, delay);
+        AMX_RUNTIME.pendingTimeouts.add(timer);
+      });
 
       // Skin observer — visual sync only (fonts / alignment)
-      let skinObserverRaf = 0;
-      const skinObserver = new MutationObserver(() => {
-        if (skinObserverRaf) return;
-        skinObserverRaf = requestAnimationFrame(() => {
-          skinObserverRaf = 0;
-          applySkin();
+      AMX_RUNTIME.skinObserver = new MutationObserver(() => {
+        if (AMX_RUNTIME.skinObserverRaf) return;
+        AMX_RUNTIME.skinObserverRaf = requestAnimationFrame(() => {
+          AMX_RUNTIME.skinObserverRaf = 0;
+          if (!AMX_RUNTIME.destroyed) applySkin();
         });
       });
-      skinObserver.observe(document.body, {
+      AMX_RUNTIME.skinObserver.observe(document.body, {
         attributes: true,
         subtree: true,
         attributeFilter: ["class", "style"]
@@ -9073,6 +10850,14 @@ function saveAMXPanelGeometry(panel) {
       function cleanupAudioGraph() {
         const a = STATE.audio || {};
 
+        // Remove only AudioMetrix's own source connection. This leaves any
+        // unrelated FM-DX / plugin routes from the same source untouched.
+        try {
+          if (a.source && a.splitter && typeof a.source.disconnect === "function") {
+            a.source.disconnect(a.splitter);
+          }
+        } catch (e) {}
+
         try {
           if (a.splitter && a.analyserEqualizerLeft) {
             a.splitter.disconnect(a.analyserEqualizerLeft);
@@ -9090,6 +10875,10 @@ function saveAMXPanelGeometry(panel) {
           a.analyserEqualizerRight,
           a.analyserMid,
           a.analyserSide,
+          a.midSideGainLToM,
+          a.midSideGainRToM,
+          a.midSideGainLToS,
+          a.midSideGainRToS,
           a.analyserPeak,
           a.bassFilter,
           a.highPassFilter,
@@ -9115,9 +10904,29 @@ function saveAMXPanelGeometry(panel) {
         cleanupAudioGraph();
         STATE.hasStreamObject = false;
         clearTransientRenderState();
+        resetSamplePeakMemory();
+
+        STATE.audioCadence.frame = 0;
+        STATE.audioCadence.interval = 1;
+        STATE.audioCadence.lastEnergy = 0;
+        STATE.spectrumCadence.frame = 0;
+
+        if (STATE.oscilloscope) {
+          STATE.oscilloscope.peakHistoryLeft.length = 0;
+          STATE.oscilloscope.peakHistoryRight.length = 0;
+          STATE.oscilloscope.peakDisplayLeft = 0;
+          STATE.oscilloscope.peakDisplayRight = 0;
+          STATE.oscilloscope.peakHoldUntilLeft = 0;
+          STATE.oscilloscope.peakHoldUntilRight = 0;
+          STATE.oscilloscope.persistenceLeft.length = 0;
+          STATE.oscilloscope.persistenceRight.length = 0;
+          STATE.oscilloscope.persistenceFrame = 0;
+          STATE.oscilloscope.lastTs = 0;
+        }
 
         if (STATE.levels && STATE.levels.equalizer) {
           STATE.levels.equalizer.values.fill(0);
+          STATE.levels.equalizer.targetValues.fill(0);
           STATE.levels.equalizer.peaks.fill(0);
           STATE.levels.equalizer.dbValues.fill(-100);
           STATE.levels.equalizer.peakHoldUntil.fill(0);
@@ -9128,6 +10937,7 @@ function saveAMXPanelGeometry(panel) {
           STATE.levels?.hybridAudio10
         ].filter(Boolean).forEach(spectrum => {
           spectrum.values.fill(0);
+          spectrum.targetValues.fill(0);
           spectrum.peaks.fill(0);
           spectrum.dbValues.fill(-100);
           spectrum.peakHoldUntil.fill(0);
@@ -9150,6 +10960,10 @@ function saveAMXPanelGeometry(panel) {
           mergerMS: null,
           analyserMid: null,
           analyserSide: null,
+          midSideGainLToM: null,
+          midSideGainRToM: null,
+          midSideGainLToS: null,
+          midSideGainRToS: null,
           dataMid: null,
           dataSide: null,
           analyserPeak: null,
@@ -9169,18 +10983,76 @@ function saveAMXPanelGeometry(panel) {
         return 20 * Math.log10(x);
       }
 
+      function resetSamplePeakMemory() {
+        const m = STATE.monitoring;
+        if (!m) return;
+
+        m.maxSamplePeak.left = 0;
+        m.maxSamplePeak.right = 0;
+        m.maxSamplePeakDb.left = -120;
+        m.maxSamplePeakDb.right = -120;
+        m.clipUntil.left = 0;
+        m.clipUntil.right = 0;
+        m.clipped.left = false;
+        m.clipped.right = false;
+        m.clipCount.left = 0;
+        m.clipCount.right = 0;
+        m.lastResetTs = Date.now();
+
+        updateDiagnosticsOverlay();
+      }
+
+      function updateSamplePeakMemory(channel, samplePeak, now) {
+        const m = STATE.monitoring;
+        if (!m || (channel !== "left" && channel !== "right")) return;
+
+        const peak = Math.max(0, Math.min(1, Number(samplePeak) || 0));
+
+        if (peak > m.maxSamplePeak[channel]) {
+          m.maxSamplePeak[channel] = peak;
+          m.maxSamplePeakDb[channel] = linearToDb(peak);
+        }
+
+        if (peak >= SAMPLE_CLIP_THRESHOLD) {
+          m.clipUntil[channel] = now + SAMPLE_CLIP_HOLD_MS;
+
+          // Count only a new clip event, not every analysis frame while the
+          // signal remains continuously clipped.
+          if (!m.clipped[channel]) {
+            m.clipCount[channel]++;
+          }
+          m.clipped[channel] = true;
+        } else if (now >= m.clipUntil[channel]) {
+          m.clipped[channel] = false;
+        }
+      }
+
+      // Admin/debug convenience. Monitoring also resets automatically whenever
+      // AudioMetrix rebuilds its audio source/graph.
+      window.AudioMetrixResetMax = resetSamplePeakMemory;
+
       function processChannel(timeData, prevSmoothDb) {
-        // RMS from time-domain samples (0..255 → -1..+1)
+        // RMS + raw sample peak from the same Float32 time-domain pass.
+        // Samples are already normalized to -1..+1, so MAX/CLIP avoids
+        // the quantization of the former 8-bit analyser path.
         let sumSq = 0;
+        let samplePeak = 0;
+
         for (let i = 0; i < timeData.length; i++) {
-          const v = (timeData[i] - 128) / 128;
+          const v = timeData[i];
+          const absV = Math.abs(v);
           sumSq += v * v;
+          if (absV > samplePeak) samplePeak = absV;
         }
 
         const rms = Math.sqrt(sumSq / timeData.length);
 
         if (rms < CONFIG.audio.minThreshold) {
-          return { instantDb: -120, smoothDb: -120 };
+          return {
+            instantDb: -120,
+            smoothDb: -120,
+            samplePeak
+          };
         }
 
         // RMS → dBFS + user gain + calibration
@@ -9200,7 +11072,11 @@ function saveAMXPanelGeometry(panel) {
           smoothDb = prevSmoothDb + (instantDb - prevSmoothDb) * CONFIG.audio.releaseSpeed;
         }
 
-        return { instantDb, smoothDb };
+        return {
+          instantDb,
+          smoothDb,
+          samplePeak
+        };
       }
 
       const spectrumCalibrationCache = new Map();
@@ -9231,7 +11107,8 @@ function saveAMXPanelGeometry(panel) {
       function updateEqualizerLevels(
         now,
         spectrumState = STATE.levels.equalizer,
-        frequencies = EQ_CENTER_FREQUENCIES
+        frequencies = EQ_CENTER_FREQUENCIES,
+        readSpectrum = true
       ) {
         const a = STATE.audio;
         const eq = spectrumState;
@@ -9241,77 +11118,88 @@ function saveAMXPanelGeometry(panel) {
         const spectrumRight = a.dataEqualizerRight;
         if (!analyserLeft || !analyserRight || !spectrumLeft || !spectrumRight) return;
 
-        analyserLeft.getByteFrequencyData(spectrumLeft);
-        analyserRight.getByteFrequencyData(spectrumRight);
-
         const sampleRate = (a.context && a.context.sampleRate) || 48000;
         const nyquist = sampleRate / 2;
         const binCount = Math.min(spectrumLeft.length, spectrumRight.length);
         const deltaSeconds = eq.lastUpdateTs > 0
           ? Math.min(0.1, Math.max(0, (now - eq.lastUpdateTs) / 1000))
-          : 1 / 30;
+          : 1 / 60;
         eq.lastUpdateTs = now;
 
-        for (let band = 0; band < frequencies.length; band++) {
-          const targetBin = Math.min(
-            binCount - 1,
-            Math.max(
+        // The expensive 4096-point spectrum data copy runs at ~30Hz.
+        // Targets are retained and interpolated below at the 60Hz visual cadence.
+        if (readSpectrum) {
+          analyserLeft.getByteFrequencyData(spectrumLeft);
+          analyserRight.getByteFrequencyData(spectrumRight);
+
+          for (let band = 0; band < frequencies.length; band++) {
+            const targetBin = Math.min(
+              binCount - 1,
+              Math.max(
+                0,
+                Math.floor((frequencies[band] / nyquist) * binCount)
+              )
+            );
+            const startBin = Math.max(0, targetBin - 2);
+            const endBin = Math.min(binCount - 1, targetBin + 2);
+
+            let peakValue = 0;
+            for (let bin = startBin; bin <= endBin; bin++) {
+              const combined = (spectrumLeft[bin] + spectrumRight[bin]) / 2;
+              if (combined > peakValue) peakValue = combined;
+            }
+
+            const analyserMinDb = analyserLeft.minDecibels;
+            const analyserMaxDb = analyserLeft.maxDecibels;
+            const rawDb =
+              analyserMinDb +
+              (peakValue / 255) * (analyserMaxDb - analyserMinDb);
+            const gainedDb = clamp(
+              rawDb + CONFIG.audio.dbGain,
+              analyserMinDb,
+              analyserMaxDb
+            );
+            const visualCeilingDb = -30;
+            const visualDb = clamp(
+              gainedDb,
+              analyserMinDb,
+              visualCeilingDb
+            );
+            const gainedByte =
+              ((visualDb - analyserMinDb) /
+                (visualCeilingDb - analyserMinDb)) *
+              255;
+            const calibration = getSpectrumCalibration(
+              frequencies[band]
+            );
+            const balancedPeak = gainedByte * calibration.gain;
+            const floor = calibration.floor;
+            eq.dbValues[band] =
+              balancedPeak > floor ? gainedDb : -100;
+            const normalized =
+              balancedPeak > floor
+                ? (balancedPeak - floor) / (255 - floor)
+                : 0;
+
+            let target = clamp(
+              Math.pow(normalized, 1 / EQ_SENSITIVITY),
               0,
-              Math.floor((frequencies[band] / nyquist) * binCount)
-            )
-          );
-          const startBin = Math.max(0, targetBin - 2);
-          const endBin = Math.min(binCount - 1, targetBin + 2);
+              1
+            );
 
-          let peakValue = 0;
-          for (let bin = startBin; bin <= endBin; bin++) {
-            const combined = (spectrumLeft[bin] + spectrumRight[bin]) / 2;
-            if (combined > peakValue) peakValue = combined;
+            const previousTarget = eq.targetValues[band] || 0;
+            if (Math.abs(target - previousTarget) < EQ_HYSTERESIS) {
+              target = previousTarget;
+            }
+            eq.targetValues[band] = target;
           }
+        }
 
-          const analyserMinDb = analyserLeft.minDecibels;
-          const analyserMaxDb = analyserLeft.maxDecibels;
-          const rawDb =
-            analyserMinDb +
-            (peakValue / 255) * (analyserMaxDb - analyserMinDb);
-          const gainedDb = clamp(
-            rawDb + CONFIG.audio.dbGain,
-            analyserMinDb,
-            analyserMaxDb
-          );
-          // Preserve the proven eq5 visual response while allowing the dB
-          // readout to retain headroom above -30 dB.
-          const visualCeilingDb = -30;
-          const visualDb = clamp(
-            gainedDb,
-            analyserMinDb,
-            visualCeilingDb
-          );
-          const gainedByte =
-            ((visualDb - analyserMinDb) /
-              (visualCeilingDb - analyserMinDb)) *
-            255;
-          const calibration = getSpectrumCalibration(
-            frequencies[band]
-          );
-          const balancedPeak = gainedByte * calibration.gain;
-          const floor = calibration.floor;
-          eq.dbValues[band] =
-            balancedPeak > floor ? gainedDb : -100;
-          const normalized =
-            balancedPeak > floor
-              ? (balancedPeak - floor) / (255 - floor)
-              : 0;
-          let target = clamp(
-            Math.pow(normalized, 1 / EQ_SENSITIVITY),
-            0,
-            1
-          );
-
+        // 60Hz visual interpolation toward the most recent FFT targets.
+        // Time-corrected alpha keeps the same response if frame timing varies.
+        for (let band = 0; band < frequencies.length; band++) {
+          const target = eq.targetValues[band] || 0;
           const previous = eq.values[band] || 0;
-          if (Math.abs(target - previous) < EQ_HYSTERESIS) {
-            target = previous;
-          }
 
           const attackBase =
             0.08 + CONFIG.audio.attackSpeed * 0.42;
@@ -9322,10 +11210,12 @@ function saveAMXPanelGeometry(panel) {
             1 - Math.pow(1 - attackBase, frameScale);
           const releaseAlpha =
             1 - Math.pow(1 - releaseBase, frameScale);
+
           const next =
             target > previous
               ? previous + (target - previous) * attackAlpha
               : previous + (target - previous) * releaseAlpha;
+
           eq.values[band] = next < 0.008 ? 0 : next;
 
           if (next >= (eq.peaks[band] || 0)) {
@@ -9452,7 +11342,27 @@ function saveAMXPanelGeometry(panel) {
           !!STATE.audio?.source;
       }
 
+      function scheduleInitAudioRetry(delay) {
+        if (AMX_RUNTIME.destroyed) return;
+
+        if (AMX_RUNTIME.initRetryTimer) {
+          clearTimeout(AMX_RUNTIME.initRetryTimer);
+        }
+
+        AMX_RUNTIME.initRetryTimer = setTimeout(() => {
+          AMX_RUNTIME.initRetryTimer = null;
+          if (!AMX_RUNTIME.destroyed) initAudioSystem();
+        }, delay);
+      }
+
       function initAudioSystem() {
+        if (AMX_RUNTIME.destroyed) return;
+
+        if (AMX_RUNTIME.initRetryTimer) {
+          clearTimeout(AMX_RUNTIME.initRetryTimer);
+          AMX_RUNTIME.initRetryTimer = null;
+        }
+
         try {
           const resolved = resolveAudioSource();
 
@@ -9486,10 +11396,10 @@ function saveAMXPanelGeometry(panel) {
             );
 
             // TIME-DOMAIN BUFFERS L / R
-            STATE.audio.timeLeft = new Uint8Array(
+            STATE.audio.timeLeft = new Float32Array(
               STATE.audio.analyserLeft.fftSize
             );
-            STATE.audio.timeRight = new Uint8Array(
+            STATE.audio.timeRight = new Float32Array(
               STATE.audio.analyserRight.fftSize
             );
 
@@ -9539,37 +11449,36 @@ function saveAMXPanelGeometry(panel) {
               STATE.audio.analyserSide.frequencyBinCount
             );
 
-            // Gains for Mid
-            const gL_to_M = ctx.createGain();
-            const gR_to_M = ctx.createGain();
-            gL_to_M.gain.value = 0.5;
-            gR_to_M.gain.value = 0.5;
+            // Gains for Mid / Side are kept in STATE so rebind cleanup can
+            // explicitly disconnect every node created by AudioMetrix.
+            STATE.audio.midSideGainLToM = ctx.createGain();
+            STATE.audio.midSideGainRToM = ctx.createGain();
+            STATE.audio.midSideGainLToS = ctx.createGain();
+            STATE.audio.midSideGainRToS = ctx.createGain();
 
-            // Gains for Side
-            const gL_to_S = ctx.createGain();
-            const gR_to_S = ctx.createGain();
-            gL_to_S.gain.value = 0.5;
-            gR_to_S.gain.value = -0.5;
+            STATE.audio.midSideGainLToM.gain.value = 0.5;
+            STATE.audio.midSideGainRToM.gain.value = 0.5;
+            STATE.audio.midSideGainLToS.gain.value = 0.5;
+            STATE.audio.midSideGainRToS.gain.value = -0.5;
 
             // Routing from splitter
-            STATE.audio.splitter.connect(gL_to_M, 0); // L
-            STATE.audio.splitter.connect(gR_to_M, 1); // R
-            STATE.audio.splitter.connect(gL_to_S, 0); // L
-            STATE.audio.splitter.connect(gR_to_S, 1); // R (inverted)
+            STATE.audio.splitter.connect(STATE.audio.midSideGainLToM, 0); // L
+            STATE.audio.splitter.connect(STATE.audio.midSideGainRToM, 1); // R
+            STATE.audio.splitter.connect(STATE.audio.midSideGainLToS, 0); // L
+            STATE.audio.splitter.connect(STATE.audio.midSideGainRToS, 1); // R inverted
 
             // Feed analysers directly (SAFE)
-            gL_to_M.connect(STATE.audio.analyserMid);
-            gR_to_M.connect(STATE.audio.analyserMid);
+            STATE.audio.midSideGainLToM.connect(STATE.audio.analyserMid);
+            STATE.audio.midSideGainRToM.connect(STATE.audio.analyserMid);
+            STATE.audio.midSideGainLToS.connect(STATE.audio.analyserSide);
+            STATE.audio.midSideGainRToS.connect(STATE.audio.analyserSide);
 
-            gL_to_S.connect(STATE.audio.analyserSide);
-            gR_to_S.connect(STATE.audio.analyserSide);
-
-            // AUDIO PEAK (A) — independent mono branch
+            // AUDIO RMS+PEAK (A) — independent filtered mono branch
             // source → lowshelf → highpass → lowpass → analyserPeak
             STATE.audio.analyserPeak = ctx.createAnalyser();
             STATE.audio.analyserPeak.fftSize = CONFIG.audio.peakFftSize;
 
-            STATE.audio.dataPeak = new Uint8Array(
+            STATE.audio.dataPeak = new Float32Array(
               STATE.audio.analyserPeak.fftSize
             );
 
@@ -9609,11 +11518,11 @@ function saveAMXPanelGeometry(panel) {
 
             startRendering();
           } else {
-            setTimeout(initAudioSystem, 500);
+            scheduleInitAudioRetry(500);
           }
         } catch (e) {
           console.error("[AudioMetrix] initAudioSystem failed:", e);
-          setTimeout(initAudioSystem, 1000);
+          scheduleInitAudioRetry(1000);
         }
       }
 
@@ -9642,7 +11551,12 @@ function saveAMXPanelGeometry(panel) {
 
       // RENDER LOOP HOOK
       function startRendering() {
-        if (!STATE.dom.contentWrapper || RENDER_GATE.rafId != null) return;
+        if (
+          AMX_RUNTIME.destroyed ||
+          document.visibilityState === "hidden" ||
+          !STATE.dom.contentWrapper ||
+          RENDER_GATE.rafId != null
+        ) return;
 
         // --- layout read (gated) ---
         readLayoutOnce();
@@ -9672,6 +11586,11 @@ function saveAMXPanelGeometry(panel) {
 
       // UPDATE METERS
       function updateMetersFrame() {
+        if (AMX_RUNTIME.destroyed || document.visibilityState === "hidden") {
+          RENDER_GATE.rafId = null;
+          return;
+        }
+
         // Also runs while the audio analysers are not ready, allowing the
         // Automatic theme to replace its startup fallback after a refresh.
         refreshAutomaticTheme();
@@ -9692,17 +11611,19 @@ function saveAMXPanelGeometry(panel) {
           STATE.hasStreamObject = isAudioTransportPlaying();
 
           // Adaptive audio cadence (single decision point)
-          const equalizerActive =
+          const highCadenceVisual =
             CONFIG.display.layoutMode === "equalizer" ||
-            CONFIG.display.layoutMode === "vuHybrid";
+            CONFIG.display.layoutMode === "vuHybrid" ||
+            CONFIG.display.layoutMode === "oscilloscope";
           const runAudio =
-            equalizerActive ? true : shouldRunAudio();
+            highCadenceVisual ? true : shouldRunAudio();
 
           if (runAudio) {
             const layoutMode = CONFIG.display.layoutMode;
             const nonLRLayout =
               layoutMode !== "lr" &&
               layoutMode !== "equalizer" &&
+              layoutMode !== "oscilloscope" &&
               !(
                 layoutMode === "vuHybrid" &&
                 CONFIG.display.hybridMode === "stereo12"
@@ -9715,8 +11636,8 @@ function saveAMXPanelGeometry(panel) {
             const rel = audioCfg.releaseSpeed;
 
             // READ TIME DOMAIN FOR L / R
-            STATE.audio.analyserLeft.getByteTimeDomainData(STATE.audio.timeLeft);
-            STATE.audio.analyserRight.getByteTimeDomainData(STATE.audio.timeRight);
+            STATE.audio.analyserLeft.getFloatTimeDomainData(STATE.audio.timeLeft);
+            STATE.audio.analyserRight.getFloatTimeDomainData(STATE.audio.timeRight);
 
             // READ MID / SIDE DATA
             if (nonLRLayout) {
@@ -9747,20 +11668,35 @@ function saveAMXPanelGeometry(panel) {
                 ? performance.now()
                 : Date.now();
 
+            updateSamplePeakMemory("left", L.samplePeak, nowTs);
+            updateSamplePeakMemory("right", R.samplePeak, nowTs);
+
+            const readSpectrumSnapshot =
+              (layoutMode === "equalizer" || layoutMode === "vuHybrid")
+                ? shouldReadSpectrumSnapshot()
+                : false;
+
             if (layoutMode === "equalizer") {
-              updateEqualizerLevels(nowTs);
+              updateEqualizerLevels(
+                nowTs,
+                STATE.levels.equalizer,
+                EQ_CENTER_FREQUENCIES,
+                readSpectrumSnapshot
+              );
             } else if (layoutMode === "vuHybrid") {
               if (CONFIG.display.hybridMode === "audio10") {
                 updateEqualizerLevels(
                   nowTs,
                   STATE.levels.hybridAudio10,
-                  HYBRID_AUDIO_10_FREQUENCIES
+                  HYBRID_AUDIO_10_FREQUENCIES,
+                  readSpectrumSnapshot
                 );
               } else {
                 updateEqualizerLevels(
                   nowTs,
                   STATE.levels.hybridStereo12,
-                  HYBRID_STEREO_12_FREQUENCIES
+                  HYBRID_STEREO_12_FREQUENCIES,
+                  readSpectrumSnapshot
                 );
               }
             }
@@ -9807,20 +11743,17 @@ function saveAMXPanelGeometry(panel) {
                 const buf = STATE.audio.dataPeak;
                 if (!buf) return;
 
-                peakAnalyser.getByteTimeDomainData(buf);
+                peakAnalyser.getFloatTimeDomainData(buf);
 
-                // RMS + TRUE PEAK
+                // RMS + SAMPLE PEAK (not inter-sample True Peak).
+                // Float32 samples are already normalized to -1..+1.
                 let sumSq = 0;
                 let instPeak = 0;
 
                 const len = buf.length;
 
                 for (let i = 0; i < len; i++) {
-                  let v = buf[i] - 128;
-
-                  if (v < 0) v = -v;
-
-                  const n = v / 128;
+                  const n = Math.abs(buf[i]);
 
                   sumSq += n * n;
 
@@ -9845,7 +11778,7 @@ function saveAMXPanelGeometry(panel) {
 
                 audioLevels.smooth = peakState.bar;
 
-                // AUDIO PEAK LINE — use the same hold/decay logic as L/R
+                // A SAMPLE-PEAK LINE — use the same hold/decay logic as L/R
                 const targetPeak = Math.min(255, instPeak * 255 * SCALE);
 
                 const rangeA = maxDb - minDb;
@@ -10071,7 +12004,8 @@ function saveAMXPanelGeometry(panel) {
           const __now = performance.now();
           const activeFrameInterval =
             CONFIG.display.layoutMode === "equalizer" ||
-            CONFIG.display.layoutMode === "vuHybrid"
+            CONFIG.display.layoutMode === "vuHybrid" ||
+            CONFIG.display.layoutMode === "oscilloscope"
               ? 1000 / 60
               : FRAME_INTERVAL;
           if (__now - _lastRenderTime < activeFrameInterval) {
@@ -10110,6 +12044,7 @@ function saveAMXPanelGeometry(panel) {
             STATE.render.canvasReadouts = {};
           }
           const dirtyValues =
+            CONFIG.display.layoutMode === "oscilloscope" ||
             _lastDrawn.L === null ||
             Math.abs(Ls - _lastDrawn.L) > EPS_DB ||
             Math.abs(Rs - _lastDrawn.R) > EPS_DB ||
@@ -10195,7 +12130,7 @@ function saveAMXPanelGeometry(panel) {
               // ─────────────────────────
               // LR — Stereo Levels layout
               // ─────────────────────────
-              if (layout === "lr") {
+              if (layout === "lr" || layout === "oscilloscope") {
 
                 if (!hasStreamObject) {
                   setReadoutText(STATE.dom.readouts.L, "");
@@ -10254,61 +12189,206 @@ function saveAMXPanelGeometry(panel) {
         } catch (e) {
           console.error("[AudioMetrix] updateMetersFrame failed:", e);
         }
-        RENDER_GATE.rafId = requestAnimationFrame(updateMetersFrame);
+        if (!AMX_RUNTIME.destroyed && document.visibilityState !== "hidden") {
+          RENDER_GATE.rafId = requestAnimationFrame(updateMetersFrame);
+        } else {
+          RENDER_GATE.rafId = null;
+        }
       }
 
       // AUTO REBIND WHEN FM-DX OR COMPATIBLE PLUGINS RECREATE AUDIO NODES
-      const AUTO_REBIND_INTERVAL_MS = 1000;
+      // Adaptive scheduler: fast while recovering, relaxed while stable,
+      // very light while the page is hidden.
+      const AUTO_REBIND_FAST_MS   = 1000;
+      const AUTO_REBIND_STABLE_MS = 5000;
+      const AUTO_REBIND_HIDDEN_MS = 15000;
       let lastSourceSignature = null;
       let lastSourceNode = null;
 
-      setInterval(() => {
+      function scheduleAutoRebind(delay) {
+        if (AMX_RUNTIME.destroyed) return;
+        if (AMX_RUNTIME.autoRebindTimer) {
+          clearTimeout(AMX_RUNTIME.autoRebindTimer);
+        }
+        AMX_RUNTIME.autoRebindTimer = setTimeout(runAutoRebindCheck, delay);
+      }
+
+      function runAutoRebindCheck() {
+        if (AMX_RUNTIME.destroyed) return;
+
+        AMX_RUNTIME.autoRebindLastCheck = Date.now();
+
+        if (document.visibilityState === "hidden") {
+          AMX_RUNTIME.autoRebindState = "hidden";
+          scheduleAutoRebind(AUTO_REBIND_HIDDEN_MS);
+          return;
+        }
+
+        let nextDelay = AUTO_REBIND_STABLE_MS;
+
         try {
           const resolved = resolveAudioSource();
 
           if (!resolved || !resolved.context || !resolved.source) {
             lastSourceSignature = null;
             lastSourceNode = null;
-            return;
-          }
+            AMX_RUNTIME.autoRebindState = "waiting-source";
+            nextDelay = AUTO_REBIND_FAST_MS;
+          } else {
+            if (!lastSourceNode && !lastSourceSignature) {
+              lastSourceNode = resolved.source;
+              lastSourceSignature = resolved.signature;
+            }
 
-          if (!lastSourceNode && !lastSourceSignature) {
-            lastSourceNode = resolved.source;
-            lastSourceSignature = resolved.signature;
-          }
+            const changed =
+              resolved.source !== lastSourceNode ||
+              resolved.signature !== lastSourceSignature ||
+              !STATE.audio ||
+              STATE.audio.source !== resolved.source ||
+              STATE.audio.context !== resolved.context ||
+              STATE.audio.sourceMode !== resolved.mode;
 
-          const changed =
-            resolved.source !== lastSourceNode ||
-            resolved.signature !== lastSourceSignature ||
-            !STATE.audio ||
-            STATE.audio.source !== resolved.source ||
-            STATE.audio.context !== resolved.context ||
-            STATE.audio.sourceMode !== resolved.mode;
+            const incomplete =
+              !STATE.audio ||
+              !STATE.audio.context ||
+              !STATE.audio.source ||
+              !STATE.audio.analyserLeft ||
+              !STATE.audio.analyserRight ||
+              !STATE.audio.analyserEqualizerLeft ||
+              !STATE.audio.analyserEqualizerRight;
 
-          if (changed) {
-            lastSourceNode = resolved.source;
-            lastSourceSignature = resolved.signature;
-            stopRenderingLoop();
-            resetAudioState();
-            initAudioSystem();
-            return;
+            if (changed || incomplete) {
+              lastSourceNode = resolved.source;
+              lastSourceSignature = resolved.signature;
+              AMX_RUNTIME.autoRebindState = changed ? "rebind" : "repair";
+              stopRenderingLoop();
+              resetAudioState();
+              initAudioSystem();
+              nextDelay = AUTO_REBIND_FAST_MS;
+            } else {
+              AMX_RUNTIME.autoRebindState = "stable";
+              nextDelay = AUTO_REBIND_STABLE_MS;
+            }
           }
+        } catch (e) {
+          AMX_RUNTIME.autoRebindState = "error";
+          nextDelay = AUTO_REBIND_FAST_MS;
+          if (AMX_DEBUG) {
+            console.warn("[AudioMetrix] auto-rebind check failed:", e);
+          }
+        }
 
-          if (
-            !STATE.audio ||
-            !STATE.audio.context ||
-            !STATE.audio.source ||
-            !STATE.audio.analyserLeft ||
-            !STATE.audio.analyserRight ||
-            !STATE.audio.analyserEqualizerLeft ||
-            !STATE.audio.analyserEqualizerRight
-          ) {
-            stopRenderingLoop();
-            resetAudioState();
-            initAudioSystem();
+        scheduleAutoRebind(nextDelay);
+      }
+
+      function handleAMXVisibilityChange() {
+        AMX_RUNTIME.pageVisible = document.visibilityState !== "hidden";
+
+        if (!AMX_RUNTIME.pageVisible) {
+          stopRenderingLoop();
+          AMX_RUNTIME.autoRebindState = "hidden";
+          scheduleAutoRebind(AUTO_REBIND_HIDDEN_MS);
+          return;
+        }
+
+        // Resume immediately with the current graph, then verify the source.
+        startRendering();
+        scheduleAutoRebind(0);
+        requestRender();
+      }
+
+      AMX_RUNTIME.visibilityHandler = handleAMXVisibilityChange;
+      document.addEventListener("visibilitychange", AMX_RUNTIME.visibilityHandler);
+
+      function destroyAudioMetrix() {
+        if (AMX_RUNTIME.destroyed) return;
+        AMX_RUNTIME.destroyed = true;
+
+        stopRenderingLoop();
+
+        if (AMX_RUNTIME.autoRebindTimer) {
+          clearTimeout(AMX_RUNTIME.autoRebindTimer);
+          AMX_RUNTIME.autoRebindTimer = null;
+        }
+
+        if (AMX_RUNTIME.initRetryTimer) {
+          clearTimeout(AMX_RUNTIME.initRetryTimer);
+          AMX_RUNTIME.initRetryTimer = null;
+        }
+
+        if (AMX_RUNTIME.diagnosticsTimer) {
+          clearInterval(AMX_RUNTIME.diagnosticsTimer);
+          AMX_RUNTIME.diagnosticsTimer = null;
+        }
+
+        if (AMX_RUNTIME.visibilityHandler) {
+          document.removeEventListener("visibilitychange", AMX_RUNTIME.visibilityHandler);
+          AMX_RUNTIME.visibilityHandler = null;
+        }
+
+        if (AMX_RUNTIME.themeObserver) {
+          AMX_RUNTIME.themeObserver.disconnect();
+          AMX_RUNTIME.themeObserver = null;
+        }
+
+        if (AMX_RUNTIME.skinObserver) {
+          AMX_RUNTIME.skinObserver.disconnect();
+          AMX_RUNTIME.skinObserver = null;
+        }
+
+        if (AMX_RUNTIME.skinObserverRaf) {
+          cancelAnimationFrame(AMX_RUNTIME.skinObserverRaf);
+          AMX_RUNTIME.skinObserverRaf = 0;
+        }
+
+        if (AMX_RUNTIME.contentResizeObserver) {
+          AMX_RUNTIME.contentResizeObserver.disconnect();
+          AMX_RUNTIME.contentResizeObserver = null;
+        }
+
+        if (AMX_RUNTIME.barsResizeRaf !== null) {
+          cancelAnimationFrame(AMX_RUNTIME.barsResizeRaf);
+          AMX_RUNTIME.barsResizeRaf = null;
+        }
+
+        if (
+          STATE.dom &&
+          STATE.dom.settingsPanel &&
+          STATE.dom.settingsPanel._amxOverflowObserver
+        ) {
+          STATE.dom.settingsPanel._amxOverflowObserver.disconnect();
+          STATE.dom.settingsPanel._amxOverflowObserver = null;
+        }
+
+        for (const [type, handler, options] of AMX_RUNTIME.windowHandlers) {
+          window.removeEventListener(type, handler, options);
+        }
+        AMX_RUNTIME.windowHandlers.length = 0;
+
+        for (const timer of AMX_RUNTIME.pendingTimeouts) {
+          clearTimeout(timer);
+        }
+        AMX_RUNTIME.pendingTimeouts.clear();
+
+        cleanupAudioGraph();
+
+        try {
+          if (window.AudioMetrixResetMax === resetSamplePeakMemory) {
+            delete window.AudioMetrixResetMax;
           }
-        } catch (e) {}
-      }, AUTO_REBIND_INTERVAL_MS);
+        } catch (_) {}
+
+        if (AMX_RUNTIME.diagnosticsEl) {
+          AMX_RUNTIME.diagnosticsEl.remove();
+          AMX_RUNTIME.diagnosticsEl = null;
+        }
+      }
+
+      // Useful for admin/debug reloads and future plugin lifecycle integration.
+      window.AudioMetrixDestroy = destroyAudioMetrix;
+
+      scheduleAutoRebind(AUTO_REBIND_FAST_MS);
+      startDiagnosticsLoop();
 
       // Log + internal update check (panel + console)
       console.log(`[AudioMetrix] Loaded v${AMX_VERSION}`);
@@ -10318,7 +12398,7 @@ function saveAMXPanelGeometry(panel) {
       initAudioSystem();
 
       // Keep floating settings panel inside viewport on window resize
-      window.addEventListener("resize", () => {
+      const handleAMXPanelViewportClamp = () => {
         if (
           STATE.dom &&
           STATE.dom.settingsPanel &&
@@ -10326,7 +12406,11 @@ function saveAMXPanelGeometry(panel) {
         ) {
           clampAMXPanelToViewport(STATE.dom.settingsPanel);
         }
-      });
+      };
+      window.addEventListener("resize", handleAMXPanelViewportClamp);
+      AMX_RUNTIME.windowHandlers.push(
+        ["resize", handleAMXPanelViewportClamp, undefined]
+      );
 
     } catch (e) {
       console.error("[AudioMetrix] DOMContentLoaded init failed:", e);

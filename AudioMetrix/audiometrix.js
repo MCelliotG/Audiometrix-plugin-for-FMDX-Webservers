@@ -1,26 +1,16 @@
 /*
- * AudioMetrix v5.1
+ * AudioMetrix v5.5
  * FM-DX Webserver audio metering / visualization plugin
- *
- * v5.1 highlights:
- * - Phase 2 core audit and lifecycle cleanup
- * - Float32 RMS / sample-peak precision
- * - MAX L/R + CLIP admin diagnostics
- * - Optimized EQ / Hybrid analysis cadence with smooth 60 Hz visuals
- * - RMS+PEAK naming for Audio (A) meter
- * - Stereo Oscilloscope with Lines, Filled, Dots, Steps,
- *   Persistence, Carrier / Envelope and Spindle visual styles
- */
 
 (() => {
   // ─────────────────────────────────────────────────────────
-  // AUDIO METRIX 5.1.0 — RELEASE
+  // AUDIO METRIX 5.5.0 — RELEASE
   // THEME ENGINE • SETTINGS UI • RENDER ENGINE • AUDIO ENGINE
   // ─────────────────────────────────────────────────────────
 
   // PLUGIN METADATA
   const AMX_PLUGIN_NAME        = "AudioMetrix";
-  const AMX_VERSION            = "5.1";
+  const AMX_VERSION            = "5.5";
   const AMX_CHECK_FOR_UPDATES  = true;
   const AMX_UPDATE_URL         =
     "https://raw.githubusercontent.com/MCelliotG/Audiometrix-plugin-for-FMDX-Webservers/main/AudioMetrix/audiometrix.js";
@@ -62,14 +52,46 @@
     canvas: document.createElement("canvas"),
     ctx: null
   };
-  GRADIENT_TEMP.ctx = GRADIENT_TEMP.canvas.getContext("2d");
+  GRADIENT_TEMP.ctx = GRADIENT_TEMP.canvas.getContext("2d", { willReadFrequently: true });
+
+  // Retain recent sizes without accumulating every intermediate resize.
+  class BoundedGeometryMap extends Map {
+    set(key, value) {
+      if (!this.has(key) && this.size >= 32) {
+        this.delete(this.keys().next().value);
+      }
+      return super.set(key, value);
+    }
+  }
+
+  let CANVAS_FONT_CACHE = new WeakMap();
+  const EQUALIZER_GRADIENT_CACHE = new WeakMap();
+  const SPECTRUM_RELIEF_CACHE = new WeakMap();
+
+  function getCanvasFontStyle(source) {
+    if (!source) return null;
+    const signature = source.className + "|" + source.style.cssText;
+    const now = performance.now();
+    const cached = CANVAS_FONT_CACHE.get(source);
+    if (cached && cached.signature === signature && now - cached.time < 250) {
+      return cached;
+    }
+    const style = getComputedStyle(source);
+    const entry = {
+      signature, time: now,
+      fontFamily: style.fontFamily,
+      fontWeight: style.fontWeight
+    };
+    CANVAS_FONT_CACHE.set(source, entry);
+    return entry;
+  }
 
   const GEOMETRY_CACHE = {
-    segment: new Map(),
-    pixelfill: new Map(),
-    circledots: new Map(),
-    matrixdots: new Map(),
-    matrixCount: new Map()
+    segment: new BoundedGeometryMap(),
+    pixelfill: new BoundedGeometryMap(),
+    circledots: new BoundedGeometryMap(),
+    matrixdots: new BoundedGeometryMap(),
+    matrixCount: new BoundedGeometryMap()
   };
 
   const PERCENT_SCALE_PAD = {left: 5, right: 55};
@@ -90,6 +112,7 @@
   const STEREO_Q_SIGNAL_RATIO = 0.74;
 
   function invalidateVisualCaches() {
+    CANVAS_FONT_CACHE = new WeakMap();
     // Gradient cache
     GRADIENT_CACHE.mode = null;
     GRADIENT_CACHE.width = 0;
@@ -1473,6 +1496,771 @@
   // ─────────────────────────────────────────
   // CONFIG + STATE
   // ─────────────────────────────────────────
+  const VISUALIZER_NAMES = {
+    landscape: "Wave Landscape",
+    waterfall: "Spectrum Waterfall",
+    circular: "Circular Wave",
+    radial: "Radial Spectrum",
+    ribbon: "Ribbon / Helix",
+    stereoTrace: "Stereo Trace",
+    spectrogram: "Spectrogram",
+    goniometer: "Goniometer",
+    halo: "Halo", ripple: "Ripple", spiral: "Spiral",
+    tide: "Tide", layers: "Layers", shower: "Shower",
+    waveBloom: "Wave Bloom", wavePetals: "Wave Petals",
+    twistedRibbon: "Twisted Ribbon", fineHalo: "Fine Halo"
+  };
+  const CIRCULAR_STYLES = ["circular", "radial", "halo", "ripple", "spiral", "waveBloom", "wavePetals", "twistedRibbon", "fineHalo"];
+  const isCircularStyle = style => CIRCULAR_STYLES.includes(style);
+  const CIRCULAR_PALETTE = { themeKey: "", palette: [] };
+  let CIRCULAR_METER_STATE = null;
+
+  function createCircularNode() {
+    return {
+      wave: new Float32Array(128), spectrum: new Float32Array(121),
+      targets: new Float32Array(121), lookup: null, lookupKey: "",
+      pulseTimes: new Float64Array(24).fill(-Infinity),
+      pulseLevels: new Float32Array(24), pulseHead: 0,
+      lastPulse: -Infinity, lastLevel: 0, level: 0, peak: 0,
+      lastDraw: 0, lastSpectrum: -Infinity
+    };
+  }
+
+  // Analysis-only filters. Recompute each overlapping analyser window from
+  // scratch and discard its first half as warm-up; never alter playback.
+  function circularBandCoefficients(type, frequency, sampleRate) {
+    const w = Math.PI * 2 * Math.min(frequency, sampleRate * 0.45) / sampleRate;
+    const cos = Math.cos(w), alpha = Math.sin(w) / Math.SQRT2;
+    const a0 = 1 + alpha;
+    const b0 = (type === "lowpass" ? 1 - cos : 1 + cos) / 2;
+    return { b0: b0 / a0,
+      b1: (type === "lowpass" ? 1 - cos : -(1 + cos)) / a0,
+      b2: b0 / a0, a1: -2 * cos / a0, a2: (1 - alpha) / a0 };
+  }
+
+  function filterCircularBand(input, output, c) {
+    let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    for (let i = 0; i < output.length; i++) {
+      const x = input[i] || 0;
+      const y = c.b0 * x + c.b1 * x1 + c.b2 * x2 - c.a1 * y1 - c.a2 * y2;
+      output[i] = y; x2 = x1; x1 = x; y2 = y1; y1 = y;
+    }
+  }
+
+  function updateCircularBands(v, frame) {
+    const nodes = v.circles;
+    const left = STATE.audio.timeLeft, right = STATE.audio.timeRight;
+    const n = Math.min(left?.length || 0, right?.length || 0);
+    if (STATE.hasStreamObject !== true || n < 4) {
+      for (const node of nodes) {
+        node.wave.fill(0);node.spectrum.fill(0);node.level = 0;
+      }
+      return;
+    }
+    const sampleRate = STATE.audio.context?.sampleRate || 48000;
+    const key = `${sampleRate}|${n}`;
+    let analysis = v.bandAnalysis;
+    if (!analysis || analysis.key !== key) {
+      const ranges = [[30, 250], [250, 4000], [4000, 20000]];
+      analysis = v.bandAnalysis = {
+        key, coefficients: [
+          circularBandCoefficients("lowpass", 250, sampleRate),
+          circularBandCoefficients("highpass", 250, sampleRate),
+          circularBandCoefficients("lowpass", 4000, sampleRate),
+          circularBandCoefficients("highpass", 4000, sampleRate)
+        ],
+        buffers: Array.from({ length: 2 }, () => Array.from({ length: 4 }, () => new Float32Array(n))),
+        spectrumPositions: ranges.map(([low, high]) => Float32Array.from({ length: 121 }, (_, i) => {
+          const frequency = low * Math.pow(high / low, i / 120);
+          let band = 0;
+          while (band < EQ_BAND_COUNT - 2 && frequency > EQ_CENTER_FREQUENCIES[band + 1]) band++;
+          const t = Math.log(frequency / EQ_CENTER_FREQUENCIES[band]) /
+            Math.log(EQ_CENTER_FREQUENCIES[band + 1] / EQ_CENTER_FREQUENCIES[band]);
+          return clamp((band + t) * 8, 0, 120);
+        }))
+      };
+    }
+    for (let channel = 0; channel < 2; channel++) {
+      const source = channel ? right : left, buffers = analysis.buffers[channel], c = analysis.coefficients;
+      filterCircularBand(source, buffers[0], c[0]);
+      filterCircularBand(source, buffers[3], c[1]);
+      filterCircularBand(buffers[3], buffers[1], c[2]);
+      filterCircularBand(source, buffers[2], c[3]);
+    }
+    const start = Math.floor(n / 2), tail = n - start, gain = getScopeGainLinear();
+    for (let band = 0; band < 3; band++) {
+      const node = nodes[band], l = analysis.buffers[0][band], r = analysis.buffers[1][band];
+      let powerL = 0, powerR = 0;
+      for (let i = start; i < n; i++) { powerL += l[i] * l[i];powerR += r[i] * r[i]; }
+      node.level = clamp(Math.sqrt((powerL + powerR) / (tail * 2)) * gain * 2, 0, 1);
+      const waveform = powerL >= powerR ? l : r;
+      for (let i = 0; i < node.wave.length; i++) {
+        const first = start + Math.floor(i / node.wave.length * tail);
+        const last = Math.min(n, Math.max(first + 1, start + Math.floor((i + 1) / node.wave.length * tail)));
+        let sample = 0;
+        for (let j = first; j < last; j++) if (Math.abs(waveform[j]) > Math.abs(sample)) sample = waveform[j];
+        node.wave[i] = clamp(sample * gain, -1, 1);
+      }
+      const positions = analysis.spectrumPositions[band];
+      for (let i = 0; i < 121; i++) {
+        const p = positions[i], lo = Math.floor(p), hi = Math.min(120, lo + 1);
+        node.spectrum[i] = frame.spectrum[lo] + (frame.spectrum[hi] - frame.spectrum[lo]) * (p - lo);
+      }
+      node.scalar = false;
+    }
+  }
+
+  const CIRCULAR_WARNING_ZONES = {
+    Q: { threshold: 0.82, color: "#ffd400" },
+    A: { threshold: 0.58, color: "#ff0000" }
+  };
+
+  function circularWarningZone(node) {
+    return CIRCULAR_WARNING_ZONES[node.metric] || null;
+  }
+
+  function drawCircularStyle(ctx, style, cx, cy, radius, node, now) {
+    refreshVisualizerPalette(CIRCULAR_PALETTE);
+    const palette = CIRCULAR_PALETTE.palette;
+    const colors = ACTIVE_THEME.colors;
+    const samples = node.wave;
+    const level = clamp(node.level || 0, 0, 1);
+    const zone = circularWarningZone(node);
+    const warning = zone && level >= zone.threshold ? zone.color : null;
+    const points = radius < 35 ? 96 : 160;
+    const tau = Math.PI * 2;
+    const sampleAt = fraction => samples[Math.floor(fraction * samples.length) % samples.length] || 0;
+    const colour = fraction => palette[Math.round(clamp(fraction, 0, 1) * 63)];
+    const line = (alpha, color, width = 0.7) => {
+      ctx.globalAlpha = alpha; ctx.strokeStyle = color;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = CONFIG.display.glowIntensity > 0 ? 3 : 0;
+      ctx.lineWidth = width; ctx.stroke();
+    };
+    ctx.save();
+    ctx.lineJoin = "round"; ctx.lineCap = "round";
+    ctx.shadowColor = colors.high;
+    ctx.shadowBlur = CONFIG.display.glowIntensity > 0 ? 2 : 0;
+    if (style === "radial") {
+      const base = radius * 0.49;
+      ctx.beginPath(); ctx.arc(cx, cy, base, 0, tau);
+      line(0.45, colors.mid);
+      ctx.shadowBlur = 0;
+      for (let i = 0; i < node.spectrum.length; i++) {
+        const value = clamp(node.spectrum[i], 0, 1);
+        const angle = i / node.spectrum.length * tau - Math.PI / 2;
+        const outer = base + value * radius * 0.48;
+        ctx.beginPath();
+        ctx.moveTo(cx + Math.cos(angle) * base, cy + Math.sin(angle) * base);
+        ctx.lineTo(cx + Math.cos(angle) * outer, cy + Math.sin(angle) * outer);
+        const position = i / (node.spectrum.length - 1);
+        const rayColor = zone && position >= zone.threshold && position <= level && value > 0
+          ? zone.color : colour(value);
+        line(0.25 + value * 0.75, rayColor, Math.max(0.6, radius / 55));
+      }
+    } else if (style === "halo") {
+      ctx.beginPath(); ctx.arc(cx, cy, radius * 0.93, 0, tau);
+      line(0.30 + level * 0.65, colors.high, 1.3);
+      if (warning) {
+        ctx.beginPath();ctx.arc(cx, cy, radius * 0.93,
+          zone.threshold * tau - Math.PI / 2, level * tau - Math.PI / 2);
+        line(0.95, warning, 1.5);
+      }
+      ctx.shadowBlur = 0;
+      for (let i = 0; i < 48; i++) {
+        const angle = i / 48 * tau - Math.PI / 2;
+        const amount = Math.abs(sampleAt(i / 48));
+        const r = radius * (0.58 + amount * 0.14);
+        ctx.beginPath();
+        ctx.moveTo(cx + Math.cos(angle) * r, cy + Math.sin(angle) * r);
+        ctx.lineTo(cx + Math.cos(angle) * (r + radius * 0.05), cy + Math.sin(angle) * (r + radius * 0.05));
+        const position = i / 48;
+        line(0.15 + Math.max(amount, level) * 0.70,
+          zone && position >= zone.threshold && position <= level ? zone.color : colour(position));
+      }
+    } else if (style === "ripple") {
+      if (level > 0.01 && (
+        (Math.abs(level - node.lastLevel) > 0.018 && now - node.lastPulse > 65) ||
+        now - node.lastPulse > 150 + (1 - level) * 250
+      )) {
+        node.pulseTimes[node.pulseHead] = now;
+        node.pulseLevels[node.pulseHead] = level;
+        node.pulseHead = (node.pulseHead + 1) % node.pulseTimes.length;
+        node.lastPulse = now;
+      }
+      node.lastLevel = level;
+      const duration = CONFIG.display.visualizerTrail / 30 * 1000;
+      for (let ring = 0; ring < node.pulseTimes.length; ring++) {
+        const age = (now - node.pulseTimes[ring]) / duration;
+        if (age < 0 || age >= 1) continue;
+        ctx.beginPath();
+        for (let i = 0; i <= points; i++) {
+          const fraction = i / points, angle = fraction * tau;
+          const core = 0.43 + node.pulseLevels[ring] * 0.03;
+          const r = radius * Math.min(0.99, core + 0.025 + age * (0.965 - core) + sampleAt(fraction) * 0.015 * (1 - age));
+          const x = cx + Math.cos(angle) * r, y = cy + Math.sin(angle) * r;
+          if (!i) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        const ringColor = zone && node.pulseLevels[ring] >= zone.threshold ? zone.color : colour(1 - age);
+        line(Math.pow(1 - age, 0.65) * (0.30 + node.pulseLevels[ring] * 0.65), ringColor, 0.9);
+      }
+      ctx.beginPath(); ctx.arc(cx, cy, radius * (0.43 + level * 0.03), 0, tau);
+      line(0.55 + level * 0.40, warning || colors.high, 1.1);
+    } else if (style === "spiral") {
+      const turns = 5;
+      ctx.shadowBlur = 0;
+      for (let turn = 0; turn < turns; turn++) {
+        ctx.beginPath();
+        for (let i = 0; i <= points; i++) {
+          const fraction = i / points;
+          const position = (turn + fraction) / turns;
+          const angle = fraction * tau - Math.PI / 2;
+          const r = radius * position * (0.92 + sampleAt(fraction) * 0.065);
+          const x = cx + Math.cos(angle) * r, y = cy + Math.sin(angle) * r;
+          if (!i) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        line(0.40 + turn / turns * 0.5, warning || colour((turn + 1) / turns));
+      }
+    } else {
+      const simple = style === "circular";
+      const count = simple ? 1 : (radius < 35 ? 10 : 18);
+      const size = count * (points + 1) * 2;
+      if (!node.outline || node.outline.length !== size) node.outline = new Float32Array(size);
+      const outline = node.outline;
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      for (let curve = 0; curve < count; curve++) {
+        const t = count > 1 ? curve / (count - 1) : 1;
+        for (let i = 0; i <= points; i++) {
+          const fraction = i / points, angle = fraction * tau - Math.PI / 2;
+          const wave = sampleAt(fraction);
+          let r;
+          if (simple) {
+            r = node.scalar ? 0.66 + level * 0.29 : 0.86 + wave * 0.12;
+          } else if (style === "waveBloom") {
+            const fold = Math.sin(angle * 4 + wave * 1.8) * (0.045 + level * 0.09);
+            r = 0.36 + t * 0.48 + fold + wave * 0.055;
+          } else if (style === "wavePetals") {
+            const petal = Math.cos(angle * 5) * (0.035 + level * 0.12);
+            r = 0.35 + t * 0.46 + petal + wave * 0.04 * t;
+          } else if (style === "twistedRibbon") {
+            const twist = Math.sin(angle * 3 + wave * 2.4);
+            r = 0.80 + twist * (0.035 + level * 0.025) +
+              Math.sin(angle * 2 + wave * 1.7 + t * 0.6) * (t - 0.5) * 0.26;
+          } else {
+            // Fine Halo: a narrow translucent ribbon, locally folded.
+            r = 0.90 + wave * 0.035 +
+              Math.sin(angle * 3 + wave * 3.4 + t * 0.7) * (t - 0.5) * 0.085;
+          }
+          r = clamp(r, 0.12, 0.985) * radius;
+          const x = Math.cos(angle) * r, y = Math.sin(angle) * r;
+          const offset = (curve * (points + 1) + i) * 2;
+          outline[offset] = x;outline[offset + 1] = y;
+          minX = Math.min(minX, x);maxX = Math.max(maxX, x);
+          minY = Math.min(minY, y);maxY = Math.max(maxY, y);
+        }
+      }
+      // Fit the actual contour, rather than a generously padded nominal
+      // radius. This uses the available height without stretching the shape.
+      const fit = Math.min(radius * 1.97 / Math.max(0.001, maxX - minX),
+        radius * 1.97 / Math.max(0.001, maxY - minY));
+      ctx.translate(cx, cy);ctx.scale(fit, fit);
+      ctx.translate(-(minX + maxX) / 2, -(minY + maxY) / 2);
+      for (let curve = 0; curve < count; curve++) {
+        const t = count > 1 ? curve / (count - 1) : 1;
+        ctx.shadowBlur = CONFIG.display.glowIntensity > 0 && curve === count - 1 ? 2 : 0;
+        ctx.beginPath();
+        for (let i = 0; i <= points; i++) {
+          const offset = (curve * (points + 1) + i) * 2;
+          if (!i) ctx.moveTo(outline[offset], outline[offset + 1]);
+          else ctx.lineTo(outline[offset], outline[offset + 1]);
+        }
+        ctx.closePath();
+        line(simple ? 0.95 : 0.38 + t * 0.40,
+          warning || (simple ? colors.high : colour(0.25 + t * 0.75)), (simple ? 1.1 : 0.55) / fit);
+      }
+    }
+    ctx.restore();
+  }
+
+  function getCircularMeterState() {
+    const source = STATE.audio.timeLeft;
+    if (!CIRCULAR_METER_STATE || CIRCULAR_METER_STATE.source !== source) {
+      CIRCULAR_METER_STATE = {
+        source, L: createCircularNode(), R: createCircularNode(),
+        Q: createCircularNode(), A: createCircularNode()
+      };
+    }
+    return CIRCULAR_METER_STATE;
+  }
+
+  function updateCircularSpectra(now) {
+    const a = STATE.audio;
+    const state = getCircularMeterState();
+    const bins = Math.min(a.dataEqualizerLeft?.length || 0, a.dataEqualizerRight?.length || 0);
+    if (!bins) return;
+    const nyquist = (a.context?.sampleRate || 48000) / 2;
+    for (const key of ["L", "R"]) {
+      const node = state[key];
+      const buffer = key === "L" ? a.dataEqualizerLeft : a.dataEqualizerRight;
+      const analyser = key === "L" ? a.analyserEqualizerLeft : a.analyserEqualizerRight;
+      if (!analyser) continue;
+      const lookupKey = `${nyquist}|${bins}`;
+      if (node.lookupKey !== lookupKey) {
+        node.lookupKey = lookupKey;
+        node.lookup = Array.from({ length: 121 }, (_, i) => {
+          const p = i / 8, band = Math.min(EQ_BAND_COUNT - 2, Math.floor(p)), t = p - band;
+          const frequency = EQ_CENTER_FREQUENCIES[band] * Math.pow(EQ_CENTER_FREQUENCIES[band + 1] / EQ_CENTER_FREQUENCIES[band], t);
+          return { bin: frequency / nyquist * bins,
+            gain: EQ_PREAMP_GAINS[band] + (EQ_PREAMP_GAINS[band + 1] - EQ_PREAMP_GAINS[band]) * t,
+            floor: EQ_FLOOR_LEVELS[band] + (EQ_FLOOR_LEVELS[band + 1] - EQ_FLOOR_LEVELS[band]) * t };
+        });
+      }
+      for (let i = 0; i < 121; i++) {
+        const item = node.lookup[i], bin = item.bin;
+        let value = 0;
+        if (bin <= bins - 1) {
+          const lo = Math.max(0, Math.floor(bin)), hi = Math.min(bins - 1, lo + 1);
+          value = buffer[lo] + (buffer[hi] - buffer[lo]) * (bin - lo);
+        }
+        const minDb = analyser.minDecibels;
+        const db = clamp(minDb + value / 255 * (analyser.maxDecibels - minDb) + CONFIG.audio.dbGain, minDb, -30);
+        const scaled = (db - minDb) / Math.max(1, -30 - minDb) * 255 * item.gain;
+        node.targets[i] = STATE.hasStreamObject === true
+          ? Math.pow(clamp((scaled - item.floor) / (255 - item.floor), 0, 1), 1 / EQ_SENSITIVITY) : 0;
+      }
+      node.lastSpectrum = now;
+    }
+  }
+
+  function renderCircularMeters(ctx, canvas, layout, style) {
+    const width = getCanvasLogicalWidth(canvas), height = WRAPPER_HEIGHT;
+    resizeCanvasIfNeeded(canvas, width, height);
+    applyCanvasHiDpiTransform(canvas);
+    ctx.clearRect(0, 0, width, height);
+    const state = getCircularMeterState();
+    const keys = layout === "full" ? ["L", "R", "Q", "A"] : layout === "sa" ? ["Q", "A"] : ["L", "R"];
+    const slot = width / keys.length;
+    const radius = Math.max(1, Math.min(slot / 2 - 3, height / 2 - 2));
+    const now = performance.now(), colors = ACTIVE_THEME.colors;
+    const minDb = CONFIG.audio.minDb, range = Math.max(1, CONFIG.audio.maxDb - minDb);
+    const playing = STATE.hasStreamObject === true;
+    const gain = getScopeGainLinear();
+    ctx.save(); ctx.beginPath(); ctx.rect(0, 0, width, height); ctx.clip();
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index], node = state[key];
+      const left = key === "L", right = key === "R", isQ = key === "Q";
+      const channel = left ? STATE.levels.left : right ? STATE.levels.right : null;
+      const db = channel ? channel.smoothDb : isQ
+        ? mapStereoQualityToDb(STATE.levels.stereoQuality.smooth, minDb, range)
+        : mapAudioSampleToDb(STATE.levels.audio.smooth, minDb, range);
+      const peakDb = channel ? channel.peakDb : isQ
+        ? STATE.levels.stereoQuality.peakDb : mapAudioSampleToDb(STATE.levels.audio.peak, minDb, range);
+      node.level = playing ? clamp((db - minDb) / range, 0, 1) : 0;
+      node.peak = playing ? clamp((peakDb - minDb) / range, 0, 1) : 0;
+      node.scalar = isQ;
+      node.metric = key;
+      const source = left ? STATE.audio.timeLeft : right ? STATE.audio.timeRight : key === "A" ? STATE.audio.dataPeak : null;
+      const trigger = source?.length && playing ? findScopeTrigger(source) : 0;
+      for (let i = 0; i < node.wave.length; i++) {
+        const n = source?.length || 0;
+        node.wave[i] = n && playing ? clamp((source[(trigger + Math.floor(i / node.wave.length * n * 0.5)) % n] || 0) * gain, -1, 1) : 0;
+      }
+      const delta = node.lastDraw ? Math.min(0.1, (now - node.lastDraw) / 1000) : 1 / 60;
+      node.lastDraw = now;
+      const attack = 1 - Math.pow(1 - (0.08 + CONFIG.audio.attackSpeed * 0.42), Math.max(0.01, delta * 60));
+      const release = 1 - Math.pow(1 - (0.015 + CONFIG.audio.releaseSpeed * 0.12), Math.max(0.01, delta * 60));
+      for (let i = 0; i < node.spectrum.length; i++) {
+        if (channel) {
+          const target = playing ? node.targets[i] : 0;
+          node.spectrum[i] += (target - node.spectrum[i]) * (target > node.spectrum[i] ? attack : release);
+        } else {
+          // Q and A are circular meters, not invented frequency spectra.
+          node.spectrum[i] = i / node.spectrum.length <= node.level && node.level > 0 ? node.level : 0;
+        }
+      }
+      const cx = slot * (index + 0.5), cy = height / 2;
+      drawCircularStyle(ctx, style, cx, cy, radius, node, now);
+      // True value/peak arc remains readable independently of ornament style.
+      ctx.save();ctx.shadowBlur = 0;
+      const inner = radius * 0.34;
+      ctx.strokeStyle = colors.mid; ctx.globalAlpha = 0.22; ctx.lineWidth = 0.8;
+      ctx.beginPath();ctx.arc(cx, cy, inner, 0, Math.PI * 2);ctx.stroke();
+      if (playing) {
+        const zone = circularWarningZone(node);
+        const normalEnd = zone ? Math.min(node.level, zone.threshold) : node.level;
+        ctx.globalAlpha = 0.85; ctx.strokeStyle = colors.high;
+        ctx.shadowColor = colors.high;ctx.shadowBlur = CONFIG.display.glowIntensity > 0 ? 3 : 0;
+        ctx.beginPath();ctx.arc(cx, cy, inner, -Math.PI / 2, -Math.PI / 2 + normalEnd * Math.PI * 2);ctx.stroke();
+        if (zone && node.level > zone.threshold) {
+          ctx.strokeStyle = zone.color;ctx.shadowColor = zone.color;
+          ctx.beginPath();ctx.arc(cx, cy, inner, -Math.PI / 2 + zone.threshold * Math.PI * 2,
+            -Math.PI / 2 + node.level * Math.PI * 2);ctx.stroke();
+        }
+        if (CONFIG.display.showPeaks && Number.isFinite(node.peak)) {
+          const angle = node.peak * Math.PI * 2 - Math.PI / 2;
+          ctx.beginPath();ctx.moveTo(cx + Math.cos(angle) * (inner - 2), cy + Math.sin(angle) * (inner - 2));
+          ctx.lineTo(cx + Math.cos(angle) * (inner + 2), cy + Math.sin(angle) * (inner + 2));
+          const peakColor = zone && node.peak >= zone.threshold ? zone.color : colors.peak;
+          ctx.strokeStyle = peakColor;ctx.shadowColor = peakColor;ctx.stroke();
+        }
+      }
+      ctx.shadowBlur = 0;
+      const font = getCanvasFontStyle(STATE.dom.title);
+      const size = radius < 34 ? 8 : 10;
+      ctx.globalAlpha = 0.95; ctx.fillStyle = colors.high;
+      ctx.font = `600 ${size}px ${font?.fontFamily || "sans-serif"}`;
+      ctx.textAlign = "center";ctx.textBaseline = "middle";
+      const values = CONFIG.display.showReadouts && playing;
+      ctx.fillText(key, cx, cy - (values ? 5 : 0));
+      if (values) {
+        ctx.font = `${Math.max(7, size - 1)}px ${font?.fontFamily || "sans-serif"}`;
+        const value = isQ ? `${Math.round(STATE.levels.stereoQuality.smooth)}%` : Number.isFinite(db) ? `${db.toFixed(1)}` : "–";
+        const zone = circularWarningZone(node);
+        ctx.fillStyle = zone && node.level >= zone.threshold ? zone.color : colors.high;
+        ctx.fillText(value, cx, cy + 7);
+      }
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  let VISUALIZER_STATE = null;
+
+  function resetVisualizerState() {
+    VISUALIZER_STATE = null;
+    CIRCULAR_METER_STATE = null;
+  }
+
+  function getVisualizerState(style, now) {
+    const source = STATE.audio.timeLeft;
+    let v = VISUALIZER_STATE;
+    if (!v || v.style !== style || v.source !== source) {
+      v = VISUALIZER_STATE = {
+        style, source, lastCapture: -Infinity,
+        head: -1, count: 0, themeKey: "", correlation: 0, width: 0,
+        frames: Array.from({ length: 48 }, () => ({
+          spectrum: new Float32Array(121),
+          wave: new Float32Array(128), xy: new Float32Array(512)
+        })),
+        palette: [], image: null, imageCtx: null,
+        circles: Array.from({ length: 3 }, () => createCircularNode()), bandAnalysis: null,
+        particleHead: 0,
+        particles: Array.from({ length: 256 }, () => ({ born: -Infinity, x: 0, level: 0, strength: 0 }))
+      };
+    }
+    return v;
+  }
+
+  function captureVisualizerFrame(v, now) {
+    if (now - v.lastCapture < 1000 / 30) return false;
+    v.lastCapture = now;
+    v.head = (v.head + 1) % v.frames.length;
+    v.count = Math.min(v.frames.length, v.count + 1);
+    const frame = v.frames[v.head];
+    const detail = STATE.levels.equalizer.detail?.values;
+    frame.spectrum.fill(0);
+    if (detail) frame.spectrum.set(detail.subarray(0, 121));
+    const left = STATE.audio.timeLeft;
+    const right = STATE.audio.timeRight;
+    const n = Math.min(left?.length || 0, right?.length || 0);
+    const gain = getScopeGainLinear();
+    const playing = STATE.hasStreamObject === true;
+    // A shared trigger keeps circular and landscape traces stable.
+    const trigger = n > 1 && playing ? findScopeTrigger(left) : 0;
+    for (let i = 0; i < frame.wave.length; i++) {
+      const sample = n ? (trigger + Math.floor(i / frame.wave.length * n * 0.5)) % n : 0;
+      frame.wave[i] = playing && n
+        ? clamp(((left[sample] || 0) + (right[sample] || 0)) * 0.5 * gain, -1, 1)
+        : 0;
+    }
+    let ll = 0, rr = 0, lr = 0, midPower = 0, sidePower = 0;
+    for (let i = 0; i < 256; i++) {
+      const sample = Math.min(n - 1, Math.floor(i / 256 * n));
+      const l = n && playing ? left[sample] || 0 : 0;
+      const r = n && playing ? right[sample] || 0 : 0;
+      const mid = (l + r) * Math.SQRT1_2;
+      const side = (l - r) * Math.SQRT1_2;
+      frame.xy[i * 2] = clamp(side * gain, -1, 1);
+      frame.xy[i * 2 + 1] = clamp(mid * gain, -1, 1);
+      ll += l * l; rr += r * r; lr += l * r;
+      midPower += mid * mid; sidePower += side * side;
+    }
+    v.correlationValid = ll * rr > 1e-16;
+    v.correlation = v.correlationValid ? clamp(lr / Math.sqrt(ll * rr), -1, 1) : 0;
+    v.width = midPower + sidePower > 1e-12
+      ? Math.sqrt(sidePower / (midPower + sidePower)) : 0;
+    if (!playing) frame.spectrum.fill(0);
+    if (isCircularStyle(v.style)) updateCircularBands(v, frame);
+    return true;
+  }
+
+  function visualizerFrame(v, age) {
+    return v.frames[(v.head - age + v.frames.length) % v.frames.length];
+  }
+
+  function refreshVisualizerPalette(v) {
+    const colors = ACTIVE_THEME.colors;
+    const key = `${colors.low}|${colors.mid}|${colors.high}`;
+    if (v.themeKey === key) return;
+    v.themeKey = key;
+    const swatch = document.createElement("canvas");
+    swatch.width = 64; swatch.height = 1;
+    const paint = swatch.getContext("2d", { willReadFrequently: true });
+    const gradient = paint.createLinearGradient(0, 0, 64, 0);
+    gradient.addColorStop(0, colors.low);
+    gradient.addColorStop(0.5, colors.mid);
+    gradient.addColorStop(1, colors.high);
+    paint.fillStyle = gradient; paint.fillRect(0, 0, 64, 1);
+    const pixels = paint.getImageData(0, 0, 64, 1).data;
+    v.palette = Array.from({ length: 64 }, (_, i) =>
+      `rgb(${pixels[i * 4]},${pixels[i * 4 + 1]},${pixels[i * 4 + 2]})`);
+    // A theme change must not leave old colours in the spectrogram history.
+    if (v.imageCtx) v.imageCtx.clearRect(0, 0, 256, 121);
+  }
+
+  function renderVisualizer(ctx, canvas) {
+    const style = CONFIG.display.visualizerStyle;
+    const width = getCanvasLogicalWidth(canvas);
+    const height = WRAPPER_HEIGHT;
+    resizeCanvasIfNeeded(canvas, width, height);
+    applyCanvasHiDpiTransform(canvas);
+    ctx.clearRect(0, 0, width, height);
+    const now = performance.now();
+    const v = getVisualizerState(style, now);
+    const captured = captureVisualizerFrame(v, now);
+    refreshVisualizerPalette(v);
+    if (v.head < 0) return;
+    const current = visualizerFrame(v, 0);
+    const colors = ACTIVE_THEME.colors;
+    const showValues = CONFIG.display.showReadouts && STATE.hasStreamObject === true;
+    const reserve = (showValues ? 12 : 0) + (style === "goniometer" ? 7 : 0);
+    const w = Math.max(1, width - 12), h = Math.max(1, height - reserve - 2);
+    const cx = width / 2, cy = 1 + h / 2;
+    const radius = Math.max(1, Math.min(w / 2 - 1, h / 2 - 1));
+    const historyCount = Math.min(v.count, CONFIG.display.visualizerTrail);
+    const palette = (level) => v.palette[Math.round(clamp(level, 0, 1) * 63)];
+    const stroke = (alpha, color, lineWidth = 1, glow = true) => {
+      ctx.globalAlpha = alpha;
+      ctx.strokeStyle = color;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = glow && CONFIG.display.glowIntensity > 0 ? 3 : 0;
+      ctx.lineWidth = lineWidth;
+      ctx.stroke();
+    };
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, width, height); ctx.clip();
+    ctx.lineJoin = "round"; ctx.lineCap = "round";
+    if (CONFIG.display.glowIntensity > 0 && style !== "spectrogram") {
+      ctx.shadowColor = colors.high;
+      ctx.shadowBlur = 3;
+    }
+
+    if (style === "landscape" || style === "waterfall") {
+      const count = Math.max(1, historyCount);
+      for (let age = count - 1; age >= 0; age--) {
+        const frame = visualizerFrame(v, age);
+        ctx.shadowBlur = CONFIG.display.glowIntensity > 0 && age === 0 ? 3 : 0;
+        const depth = age / Math.max(1, count - 1);
+        const scale = 1 - depth * 0.35;
+        const left = cx - w * scale / 2;
+        const baseline = (style === "waterfall" ? h : h * 0.88) - depth * h * 0.60;
+        const samples = style === "waterfall" ? frame.spectrum : frame.wave;
+        ctx.beginPath();
+        for (let i = 0; i < samples.length; i++) {
+          const x = left + i / (samples.length - 1) * w * scale;
+          const amplitude = style === "waterfall" ? h * 0.47 : h * 0.11;
+          const y = baseline - samples[i] * amplitude * scale;
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        stroke((1 - depth * 0.82) * 0.85, palette(1 - depth * 0.8), age === 0 ? 1.3 : 0.7);
+      }
+    } else if (isCircularStyle(style)) {
+      const names = ["Low", "Medium", "High"];
+      const slot = width / 3;
+      const bandRadius = Math.max(1, Math.min(slot / 2 - 3, h / 2 - 1));
+      const font = getCanvasFontStyle(STATE.dom.title);
+      for (let band = 0; band < 3; band++) {
+        const bandX = slot * (band + 0.5);
+        drawCircularStyle(ctx, style, bandX, cy, bandRadius, v.circles[band], now);
+        ctx.save();ctx.shadowBlur = 0;
+        ctx.textAlign = "center";ctx.textBaseline = "middle";
+        ctx.font = `600 ${Math.min(9, Math.max(7, bandRadius * 0.21))}px ${font?.fontFamily || "sans-serif"}`;
+        ctx.strokeStyle = colors.low;ctx.lineWidth = 3;ctx.globalAlpha = 0.95;
+        ctx.strokeText(names[band], bandX, cy, slot - 8);
+        ctx.fillStyle = colors.high;ctx.fillText(names[band], bandX, cy, slot - 8);
+        ctx.restore();
+      }
+    } else if (style === "ribbon") {
+      const samples = current.wave;
+      const energy = current.spectrum.reduce((sum, value) => sum + value, 0) / 121;
+      // Three strands with audio-dependent twist, no free-running phase.
+      for (let strand = 0; strand < 3; strand++) {
+        ctx.beginPath();
+        for (let i = 0; i < samples.length; i++) {
+          const fraction = i / (samples.length - 1);
+          const angle = fraction * Math.PI * 10 + strand * Math.PI * 2 / 3 + samples[i] * 1.6;
+          const spread = Math.sin(fraction * Math.PI) * radius * (0.40 + energy * 0.60);
+          const x = 6 + fraction * w;
+          const y = cy + Math.cos(angle) * spread + samples[i] * radius * 0.18;
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        stroke(0.70, [colors.low, colors.mid, colors.high][strand], 1.1);
+      }
+    } else if (style === "stereoTrace" || style === "goniometer") {
+      const sizeX = w * 0.48;
+      const sizeY = h * 0.48;
+      if (style === "goniometer") {
+        ctx.shadowBlur = 0;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy - sizeY); ctx.lineTo(cx + sizeX, cy);
+        ctx.lineTo(cx, cy + sizeY); ctx.lineTo(cx - sizeX, cy); ctx.closePath();
+        ctx.moveTo(cx - sizeX, cy); ctx.lineTo(cx + sizeX, cy);
+        ctx.moveTo(cx, cy - sizeY); ctx.lineTo(cx, cy + sizeY);
+        stroke(0.35, colors.mid, 0.6, false);
+        if (CONFIG.display.glowIntensity > 0) ctx.shadowBlur = 3;
+      }
+      ctx.save();
+      if (style === "goniometer") {
+        ctx.beginPath();ctx.moveTo(cx, cy - sizeY);ctx.lineTo(cx + sizeX, cy);
+        ctx.lineTo(cx, cy + sizeY);ctx.lineTo(cx - sizeX, cy);ctx.closePath();ctx.clip();
+      }
+      const count = Math.min(historyCount, 16);
+      for (let age = count - 1; age >= 0; age--) {
+        const historyAge = count > 1 ? Math.round(age * (historyCount - 1) / (count - 1)) : 0;
+        const xy = visualizerFrame(v, historyAge).xy;
+        ctx.shadowBlur = CONFIG.display.glowIntensity > 0 && age === 0 ? 3 : 0;
+        ctx.beginPath();
+        for (let i = 0; i < 256; i++) {
+          const x = cx + xy[i * 2] * sizeX;
+          const y = cy - xy[i * 2 + 1] * sizeY;
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        stroke(age === 0 ? 0.85 : (1 - age / count) * 0.11, age === 0 ? colors.high : colors.mid, 0.75);
+      }
+      ctx.restore();
+      if (style === "goniometer") {
+        ctx.shadowBlur = 0;
+        const barX = cx - w * 0.35, barW = w * 0.70, barY = h + 2;
+        ctx.globalAlpha = 0.32; ctx.fillStyle = colors.low;
+        ctx.fillRect(barX, barY, barW, 3);
+        if (v.correlationValid) {
+          ctx.globalAlpha = 0.95; ctx.fillStyle = v.correlation < 0 ? colors.mid : colors.high;
+          ctx.fillRect(barX + (v.correlation + 1) * 0.5 * (barW - 2), barY - 1, 2, 5);
+        }
+      }
+    } else if (style === "tide") {
+      ctx.shadowBlur = 0;
+      const columns = Math.max(1, historyCount * 4);
+      const dx = w / columns;
+      for (let column = 0; column < columns; column++) {
+        const age = historyCount - 1 - Math.floor(column / 4);
+        const frame = visualizerFrame(v, age);
+        const segment = column % 4;
+        let power = 0;
+        for (let i = segment * 32; i < segment * 32 + 32; i++) power += frame.wave[i] * frame.wave[i];
+        const level = clamp(Math.sqrt(power / 32) * 2, 0, 1);
+        const amp = level * h * 0.49;
+        ctx.beginPath();ctx.moveTo(6 + column * dx, cy - amp);ctx.lineTo(6 + column * dx, cy + amp);
+        stroke(0.35 + level * 0.65, palette(level), Math.max(0.6, dx * 0.64));
+      }
+    } else if (style === "layers") {
+      ctx.shadowBlur = 0;
+      const count = Math.min(historyCount, 8);
+      for (let layer = 0; layer < count; layer++) {
+        const age = count > 1 ? Math.round((count - layer - 1) * (historyCount - 1) / (count - 1)) : 0;
+        const wave = visualizerFrame(v, age).wave;
+        const base = h * (0.15 + layer / Math.max(1, count - 1) * 0.69);
+        ctx.beginPath();
+        for (let i = 0; i < wave.length; i++) {
+          const x = 6 + i / (wave.length - 1) * w;
+          const y = clamp(base - wave[i] * h * 0.14, 1, h);
+          if (!i) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.lineTo(6 + w, h + 1);ctx.lineTo(6, h + 1);ctx.closePath();
+        ctx.globalAlpha = 0.10;ctx.fillStyle = palette((layer + 1) / count);ctx.fill();
+        // The upper boundary alone is the illuminated layer edge.
+        ctx.beginPath();
+        for (let i = 0; i < wave.length; i++) {
+          const x = 6 + i / (wave.length - 1) * w;
+          const y = clamp(base - wave[i] * h * 0.14, 1, h);
+          if (!i) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        stroke(0.45 + layer / Math.max(1, count - 1) * 0.4, palette((layer + 1) / count), 0.8);
+      }
+    } else if (style === "shower") {
+      if (captured && STATE.hasStreamObject === true) {
+        const previous = v.count > 1 ? visualizerFrame(v, 1).spectrum : null;
+        const tick = Math.floor(v.lastCapture / (1000 / 30));
+        for (let i = 0; i < current.spectrum.length; i += 2) {
+          const level = current.spectrum[i];
+          const rise = level - (previous ? previous[i] : 0);
+          const period = Math.max(2, Math.round(7 - level * 5));
+          if (level < 0.025 || (rise < 0.010 && (tick + i) % period !== 0)) continue;
+          const particle = v.particles[v.particleHead];
+          particle.born = now;particle.x = 6 + i / 120 * w;particle.level = level;
+          particle.strength = clamp(level + Math.max(0, rise) * 2.5, 0, 1);
+          v.particleHead = (v.particleHead + 1) % v.particles.length;
+        }
+      }
+      const duration = CONFIG.display.visualizerTrail / 30 * 1000;
+      for (const particle of v.particles) {
+        const age = (now - particle.born) / duration;
+        if (age < 0 || age >= 1) continue;
+        const y = 1 + age * (h - 1);
+        const length = Math.min(5 + particle.strength * 20, h + 1 - y);
+        ctx.beginPath();ctx.moveTo(particle.x, y);ctx.lineTo(particle.x, y + length);
+        stroke(Math.pow(1 - age, 0.65) * (0.35 + particle.strength * 0.65),
+          palette(Math.max(0.35, particle.strength)), 1 + particle.strength * 0.9);
+      }
+    } else if (style === "spectrogram") {
+      if (!v.image) {
+        v.image = document.createElement("canvas");
+        v.image.width = 256; v.image.height = 121;
+        v.imageCtx = v.image.getContext("2d");
+      }
+      if (captured) {
+        const paint = v.imageCtx;
+        const speed = CONFIG.display.visualizerTrail === 12 ? 4 : CONFIG.display.visualizerTrail === 24 ? 2 : 1;
+        paint.globalCompositeOperation = "copy";
+        paint.drawImage(v.image, speed, 0, 256 - speed, 121, 0, 0, 256 - speed, 121);
+        paint.globalCompositeOperation = "source-over";
+        paint.clearRect(256 - speed, 0, speed, 121);
+        for (let i = 0; i < 121; i++) {
+          const level = current.spectrum[i];
+          if (level < 0.008) continue;
+          paint.globalAlpha = 0.15 + level * 0.85;
+          paint.fillStyle = palette(level);
+          paint.fillRect(256 - speed, 120 - i, speed, 1);
+        }
+        paint.globalAlpha = 1;
+      }
+      ctx.imageSmoothingEnabled = false;
+      ctx.shadowColor = colors.high;
+      ctx.shadowBlur = CONFIG.display.glowIntensity > 0 ? 4 : 0;
+      ctx.drawImage(v.image, 6, 1, w, h);
+    }
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 0.85;
+    const font = getCanvasFontStyle(STATE.dom.title);
+    ctx.font = `9px ${font?.fontFamily || "sans-serif"}`;
+    ctx.fillStyle = colors.high;
+    ctx.textBaseline = "bottom";
+    if (style === "spectrogram") {
+      ctx.fillText("20k", 8, 14); ctx.fillText("30Hz", 8, h + 2);
+    }
+    if (CONFIG.display.showReadouts && STATE.hasStreamObject === true) {
+      const format = value => Number.isFinite(value) ? value.toFixed(1) : "–";
+      ctx.textAlign = "left";
+      ctx.fillText(`L ${format(STATE.levels.left.smoothDb)} dB`, 7, height - 1);
+      ctx.textAlign = "right";
+      const label = style === "goniometer"
+        ? `Corr ${v.correlationValid ? v.correlation.toFixed(2) : "–"} · Side ${(v.width * 100).toFixed(0)}%`
+        : `R ${format(STATE.levels.right.smoothDb)} dB`;
+      ctx.fillText(label, width - 7, height - 1);
+    }
+    ctx.restore();
+  }
+
   const CONFIG = {
     audio: {
       minThreshold: 0.0015,
@@ -1495,10 +2283,12 @@
     display: {
       glowIntensity: loadLSBool(STORAGE_GLOW_ENABLED, false) ? 1 : 0,
       barStyle: loadLSEnum(STORAGE_BARSTYLE, "simple", VALID_STYLES),
-      layoutMode: loadLSEnum(STORAGE_LAYOUT, "lr", ["lr", "sa", "full", "equalizer", "vuHybrid", "oscilloscope"]),
-      renderMode: loadLSEnum(STORAGE_RENDER, "bars", ["bars", "gauges", "mirrored", "analogVu"]),
+      layoutMode: loadLSEnum(STORAGE_LAYOUT, "lr", ["lr", "sa", "full", "equalizer", "vuHybrid", "oscilloscope", "visualizer"]),
+      renderMode: loadLSEnum(STORAGE_RENDER, "bars", ["bars", "gauges", "mirrored", "analogVu", ...CIRCULAR_STYLES]),
       hybridMode: loadLSEnum(STORAGE_HYBRID_MODE, "stereo12", HYBRID_MODES),
       equalizerRenderMode: loadLSEnum(STORAGE_EQ_RENDER, "bars", ["bars", "spectrum"]),
+      visualizerStyle: loadLSEnum("AMX_VISUALIZER_STYLE", "waterfall", Object.keys(VISUALIZER_NAMES)),
+      visualizerTrail: loadLSInt("AMX_VISUALIZER_TRAIL", 24, 12, 48),
       oscilloscopeStyle: loadLSEnum(
         STORAGE_SCOPE_STYLE,
         "lines",
@@ -1875,7 +2665,7 @@
         `Rebind: ${AMX_RUNTIME.autoRebindState || "unknown"} | last ${lastRebind}\n` +
         `Layout: ${CONFIG.display?.layoutMode || "-"} | RenderMode: ${CONFIG.display?.renderMode || "-"}\n` +
         `Canvas: ${Math.round(logicalW)}×${Math.round(logicalH)} | DPR ${dpr.toFixed(2)} | FPS gate ${
-          ["equalizer", "vuHybrid", "oscilloscope"].includes(CONFIG.display?.layoutMode) ? 60 : 30
+          ["equalizer", "vuHybrid", "oscilloscope", "visualizer"].includes(CONFIG.display?.layoutMode) ? 60 : 30
         }`;
 
       el.style.borderColor = "rgba(255,255,255,.18)";
@@ -3397,7 +4187,11 @@ function saveAMXPanelGeometry(panel) {
 
       // BAR STYLE AVAILABILITY (renderMode dependent)
       function updateBarStyleAvailability() {
+        const trailGroup = document.getElementById("amx-visualizer-trail-group");
+        if (trailGroup) trailGroup.style.display = (CONFIG.display.layoutMode === "visualizer" || (MIRRORED_LAYOUTS.includes(CONFIG.display.layoutMode) && isCircularStyle(CONFIG.display.renderMode))) ? "" : "none";
         const disabled =
+          (MIRRORED_LAYOUTS.includes(CONFIG.display.layoutMode) && isCircularStyle(CONFIG.display.renderMode)) ||
+          CONFIG.display.layoutMode === "visualizer" ||
           CONFIG.display.layoutMode === "oscilloscope" ||
           (
             CONFIG.display.layoutMode === "equalizer" &&
@@ -3511,6 +4305,7 @@ function saveAMXPanelGeometry(panel) {
             <div class="option" data-value="equalizer">Equalizer</div>
             <div class="option" data-value="vuHybrid">Vu Hybrid</div>
             <div class="option" data-value="oscilloscope">Oscilloscope</div>
+            <div class="option" data-value="visualizer">Visualizer</div>
           </div>
         </div>
       `;
@@ -3524,10 +4319,11 @@ function saveAMXPanelGeometry(panel) {
         savedLayout === "full" ? "Audio levels (Full mode)" :
         savedLayout === "vuHybrid" ? "Vu Hybrid" :
         savedLayout === "oscilloscope" ? "Oscilloscope" :
+        savedLayout === "visualizer" ? "Visualizer" :
         "Equalizer";
 
       bindDropdown(layoutInput, "#amx-layout-options", (val) => {
-        if (!["lr", "sa", "full", "equalizer", "vuHybrid", "oscilloscope"].includes(val)) return;
+        if (!["lr", "sa", "full", "equalizer", "vuHybrid", "oscilloscope", "visualizer"].includes(val)) return;
         CONFIG.display.layoutMode = val;
         safeLSSet("AMX_LAYOUT_MODE", val);
 
@@ -3539,12 +4335,13 @@ function saveAMXPanelGeometry(panel) {
         } else if (
           val !== "equalizer" &&
           STATE._renderBeforeEqualizer &&
-          ["bars", "gauges", "mirrored", "analogVu"].includes(STATE._renderBeforeEqualizer)
+          ["bars", "gauges", "mirrored", "analogVu", ...CIRCULAR_STYLES].includes(STATE._renderBeforeEqualizer)
         ) {
           CONFIG.display.renderMode = STATE._renderBeforeEqualizer;
           const renderInput = document.getElementById("amx-render-input");
           if (renderInput) {
             renderInput.value =
+              isCircularStyle(CONFIG.display.renderMode) ? VISUALIZER_NAMES[CONFIG.display.renderMode] :
               CONFIG.display.renderMode === "gauges" ? "Gauges" :
               CONFIG.display.renderMode === "analogVu" ? "Analog VU" :
               CONFIG.display.renderMode === "mirrored" ? "Mirrored" :
@@ -3597,12 +4394,22 @@ function saveAMXPanelGeometry(panel) {
       const savedRender = CONFIG.display.renderMode;
       renderInput.value =
         CONFIG.display.layoutMode === "equalizer" ? "Bars" :
+        isCircularStyle(savedRender) ? VISUALIZER_NAMES[savedRender] :
         savedRender === "bars" ? "Bars" :
         savedRender === "gauges" ? "Gauges" :
         savedRender === "analogVu" ? "Analog VU" :
         "Mirrored";
 
       bindDropdown(renderInput, "#amx-render-options", (val) => {
+        if (CONFIG.display.layoutMode === "visualizer") {
+          if (!Object.prototype.hasOwnProperty.call(VISUALIZER_NAMES, val)) return;
+          CONFIG.display.visualizerStyle = val;
+          safeLSSet("AMX_VISUALIZER_STYLE", val);
+          resetVisualizerState();
+          invalidateVisualCaches();
+          requestRender();
+          return;
+        }
         if (CONFIG.display.layoutMode === "vuHybrid") {
           if (!HYBRID_MODES.includes(val)) return;
           CONFIG.display.hybridMode = val;
@@ -3642,13 +4449,15 @@ function saveAMXPanelGeometry(panel) {
         
           renderInput.value =
             CONFIG.display.renderMode === "bars" ? "Bars" :
-            CONFIG.display.renderMode === "gauges" ? "Gauges" :
+            isCircularStyle(CONFIG.display.renderMode) ? VISUALIZER_NAMES[CONFIG.display.renderMode] :
+          CONFIG.display.renderMode === "gauges" ? "Gauges" :
             CONFIG.display.renderMode === "analogVu" ? "Analog VU" :
             "Mirrored";
         
           return;
         }
 
+        if (!["bars", "gauges", "mirrored", "analogVu", ...CIRCULAR_STYLES].includes(val)) return;
         CONFIG.display.renderMode = val;
         safeLSSet("AMX_RENDER_MODE", val);
         updateBarStyleAvailability();
@@ -3660,6 +4469,12 @@ function saveAMXPanelGeometry(panel) {
       function syncRenderSelectorOptions() {
         const options = document.getElementById("amx-render-options");
         if (!options || !renderInput) return;
+        if (CONFIG.display.layoutMode === "visualizer") {
+          options.innerHTML = Object.entries(VISUALIZER_NAMES).map(([value, name]) =>
+            `<div class="option" data-value="${value}">${name}</div>`).join("");
+          renderInput.value = VISUALIZER_NAMES[CONFIG.display.visualizerStyle];
+          return;
+        }
 
         if (CONFIG.display.layoutMode === "vuHybrid") {
           options.innerHTML = `
@@ -3713,8 +4528,11 @@ function saveAMXPanelGeometry(panel) {
           <div class="option" data-value="gauges">Gauges</div>
           <div class="option" data-value="analogVu">Analog VU</div>
         `;
+        options.insertAdjacentHTML("beforeend", CIRCULAR_STYLES.map(value =>
+          `<div class="option" data-value="${value}">${VISUALIZER_NAMES[value]}</div>`).join(""));
         renderInput.value =
           CONFIG.display.layoutMode === "equalizer" ? "Bars" :
+          isCircularStyle(CONFIG.display.renderMode) ? VISUALIZER_NAMES[CONFIG.display.renderMode] :
           CONFIG.display.renderMode === "gauges" ? "Gauges" :
           CONFIG.display.renderMode === "analogVu" ? "Analog VU" :
           CONFIG.display.renderMode === "mirrored" ? "Mirrored" :
@@ -3722,6 +4540,31 @@ function saveAMXPanelGeometry(panel) {
       }
 
       syncRenderSelectorOptions();
+
+      const trailDiv = document.createElement("div");
+      trailDiv.id = "amx-visualizer-trail-group";
+      trailDiv.className = "form-group";
+      trailDiv.style.display = (CONFIG.display.layoutMode === "visualizer" || (MIRRORED_LAYOUTS.includes(CONFIG.display.layoutMode) && isCircularStyle(CONFIG.display.renderMode))) ? "" : "none";
+      trailDiv.innerHTML = `
+        <label class="form-label">VISUALIZER TRAIL</label>
+        <div class="dropdown">
+          <input type="text" id="amx-visualizer-trail-input" class="form-control" readonly>
+          <div id="amx-visualizer-trail-options" class="options">
+            <div class="option" data-value="12">Short</div>
+            <div class="option" data-value="24">Medium</div>
+            <div class="option" data-value="48">Long</div>
+          </div>
+        </div>`;
+      content.appendChild(trailDiv);
+      const trailInput = document.getElementById("amx-visualizer-trail-input");
+      trailInput.value = CONFIG.display.visualizerTrail <= 12 ? "Short" : CONFIG.display.visualizerTrail >= 48 ? "Long" : "Medium";
+      bindDropdown(trailInput, "#amx-visualizer-trail-options", (value) => {
+        const count = Number(value);
+        if (![12, 24, 48].includes(count)) return;
+        CONFIG.display.visualizerTrail = count;
+        safeLSSet("AMX_VISUALIZER_TRAIL", String(count));
+        requestRender();
+      });
 
       // SHOW PEAK INDICATOR
       {
@@ -4502,6 +5345,8 @@ function saveAMXPanelGeometry(panel) {
 
       return;
     }
+
+    if (layout === "visualizer" || isCircularStyle(render)) return;
 
     // OSCILLOSCOPE — L/R readouts aligned with the two enlarged lanes.
     if (layout === "oscilloscope") {
@@ -5971,6 +6816,9 @@ function saveAMXPanelGeometry(panel) {
     const colors = ACTIVE_THEME.colors;
     // Identical X coordinates force a strictly vertical colour axis.
     const gradientX = Math.round(x + width / 2) + 0.5;
+    const key = `${gradientX}|${top}|${height}|${ctx.canvas.width}|${ctx.canvas.height}|${ctx.canvas._amxDpr}|${ctx.canvas._amxLogicalWidth}|${ctx.canvas._amxLogicalHeight}|${colors.low}|${colors.mid}|${colors.high}`;
+    const cached = EQUALIZER_GRADIENT_CACHE.get(ctx);
+    if (cached && cached.key === key) return cached.gradient;
     const gradient = ctx.createLinearGradient(
       gradientX,
       top + height,
@@ -5980,6 +6828,7 @@ function saveAMXPanelGeometry(panel) {
     gradient.addColorStop(0, colors.low);
     gradient.addColorStop(0.50, colors.mid);
     gradient.addColorStop(1, colors.high);
+    EQUALIZER_GRADIENT_CACHE.set(ctx, { key, gradient });
     return gradient;
   }
 
@@ -6673,7 +7522,7 @@ function saveAMXPanelGeometry(panel) {
     const eq = STATE.levels.equalizer;
     const fontSource = STATE.dom.labels?.left || STATE.dom.title;
     const inheritedFont = fontSource
-      ? getComputedStyle(fontSource)
+      ? getCanvasFontStyle(fontSource)
       : null;
     const fontFamily =
       inheritedFont?.fontFamily || "sans-serif";
@@ -6748,6 +7597,118 @@ function saveAMXPanelGeometry(panel) {
     ctx.restore();
   }
 
+  // Fine spectrum detail shares the existing FFT snapshot and audio cadence.
+  function updateSpectrumDetail(eq, audio, now, deltaSeconds, readSpectrum) {
+    const count = (EQ_BAND_COUNT - 1) * 8 + 1;
+    const left = audio.dataEqualizerLeft;
+    const right = audio.dataEqualizerRight;
+    if (!left || !right) return;
+    let detail = eq.detail;
+    if (!detail || detail.source !== left) {
+      detail = eq.detail = {
+        source: left, values: new Float32Array(count),
+        targets: new Float32Array(count), peaks: new Float32Array(count),
+        hold: new Float64Array(count)
+      };
+    }
+    const analyser = audio.analyserEqualizerLeft;
+    const nyquist = (audio.context?.sampleRate || 48000) / 2;
+    const bins = Math.min(left.length, right.length);
+    const minDb = analyser.minDecibels;
+    const maxDb = analyser.maxDecibels;
+    if (readSpectrum) {
+      for (let i = 0; i < count; i++) {
+        const position = i / 8;
+        const band = Math.min(EQ_BAND_COUNT - 2, Math.floor(position));
+        const mix = position - band;
+        const frequency = EQ_CENTER_FREQUENCIES[band] *
+          Math.pow(EQ_CENTER_FREQUENCIES[band + 1] / EQ_CENTER_FREQUENCIES[band], mix);
+        const bin = frequency / nyquist * bins;
+        let byte = 0;
+        if (bin <= bins - 1) {
+          const lo = Math.max(0, Math.floor(bin));
+          const hi = Math.min(bins - 1, lo + 1);
+          const a = (left[lo] + right[lo]) * 0.5;
+          const b = (left[hi] + right[hi]) * 0.5;
+          byte = a + (b - a) * (bin - lo);
+        }
+        const db = clamp(minDb + byte / 255 * (maxDb - minDb) + CONFIG.audio.dbGain, minDb, maxDb);
+        const gain = EQ_PREAMP_GAINS[band] + (EQ_PREAMP_GAINS[band + 1] - EQ_PREAMP_GAINS[band]) * mix;
+        const floor = EQ_FLOOR_LEVELS[band] + (EQ_FLOOR_LEVELS[band + 1] - EQ_FLOOR_LEVELS[band]) * mix;
+        const scaled = (clamp(db, minDb, -30) - minDb) / (-30 - minDb) * 255 * gain;
+        const target = Math.pow(clamp((scaled - floor) / (255 - floor), 0, 1), 1 / EQ_SENSITIVITY);
+        if (Math.abs(target - detail.targets[i]) >= EQ_HYSTERESIS) detail.targets[i] = target;
+      }
+    }
+    const frameScale = Math.max(0.01, deltaSeconds * 60);
+    const attack = 1 - Math.pow(1 - (0.08 + CONFIG.audio.attackSpeed * 0.42), frameScale);
+    const release = 1 - Math.pow(1 - (0.015 + CONFIG.audio.releaseSpeed * 0.12), frameScale);
+    for (let i = 0; i < count; i++) {
+      const previous = detail.values[i];
+      const target = detail.targets[i];
+      const next = previous + (target - previous) * (target > previous ? attack : release);
+      detail.values[i] = next < 0.008 ? 0 : next;
+      if (next >= detail.peaks[i]) {
+        detail.peaks[i] = next;
+        detail.hold[i] = now + CONFIG.audio.peakHoldMs;
+      } else if (now >= detail.hold[i]) {
+        detail.peaks[i] = Math.max(next, detail.peaks[i] -
+          (0.15 + CONFIG.audio.releaseSpeed * 0.55) * deltaSeconds);
+      }
+    }
+  }
+
+  // Relief is derived from local FFT peaks/slopes, never decorative stripes.
+  function drawSpectrumRelief(ctx, traceFill, firstX, lastX, top, height, values) {
+    const colors = ACTIVE_THEME.colors;
+    const accent = colors.accent || colors.high;
+    const key = `${colors.low}|${accent}`;
+    let cached = SPECTRUM_RELIEF_CACHE.get(ctx);
+    if (!cached || cached.key !== key) {
+      const makeStamp = (color) => {
+        const stamp = document.createElement("canvas");
+        stamp.width = 4; stamp.height = 128;
+        const paint = stamp.getContext("2d");
+        paint.fillStyle = color;
+        paint.fillRect(0, 0, 4, 128);
+        paint.globalCompositeOperation = "destination-in";
+        const fade = paint.createLinearGradient(0, 0, 0, 128);
+        fade.addColorStop(0, "rgba(0,0,0,0.9)");
+        fade.addColorStop(0.18, "rgba(0,0,0,0.65)");
+        fade.addColorStop(0.58, "rgba(0,0,0,0.16)");
+        fade.addColorStop(1, "rgba(0,0,0,0)");
+        paint.fillStyle = fade;
+        paint.fillRect(0, 0, 4, 128);
+        return stamp;
+      };
+      cached = { key, light: makeStamp(accent), dark: makeStamp(colors.low) };
+      SPECTRUM_RELIEF_CACHE.set(ctx, cached);
+    }
+    const dx = (lastX - firstX) / Math.max(1, values.length - 1);
+    const baseline = top + height;
+    ctx.save();
+    ctx.clip(traceFill);
+    for (let i = 0; i < values.length; i++) {
+      const level = clamp(values[i] || 0, 0, 1);
+      if (level < 0.008) continue;
+      const left = values[Math.max(0, i - 1)] || 0;
+      const right = values[Math.min(values.length - 1, i + 1)] || 0;
+      const slope = right - left;
+      const crest = Math.max(0, level - (left + right) * 0.5);
+      const x = firstX + i * dx;
+      const y = baseline - level * height;
+      // Vertical illumination drops from the trace. Adjacent rising/falling
+      // slopes form moving highlight/shadow pairs as spectral peaks change.
+      ctx.globalAlpha = Math.min(0.75, 0.10 + level * 0.30 + Math.max(0, slope) * 2.8 + crest * 3);
+      ctx.drawImage(cached.light, x - dx * 0.5, y, dx + 0.3, level * height);
+      ctx.globalAlpha = Math.min(0.72, Math.max(0, -slope) * 4 + crest * 1.4);
+      if (ctx.globalAlpha > 0.01) {
+        ctx.drawImage(cached.dark, x, y, Math.max(0.6, dx * 0.65), level * height * 0.92);
+      }
+    }
+    ctx.restore();
+  }
+
   function renderEqualizerSpectrum(ctx, canvas) {
     const renderedWidth = getCanvasRenderedWidth(canvas);
     const width =
@@ -6798,11 +7759,16 @@ function saveAMXPanelGeometry(panel) {
     const levelY = (value) =>
       baseline - clamp(value || 0, 0, 1) * plotH;
 
+    const traceValues = eq.detail?.values || eq.values;
+    const tracePeaks = eq.detail?.peaks || eq.peaks;
+    const traceX = (index) => pointX(0) +
+      index / Math.max(1, traceValues.length - 1) * (pointX(EQ_BAND_COUNT - 1) - pointX(0));
+
     const traceFill = new Path2D();
     traceFill.moveTo(startX, baseline);
-    traceFill.lineTo(pointX(0), levelY(eq.values[0]));
-    for (let i = 1; i < EQ_BAND_COUNT; i++) {
-      traceFill.lineTo(pointX(i), levelY(eq.values[i]));
+    traceFill.lineTo(traceX(0), levelY(traceValues[0]));
+    for (let i = 1; i < traceValues.length; i++) {
+      traceFill.lineTo(traceX(i), levelY(traceValues[i]));
     }
     traceFill.lineTo(endX, baseline);
     traceFill.closePath();
@@ -6818,15 +7784,19 @@ function saveAMXPanelGeometry(panel) {
     }
 
     ctx.save();
-    ctx.globalAlpha = 0.72;
+    ctx.globalAlpha = 0.30;
     ctx.fillStyle = gradient;
     ctx.fill(traceFill);
     ctx.restore();
 
+    drawSpectrumRelief(
+      ctx, traceFill, pointX(0), pointX(EQ_BAND_COUNT - 1), top, plotH, traceValues
+    );
+
     const traceLine = new Path2D();
-    traceLine.moveTo(pointX(0), levelY(eq.values[0]));
-    for (let i = 1; i < EQ_BAND_COUNT; i++) {
-      traceLine.lineTo(pointX(i), levelY(eq.values[i]));
+    traceLine.moveTo(traceX(0), levelY(traceValues[0]));
+    for (let i = 1; i < traceValues.length; i++) {
+      traceLine.lineTo(traceX(i), levelY(traceValues[i]));
     }
 
     ctx.save();
@@ -6842,9 +7812,9 @@ function saveAMXPanelGeometry(panel) {
       STATE.hasStreamObject === true
     ) {
       const peakLine = new Path2D();
-      peakLine.moveTo(pointX(0), levelY(eq.peaks[0]));
-      for (let i = 1; i < EQ_BAND_COUNT; i++) {
-        peakLine.lineTo(pointX(i), levelY(eq.peaks[i]));
+      peakLine.moveTo(traceX(0), levelY(tracePeaks[0]));
+      for (let i = 1; i < tracePeaks.length; i++) {
+        peakLine.lineTo(traceX(i), levelY(tracePeaks[i]));
       }
       ctx.save();
       ctx.lineWidth = 1.35;
@@ -6857,7 +7827,7 @@ function saveAMXPanelGeometry(panel) {
 
     const fontSource = STATE.dom.labels?.left || STATE.dom.title;
     const inheritedFont = fontSource
-      ? getComputedStyle(fontSource)
+      ? getCanvasFontStyle(fontSource)
       : null;
     const fontFamily =
       inheritedFont?.fontFamily || "sans-serif";
@@ -6996,7 +7966,7 @@ function saveAMXPanelGeometry(panel) {
 
     const fontSource = STATE.dom.labels?.left || STATE.dom.title;
     const inheritedFont = fontSource
-      ? getComputedStyle(fontSource)
+      ? getCanvasFontStyle(fontSource)
       : null;
     const fontFamily =
       inheritedFont?.fontFamily || "sans-serif";
@@ -7968,7 +8938,7 @@ function saveAMXPanelGeometry(panel) {
 
     const layout = CONFIG.display.layoutMode;
     const render =
-      layout === "equalizer" || layout === "vuHybrid" || layout === "oscilloscope"
+      layout === "equalizer" || layout === "vuHybrid" || layout === "oscilloscope" || layout === "visualizer"
         ? "bars"
         : CONFIG.display.renderMode;
     const barStyle = CONFIG.display.barStyle;
@@ -7980,7 +8950,7 @@ function saveAMXPanelGeometry(panel) {
     FRAME_GRADIENT_CACHE.clear();
 
     const visualStateKey =
-      `${layout}|${render}|${barStyle}|${showReadouts}|${CONFIG.display.hybridMode}|${CONFIG.display.equalizerRenderMode}|${CONFIG.display.oscilloscopeStyle}`;
+      `${layout}|${render}|${barStyle}|${showReadouts}|${CONFIG.display.hybridMode}|${CONFIG.display.equalizerRenderMode}|${CONFIG.display.oscilloscopeStyle}|${CONFIG.display.visualizerStyle}`;
 
     if (visualStateKey !== _lastVisualStateKey) {
       _lastVisualStateKey = visualStateKey;
@@ -8031,6 +9001,16 @@ function saveAMXPanelGeometry(panel) {
 
     const barH  = CONFIG.display.dimensions.barHeight;
     const gap   = CONFIG.display.dimensions.spacing;
+
+    if (MIRRORED_LAYOUTS.includes(layout) && isCircularStyle(render)) {
+      renderCircularMeters(ctx, canvas, layout, render);
+      return;
+    }
+
+    if (layout === "visualizer") {
+      renderVisualizer(ctx, canvas);
+      return;
+    }
 
     if (layout === "oscilloscope") {
       renderOscilloscope(ctx, canvas);
@@ -9284,7 +10264,7 @@ function saveAMXPanelGeometry(panel) {
     const frameH =
       (desiredHeight - pad * 2 - gapY * (rows - 1)) / rows;
     const inheritedFont = STATE.dom.title
-      ? getComputedStyle(STATE.dom.title)
+      ? getCanvasFontStyle(STATE.dom.title)
       : null;
     const analogFontFamily =
       inheritedFont?.fontFamily || "sans-serif";
@@ -9327,7 +10307,7 @@ function saveAMXPanelGeometry(panel) {
   function getTileTitle(layout, render, useMirrored) {
     if (layout === "equalizer") {
       return CONFIG.display.equalizerRenderMode === "spectrum"
-        ? "16-BAND SPECTRUM"
+        ? "SPECTRUM"
         : "16-BAND EQ";
     }
     if (layout === "vuHybrid") {
@@ -9336,6 +10316,7 @@ function saveAMXPanelGeometry(panel) {
         : "STEREO LEVELS & 12B EQ";
     }
 
+    if (layout === "visualizer") return VISUALIZER_NAMES[CONFIG.display.visualizerStyle].toUpperCase();
     if (layout === "oscilloscope") return "STEREO OSCILLOSCOPE";
 
     if (layout === "full") return "AUDIO LEVELS";
@@ -9443,7 +10424,7 @@ function saveAMXPanelGeometry(panel) {
 
     const layout = CONFIG.display.layoutMode;
     const render =
-      layout === "equalizer" || layout === "vuHybrid" || layout === "oscilloscope"
+      layout === "equalizer" || layout === "vuHybrid" || layout === "oscilloscope" || layout === "visualizer"
         ? "bars"
         : CONFIG.display.renderMode;
 
@@ -9552,6 +10533,32 @@ function saveAMXPanelGeometry(panel) {
         (INNER_BASE_TOP + barH + gap + barH / 2 - 12) + "px";
     }
 
+    if (layout === "visualizer" || (MIRRORED_LAYOUTS.includes(layout) && isCircularStyle(render))) {
+      for (const el of Object.values(STATE.dom.labels || {})) {
+        if (el) el.style.display = "none";
+      }
+      for (const el of Object.values(STATE.dom.scales || {})) {
+        if (el) el.style.display = "none";
+      }
+      for (const el of Object.values(STATE.dom.readouts || {})) {
+        if (el) el.style.display = "none";
+      }
+      if (STATE.dom.canvasNormal) {
+        STATE.dom.canvasNormal.style.top = "-2px";
+        STATE.dom.canvasNormal.style.left = "5px";
+        STATE.dom.canvasNormal.style.width = "calc(100% - 10px)";
+        STATE.dom.canvasNormal.style.transform = "";
+      }
+      if (STATE.dom.contentWrapper) {
+        STATE.dom.contentWrapper.style.height = WRAPPER_HEIGHT + "px";
+        STATE.dom.contentWrapper.style.minHeight = WRAPPER_HEIGHT + "px";
+      }
+      setTitleText(layout === "visualizer"
+        ? VISUALIZER_NAMES[CONFIG.display.visualizerStyle].toUpperCase()
+        : layout === "full" ? "AUDIO LEVELS" : layout === "sa" ? "ST. QUALITY / RMS+PEAK" : "STEREO LEVELS");
+      return;
+    }
+
     // OSCILLOSCOPE — stereo Float32 waveform using the native LR overlay.
     if (layout === "oscilloscope") {
       // Reuse the real Bar-mode L/R labels. Same DOM, font, coordinates.
@@ -9636,7 +10643,7 @@ function saveAMXPanelGeometry(panel) {
 
       setTitleText(
         CONFIG.display.equalizerRenderMode === "spectrum"
-          ? "16-BAND SPECTRUM"
+          ? "SPECTRUM"
           : "16-BAND EQ"
       );
       return;
@@ -10931,6 +11938,8 @@ function saveAMXPanelGeometry(panel) {
           STATE.levels.equalizer.dbValues.fill(-100);
           STATE.levels.equalizer.peakHoldUntil.fill(0);
           STATE.levels.equalizer.lastUpdateTs = 0;
+          STATE.levels.equalizer.detail = null;
+          resetVisualizerState();
         }
         [
           STATE.levels?.hybridStereo12,
@@ -11195,21 +12204,26 @@ function saveAMXPanelGeometry(panel) {
           }
         }
 
+        if (eq === STATE.levels.equalizer && (CONFIG.display.equalizerRenderMode === "spectrum" || CONFIG.display.layoutMode === "visualizer")) {
+          updateSpectrumDetail(eq, a, now, deltaSeconds, readSpectrum);
+        }
+
         // 60Hz visual interpolation toward the most recent FFT targets.
         // Time-corrected alpha keeps the same response if frame timing varies.
+
+        const attackBase =
+          0.08 + CONFIG.audio.attackSpeed * 0.42;
+        const releaseBase =
+          0.015 + CONFIG.audio.releaseSpeed * 0.12;
+        const frameScale = Math.max(0.01, deltaSeconds * 60);
+        const attackAlpha =
+          1 - Math.pow(1 - attackBase, frameScale);
+        const releaseAlpha =
+          1 - Math.pow(1 - releaseBase, frameScale);
+
         for (let band = 0; band < frequencies.length; band++) {
           const target = eq.targetValues[band] || 0;
           const previous = eq.values[band] || 0;
-
-          const attackBase =
-            0.08 + CONFIG.audio.attackSpeed * 0.42;
-          const releaseBase =
-            0.015 + CONFIG.audio.releaseSpeed * 0.12;
-          const frameScale = Math.max(0.01, deltaSeconds * 60);
-          const attackAlpha =
-            1 - Math.pow(1 - attackBase, frameScale);
-          const releaseAlpha =
-            1 - Math.pow(1 - releaseBase, frameScale);
 
           const next =
             target > previous
@@ -11614,7 +12628,9 @@ function saveAMXPanelGeometry(panel) {
           const highCadenceVisual =
             CONFIG.display.layoutMode === "equalizer" ||
             CONFIG.display.layoutMode === "vuHybrid" ||
-            CONFIG.display.layoutMode === "oscilloscope";
+            CONFIG.display.layoutMode === "oscilloscope" ||
+            CONFIG.display.layoutMode === "visualizer" ||
+            isCircularStyle(CONFIG.display.renderMode);
           const runAudio =
             highCadenceVisual ? true : shouldRunAudio();
 
@@ -11624,6 +12640,7 @@ function saveAMXPanelGeometry(panel) {
               layoutMode !== "lr" &&
               layoutMode !== "equalizer" &&
               layoutMode !== "oscilloscope" &&
+              layoutMode !== "visualizer" &&
               !(
                 layoutMode === "vuHybrid" &&
                 CONFIG.display.hybridMode === "stereo12"
@@ -11672,11 +12689,21 @@ function saveAMXPanelGeometry(panel) {
             updateSamplePeakMemory("right", R.samplePeak, nowTs);
 
             const readSpectrumSnapshot =
-              (layoutMode === "equalizer" || layoutMode === "vuHybrid")
+              (layoutMode === "equalizer" || layoutMode === "vuHybrid" || layoutMode === "visualizer" ||
+                (CONFIG.display.renderMode === "radial" && MIRRORED_LAYOUTS.includes(layoutMode) && layoutMode !== "sa"))
                 ? shouldReadSpectrumSnapshot()
                 : false;
 
-            if (layoutMode === "equalizer") {
+            if (CONFIG.display.renderMode === "radial" && MIRRORED_LAYOUTS.includes(layoutMode) && readSpectrumSnapshot) {
+              const a = STATE.audio;
+              if (a.analyserEqualizerLeft && a.analyserEqualizerRight && a.dataEqualizerLeft && a.dataEqualizerRight) {
+                a.analyserEqualizerLeft.getByteFrequencyData(a.dataEqualizerLeft);
+                a.analyserEqualizerRight.getByteFrequencyData(a.dataEqualizerRight);
+                updateCircularSpectra(nowTs);
+              }
+            }
+
+            if (layoutMode === "equalizer" || layoutMode === "visualizer") {
               updateEqualizerLevels(
                 nowTs,
                 STATE.levels.equalizer,
@@ -12005,7 +13032,9 @@ function saveAMXPanelGeometry(panel) {
           const activeFrameInterval =
             CONFIG.display.layoutMode === "equalizer" ||
             CONFIG.display.layoutMode === "vuHybrid" ||
-            CONFIG.display.layoutMode === "oscilloscope"
+            CONFIG.display.layoutMode === "oscilloscope" ||
+            CONFIG.display.layoutMode === "visualizer" ||
+            isCircularStyle(CONFIG.display.renderMode)
               ? 1000 / 60
               : FRAME_INTERVAL;
           if (__now - _lastRenderTime < activeFrameInterval) {
@@ -12044,6 +13073,9 @@ function saveAMXPanelGeometry(panel) {
             STATE.render.canvasReadouts = {};
           }
           const dirtyValues =
+            (MIRRORED_LAYOUTS.includes(CONFIG.display.layoutMode) && isCircularStyle(CONFIG.display.renderMode)) ||
+            CONFIG.display.layoutMode === "visualizer" ||
+            (CONFIG.display.layoutMode === "equalizer" && CONFIG.display.equalizerRenderMode === "spectrum") ||
             CONFIG.display.layoutMode === "oscilloscope" ||
             _lastDrawn.L === null ||
             Math.abs(Ls - _lastDrawn.L) > EPS_DB ||
@@ -12285,6 +13317,7 @@ function saveAMXPanelGeometry(panel) {
         AMX_RUNTIME.pageVisible = document.visibilityState !== "hidden";
 
         if (!AMX_RUNTIME.pageVisible) {
+          resetVisualizerState();
           stopRenderingLoop();
           AMX_RUNTIME.autoRebindState = "hidden";
           scheduleAutoRebind(AUTO_REBIND_HIDDEN_MS);
@@ -12303,6 +13336,7 @@ function saveAMXPanelGeometry(panel) {
       function destroyAudioMetrix() {
         if (AMX_RUNTIME.destroyed) return;
         AMX_RUNTIME.destroyed = true;
+        resetVisualizerState();
 
         stopRenderingLoop();
 

@@ -1,6 +1,7 @@
 /*
  * AudioMetrix v5.5
  * FM-DX Webserver audio metering / visualization plugin
+ */
 
 (() => {
   // ─────────────────────────────────────────────────────────

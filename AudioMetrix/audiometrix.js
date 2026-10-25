@@ -1,12 +1,16 @@
+/*
+ * AudioMetrix v5.5
+ * FM-DX Webserver audio metering / visualization plugin
+
 (() => {
   // ─────────────────────────────────────────────────────────
-  // AUDIO METRIX — FULL HARDENED VERSION
+  // AUDIO METRIX 5.5.0 — RELEASE
   // THEME ENGINE • SETTINGS UI • RENDER ENGINE • AUDIO ENGINE
   // ─────────────────────────────────────────────────────────
 
   // PLUGIN METADATA
   const AMX_PLUGIN_NAME        = "AudioMetrix";
-  const AMX_VERSION            = "4.0";
+  const AMX_VERSION            = "5.5";
   const AMX_CHECK_FOR_UPDATES  = true;
   const AMX_UPDATE_URL         =
     "https://raw.githubusercontent.com/MCelliotG/Audiometrix-plugin-for-FMDX-Webservers/main/AudioMetrix/audiometrix.js";
@@ -29,8 +33,7 @@
   ];
 
   const VALID_STYLES = [
-    "simple", "segment", "circledots", "matrixdots", "pillars",
-    "beveled3d", "glasstube"
+    "simple", "segment", "circledots", "matrixdots", "pillars", "beveled3d", "glasstube"
   ];
 
   const GRADIENT_CACHE = {
@@ -49,29 +52,67 @@
     canvas: document.createElement("canvas"),
     ctx: null
   };
-  GRADIENT_TEMP.ctx = GRADIENT_TEMP.canvas.getContext("2d");
+  GRADIENT_TEMP.ctx = GRADIENT_TEMP.canvas.getContext("2d", { willReadFrequently: true });
+
+  // Retain recent sizes without accumulating every intermediate resize.
+  class BoundedGeometryMap extends Map {
+    set(key, value) {
+      if (!this.has(key) && this.size >= 32) {
+        this.delete(this.keys().next().value);
+      }
+      return super.set(key, value);
+    }
+  }
+
+  let CANVAS_FONT_CACHE = new WeakMap();
+  const EQUALIZER_GRADIENT_CACHE = new WeakMap();
+  const SPECTRUM_RELIEF_CACHE = new WeakMap();
+
+  function getCanvasFontStyle(source) {
+    if (!source) return null;
+    const signature = source.className + "|" + source.style.cssText;
+    const now = performance.now();
+    const cached = CANVAS_FONT_CACHE.get(source);
+    if (cached && cached.signature === signature && now - cached.time < 250) {
+      return cached;
+    }
+    const style = getComputedStyle(source);
+    const entry = {
+      signature, time: now,
+      fontFamily: style.fontFamily,
+      fontWeight: style.fontWeight
+    };
+    CANVAS_FONT_CACHE.set(source, entry);
+    return entry;
+  }
 
   const GEOMETRY_CACHE = {
-    segment: new Map(),
-    pixelfill: new Map(),
-    circledots: new Map(),
-    matrixdots: new Map(),
-    matrixCount: new Map()
+    segment: new BoundedGeometryMap(),
+    pixelfill: new BoundedGeometryMap(),
+    circledots: new BoundedGeometryMap(),
+    matrixdots: new BoundedGeometryMap(),
+    matrixCount: new BoundedGeometryMap()
   };
 
-  const PERCENT_SCALE_PAD = {
-    left: 10,
-    right: 45
-  };
+  const PERCENT_SCALE_PAD = {left: 5, right: 55};
 
   const FRAME_INTERVAL = 1000 / 30;
   let _lastRenderTime = 0;
-  let _lastDrawn = { L:null, R:null, Q:null, A:null };
+  let _lastDrawn = {
+    L: null,
+    R: null,
+    Q: null,
+    A: null,
+    EQ: null,
+    Scope: null,
+    Stream: null
+  };
 
   const STEREO_Q_MAX = 120;
   const STEREO_Q_SIGNAL_RATIO = 0.74;
 
   function invalidateVisualCaches() {
+    CANVAS_FONT_CACHE = new WeakMap();
     // Gradient cache
     GRADIENT_CACHE.mode = null;
     GRADIENT_CACHE.width = 0;
@@ -90,8 +131,17 @@
     STATE.cache.pillar.height = 0;
   }
 
+  function clearTransientRenderState() {
+    if (!STATE.render) return;
+    STATE.render.barPeak = {};
+    STATE.render.gaugePeak = {};
+    STATE.render.analogVuPeak = {};
+    STATE.render.canvasReadouts = {};
+  }
+
   const STORAGE_ENABLE        = "amx_enabled_state";
   const STORAGE_THEME         = "AMX_THEME";
+  const STORAGE_AUTO_PALETTE  = "AMX_AUTO_THEME_PALETTE";
   const STORAGE_GLOW_ENABLED  = "AMX_GLOW_ENABLED";
   const STORAGE_SHOW_PEAKS    = "AMX_SHOW_PEAKS";
   const STORAGE_SHOW_READOUTS = "AMX_SHOW_READOUTS";
@@ -99,6 +149,9 @@
   const STORAGE_GAIN          = "AMX_GAIN";
   const STORAGE_LAYOUT        = "AMX_LAYOUT_MODE";
   const STORAGE_RENDER        = "AMX_RENDER_MODE";
+  const STORAGE_HYBRID_MODE   = "AMX_HYBRID_MODE";
+  const STORAGE_EQ_RENDER     = "AMX_EQ_RENDER_MODE";
+  const STORAGE_SCOPE_STYLE   = "AMX_OSCILLOSCOPE_STYLE";
   const STORAGE_ATTACK        = "AMX_ATTACK_SPEED";
   const STORAGE_RELEASE       = "AMX_RELEASE_SPEED";
   const STORAGE_PEAK_HOLD     = "AMX_PEAK_HOLD_MS";
@@ -106,7 +159,157 @@
   const STORAGE_PANEL_TOP     = "AMX_PANEL_TOP";
   const STORAGE_PANEL_WIDTH   = "AMX_PANEL_WIDTH";
   const STORAGE_PANEL_HEIGHT  = "AMX_PANEL_HEIGHT";
+  const STORAGE_DIAGNOSTICS   = "AMX_ADMIN_DIAGNOSTICS";
+
+  const AMX_RUNTIME = {
+    destroyed: false,
+    pageVisible: document.visibilityState !== "hidden",
+    autoRebindTimer: null,
+    autoRebindState: "startup",
+    autoRebindLastCheck: 0,
+    diagnosticsTimer: null,
+    diagnosticsEl: null,
+    visibilityHandler: null,
+    themeObserver: null,
+    skinObserver: null,
+    skinObserverRaf: 0,
+    contentResizeObserver: null,
+    barsResizeRaf: null,
+    windowHandlers: [],
+    pendingTimeouts: new Set(),
+    initRetryTimer: null
+  };
   const MIRRORED_LAYOUTS = ["lr", "sa", "full"];
+  const EQ_CENTER_FREQUENCIES = [
+    30, 50, 80, 125, 200, 315, 500, 800,
+    1250, 2000, 3150, 5000, 8000, 12000, 16000, 20000
+  ];
+  const EQ_BAND_LABELS = [
+    "30", "50", "80", "125", "200", "315", "500", "800",
+    "1.25K", "2K", "3.15K", "5K", "8K", "12K", "16K", "20K"
+  ];
+  const EQ_PREAMP_GAINS = [
+    0.95, 0.95, 0.95, 0.95, 0.92, 0.92, 0.96, 1.0,
+    1.02, 1.04, 1.06, 1.10, 1.14, 1.18, 1.22, 1.25
+  ];
+  const EQ_FLOOR_LEVELS = [
+    5, 5, 5, 5, 4, 4, 4, 4,
+    4, 4, 4, 4, 5, 5, 5, 6
+  ];
+  const EQ_SENSITIVITY = 0.8;
+  const EQ_HYSTERESIS = 0.006;
+
+  // Raw sample-peak monitoring. This is deliberately independent from
+  // meter smoothing, user dB gain and visual calibration.
+  const SAMPLE_CLIP_THRESHOLD = 0.985; // ≈ -0.13 dBFS
+  const SAMPLE_CLIP_HOLD_MS = 1500;
+  const EQ_LABEL_ANCHORS = [
+    { index: 0, text: "30" },
+    { index: 3, text: "125" },
+    { index: 7, text: "800" },
+    { index: 11, text: "5K" },
+    { index: 15, text: "20K" }
+  ];
+  const EQ_BAND_COUNT = EQ_BAND_LABELS.length;
+  const HYBRID_STEREO_12_FREQUENCIES = [
+    30, 50, 80, 125, 200, 315, 500, 800,
+    1250, 3150, 8000, 16000
+  ];
+  const HYBRID_AUDIO_10_FREQUENCIES = [
+    30, 63, 125, 250, 500,
+    1000, 2000, 4000, 8000, 16000
+  ];
+  const HYBRID_MODES = [
+    "stereo12",
+    "audio10"
+  ];
+
+  // Fixed gauge geometry. One source of truth for both canvas gauges and DOM labels.
+  // Lower values tighten the group symmetrically around the tile centre.
+  const GAUGE_GAP_SCALE = 0.90;
+
+  function getGaugeGeometry(layout) {
+    const gaugeCount = (layout === "lr" || layout === "sa") ? 2 : (layout === "full" ? 4 : 0);
+    if (!gaugeCount) {
+      return { gaugeCount: 0, centers: [], numericLabels: [] };
+    }
+
+    const cellFraction = 1 / gaugeCount;
+    const centers = Array.from({ length: gaugeCount }, (_, i) =>
+      0.5 + (i - (gaugeCount - 1) / 2) * cellFraction * GAUGE_GAP_SCALE
+    );
+
+    // Numeric scale positions are stored as local offsets from each gauge centre.
+    // This preserves the original arc-label shape while allowing the complete
+    // gauge UI to follow GAUGE_GAP_SCALE as one unified geometry system.
+    const numericLabels = gaugeCount === 2 ? [
+      {
+        start: { x: centers[0] - 0.15, y: 0.80, align: "right" },
+        mid:   { x: centers[0] - 0.12, y: 0.15, align: "right" },
+        high:  { x: centers[0] + 0.12, y: 0.15, align: "left" },
+        end:   { x: centers[0] + 0.15, y: 0.80, align: "left" }
+      },
+      {
+        start: { x: centers[1] - 0.15, y: 0.80, align: "right" },
+        mid:   { x: centers[1] - 0.12, y: 0.15, align: "right" },
+        high:  { x: centers[1] + 0.12, y: 0.15, align: "left" },
+        end:   { x: centers[1] + 0.15, y: 0.80, align: "left" }
+      }
+    ] : [];
+
+    return { gaugeCount, centers, numericLabels };
+  }
+
+  function getGaugeCenterFractions(layout) {
+    return getGaugeGeometry(layout).centers;
+  }
+
+  function getGaugeHorizontalInset(layout) {
+    // Full Gauges uses the nearly edge-to-edge canvas introduced for
+    // 305px mobile clearance. Two-gauge layouts retain the original inset.
+    return layout === "full" ? 1 : 5;
+  }
+
+  function syncGaugeOverlayGeometry(layout) {
+    const overlay = STATE.dom.gaugeOverlay;
+    if (!overlay) return;
+
+    const inset = getGaugeHorizontalInset(layout);
+    overlay.style.left = inset + "px";
+    overlay.style.right = inset + "px";
+  }
+
+  function applyGaugeNumericGeometry(layout) {
+    const geometry = getGaugeGeometry(layout);
+    const groups = [STATE.dom.gaugeNumsLeft, STATE.dom.gaugeNumsRight];
+
+    groups.forEach((group, index) => {
+      const positions = geometry.numericLabels[index];
+      if (!group || !positions) return;
+
+      ["start", "mid", "high", "end"].forEach(key => {
+        const el = group[key];
+        const pos = positions[key];
+        if (!el || !pos) return;
+
+        el.style.left = `${pos.x * 100}%`;
+        el.style.top  = `${pos.y * 100}%`;
+
+        // Anchor the text toward the gauge arc. Left-side numerics end at
+        // their geometry point; right-side numerics begin at theirs.
+        if (pos.align === "right") {
+          el.style.transform = "translate(-100%, -50%)";
+          el.style.textAlign = "right";
+        } else if (pos.align === "left") {
+          el.style.transform = "translate(0, -50%)";
+          el.style.textAlign = "left";
+        } else {
+          el.style.transform = "translate(-50%, -50%)";
+          el.style.textAlign = "center";
+        }
+      });
+    });
+  }
   const AMX_DEBUG             = false;
 
   // HARDENED LOCAL STORAGE HELPERS
@@ -350,7 +553,7 @@
   // PART 1 — THEME ENGINE • SETTINGS UI • CONFIG • STATE
   // ─────────────────────────────────────────────────────
 
-  // External peak
+  // External peak — unified PLAY/floor visibility across all render modes
   function drawExternalPeak(ctx, levelX, peakX, y, height, effectiveW, gauge, barPeakWidth, barPeakStep) {
     // GLOBAL TOGGLE
     if (!CONFIG.display.showPeaks) return;
@@ -371,6 +574,19 @@
     const stateKey = gauge
       ? `g:${tx}:${ty}:${Math.round((gauge.cx || 0) * 10)}:${Math.round((gauge.cy || 0) * 10)}:${Math.round((gauge.r || 0) * 10)}:${Math.round((gauge.startAngle || 0) * 1000)}:${Math.round((gauge.sweepAngle || 0) * 1000)}`
       : `b:${tx}:${ty}:${Math.round(y)}:${Math.round(effectiveW)}`;
+
+    // Visual-floor state is NOT a hide condition while transport is playing.
+    // Peak indicators must remain visible and settle at the beginning/bottom
+    // of their scale even when both live and held values reach 0 / min dB.
+    const atVisualFloor = gauge
+      ? (
+          Math.abs(gauge.normLevel || 0) <= 0.001 &&
+          Math.abs(gauge.peakNorm || 0) <= 0.001
+        )
+      : (
+          Math.abs(levelX || 0) <= 0.5 &&
+          Math.abs(peakX || 0) <= 0.5
+        );
 
     // Same visibility rule as readouts
     const hasStreamObject = STATE.hasStreamObject === true;
@@ -404,7 +620,9 @@
       const fillX = Math.max(0, Math.min(levelX, barW));
       const peakBarX = Math.max(0, Math.min(peakX, barW));
 
-      base = Math.min(barW - 2, fillX + 1);
+      base = atVisualFloor
+        ? 0
+        : Math.min(barW - 2, fillX + 1);
       min  = base;
       max  = barW + PEAK_THROW_PX;
 
@@ -424,10 +642,12 @@
         gauge.startAngle + gauge.normLevel * gauge.sweepAngle;
 
       const angleEps = gauge.sweepAngle * 0.015;
-      base = Math.min(
-        gauge.startAngle + gauge.sweepAngle,
-        fillAngle + angleEps
-      );
+      base = atVisualFloor
+        ? gauge.startAngle
+        : Math.min(
+            gauge.startAngle + gauge.sweepAngle,
+            fillAngle + angleEps
+          );
 
       min = base;
       max = gauge.startAngle + gauge.sweepAngle;
@@ -443,7 +663,17 @@
       const isNewPeak =
         peakAngle > (peakState.lastPeak + gauge.sweepAngle * 0.0025);
 
-      target = isNewPeak ? peakAngle : base;
+      const throwAngle = Math.min(
+        gauge.sweepAngle * 0.08,
+        8 / Math.max(1, gauge.r)
+      );
+
+      // Exact bar behaviour in arc space: the held peak is the trigger for a
+      // new outward throw, but the marker then returns to the live fill edge
+      // instead of parking at the held value.
+      target = isNewPeak
+        ? Math.min(max, peakAngle + throwAngle)
+        : base;
       peakState.lastPeak = peakAngle;
     }
 
@@ -458,8 +688,10 @@
       peakState.pos = Math.min(max, target);
       peakState.vel = 0;
     } else {
-      // Return quickly but smoothly toward the current bar/gauge edge
-      peakState.vel += (base - peakState.pos) * RETURN;
+      // Return quickly but smoothly toward the active target. For bars the
+      // target is their current edge; for gauges it can remain at the held
+      // peak, preventing frame-by-frame snap-back flicker on the arc.
+      peakState.vel += (target - peakState.pos) * RETURN;
       peakState.vel *= DAMPING;
       peakState.pos += peakState.vel;
     }
@@ -515,7 +747,7 @@
     const YELLOW_ZONE_COLOR = "#ffd400"; // stereo quality
 
     // 2) Threshold selector
-    const THR = (mode === 2) ? 0.74 : 0.58;
+    const THR = (mode === 2) ? 0.82 : 0.58;
 
     const t   = THR;
     const t1  = t - 0.001;
@@ -558,7 +790,7 @@
     // 6) Build gradient
     const grad = tctx.createLinearGradient(0, 0, width, 0);
 
-    // ===== AUDIO PEAK =====
+    // ===== RMS+PEAK (A) =====
     if (mode === 1) {
       grad.addColorStop(0.00, low);
       grad.addColorStop(mid_pos, mid);
@@ -622,6 +854,51 @@
     return cache;
   }
 
+  // Native continuous bar gradient. Unlike the legacy one-column sampler,
+  // this is rasterized as one uninterrupted fill by the browser. That avoids
+  // faint vertical seams when browser zoom maps logical CSS pixels onto
+  // fractional device pixels.
+  function createBarsLinearGradient(ctx, width, mode) {
+    const w = Math.max(1, Number(width) || 1);
+    const col = ACTIVE_THEME.colors;
+    const low = col.low;
+    const mid = col.mid;
+    const high = col.high;
+
+    const RED_ZONE_COLOR = "#ff0000";
+    const YELLOW_ZONE_COLOR = "#ffd400";
+    const THR = (mode === 2) ? 0.82 : 0.58;
+    const t1 = THR - 0.001;
+    const t2 = THR + 0.001;
+    const midPos = 0.40 * THR;
+    const highPos = 0.80 * THR;
+
+    const grad = ctx.createLinearGradient(0, 0, w, 0);
+
+    if (mode === 1) {
+      grad.addColorStop(0.00, low);
+      grad.addColorStop(midPos, mid);
+      grad.addColorStop(highPos, high);
+      grad.addColorStop(Math.max(0, t1), high);
+      grad.addColorStop(Math.min(1, t2), RED_ZONE_COLOR);
+      grad.addColorStop(1.00, RED_ZONE_COLOR);
+    } else if (mode === 2) {
+      grad.addColorStop(0.00, high);
+      grad.addColorStop(Math.min(midPos, t1), mid);
+      grad.addColorStop(Math.min(highPos, t1), low);
+      grad.addColorStop(Math.max(0, t1), low);
+      grad.addColorStop(Math.min(1, t2), YELLOW_ZONE_COLOR);
+      grad.addColorStop(1.00, YELLOW_ZONE_COLOR);
+    } else {
+      grad.addColorStop(0.00, low);
+      grad.addColorStop(0.50, mid);
+      grad.addColorStop(0.80, high);
+      grad.addColorStop(1.00, high);
+    }
+
+    return grad;
+  }
+
   // COLOR INTERPOLATION
   function interpolateColor(c1, c2, t) {
       const n1 = c1.match(/[\d\.]+/g).map(Number);
@@ -652,7 +929,7 @@
     // THR is the “one source of truth” threshold used by bars
     const THR = (gcache && gcache.width) ? (gcache.peakThresholdX / gcache.width) : 0.74;
 
-    const t   = THR;
+    const t = Math.max(0, THR - 0.05);
     const t1  = t - 0.001;
     const t2  = t + 0.001;
 
@@ -680,7 +957,7 @@
 
     } else if (mode === 2) {
       // STEREO QUALITY — VISUAL 100% CLAMP
-      const VISUAL_YELLOW = 0.63;
+      const VISUAL_YELLOW = 0.55;
 
       const y1 = VISUAL_YELLOW - 0.003;
       const y2 = VISUAL_YELLOW + 0.003;
@@ -730,44 +1007,137 @@
   // ─────────────────────────────────────────────────────
   // THEME ENGINE — FM-DX INHERITANCE + MANUAL PRESETS
   // ─────────────────────────────────────────────────────
+  let FM_DX_CSS_PALETTE_CHECK = -Infinity;
+  let FM_DX_CSS_PALETTE = Object.create(null);
+  let FM_DX_COLOR_PROBE = null;
+
+  function refreshFmDxCssPalette(force = false) {
+    const now = performance.now();
+    if (!force && now - FM_DX_CSS_PALETTE_CHECK < 250) return;
+    FM_DX_CSS_PALETTE_CHECK = now;
+
+    try {
+      // A detached AudioMetrix container does not inherit the FM-DX custom
+      // properties. Use it only after insertion; otherwise read from :root.
+      const amxContainer = STATE.dom && STATE.dom.container;
+      const source =
+        (amxContainer && amxContainer.isConnected ? amxContainer : null) ||
+        document.documentElement ||
+        document.body;
+      if (!source) return;
+
+      const computed = getComputedStyle(source);
+      const next = Object.create(null);
+
+      ["--color-2", "--color-3", "--color-4"].forEach((propertyName) => {
+        const raw = computed.getPropertyValue(propertyName).trim();
+        if (!raw) return;
+
+        if (!raw.startsWith("var(") && (!window.CSS || CSS.supports("color", raw))) {
+          next[propertyName] = raw;
+          return;
+        }
+
+        // Resolve nested CSS variables to the actual RGB value understood by
+        // CanvasRenderingContext2D.
+        const parent = document.body || document.documentElement;
+        if (!parent) return;
+        if (!FM_DX_COLOR_PROBE) {
+          FM_DX_COLOR_PROBE = document.createElement("span");
+          FM_DX_COLOR_PROBE.setAttribute("aria-hidden", "true");
+          FM_DX_COLOR_PROBE.style.cssText =
+            "position:fixed;left:-9999px;top:-9999px;visibility:hidden;pointer-events:none;";
+          parent.appendChild(FM_DX_COLOR_PROBE);
+        }
+        FM_DX_COLOR_PROBE.style.color = `var(${propertyName})`;
+        const resolved = getComputedStyle(FM_DX_COLOR_PROBE).color;
+        if (resolved) next[propertyName] = resolved;
+      });
+
+      FM_DX_CSS_PALETTE = next;
+    } catch (e) {}
+  }
+
+  function getFmDxCssColor(propertyName) {
+    refreshFmDxCssPalette();
+    return FM_DX_CSS_PALETTE[propertyName] || null;
+  }
+
   function getFmDxThemeTriple() {
     try {
       const themeName = safeLSGet("theme") || safeLSGet("defaultTheme") || null;
-      if (!themeName) return null;
-      if (typeof themes === "undefined" || !themes) return null;
-
-      const triple = themes[themeName];
-      if (!triple) return null;
-
-      // Validate correct triple
-      if (!Array.isArray(triple) || triple.length < 3) return null;
-
-      const [main, bright, text] = triple;
-
-      // Validate color strings (basic RGB/HSL/HEX detection)
       const isColor = (c) => typeof c === "string" &&
         (c.startsWith("rgb") || c.startsWith("hsl") || c.startsWith("#"));
 
-      if (!isColor(main) || !isColor(bright)) {
-        return null;
+      if (themeName && typeof themes !== "undefined" && themes) {
+        const triple = themes[themeName];
+        if (Array.isArray(triple) && triple.length >= 3) {
+          const [main, bright, text] = triple;
+          if (isColor(main) && isColor(bright)) {
+            return [main, bright, isColor(text) ? text : null];
+          }
+        }
       }
 
-      // text color optional but validate if exists
-      if (text && !isColor(text)) {
-        return [main, bright, null];
+      // The live CSS palette remains available even when the FM-DX JavaScript
+      // theme registry is initialized after AudioMetrix.
+      const cssTriple = [
+        getFmDxCssColor("--color-2"),
+        getFmDxCssColor("--color-3"),
+        getFmDxCssColor("--color-4")
+      ];
+      if (cssTriple.every(isColor)) {
+        return cssTriple;
       }
-
-      return [main, bright, text || null];
+      return null;
     } catch (e) {
       return null;
+    }
+  }
+
+  function getFmDxAccentColor() {
+    return (
+      getFmDxCssColor("--color-4") ||
+      (getFmDxThemeTriple() || [])[2] ||
+      "rgb(184,194,204)"
+    );
+  }
+
+  function isStoredThemeColor(value) {
+    return typeof value === "string" &&
+      (value.startsWith("rgb") || value.startsWith("hsl") || value.startsWith("#"));
+  }
+
+  function loadCachedAutomaticTriple() {
+    try {
+      const parsed = JSON.parse(safeLSGet(STORAGE_AUTO_PALETTE) || "null");
+      return Array.isArray(parsed) &&
+        parsed.length >= 3 &&
+        parsed.every(isStoredThemeColor)
+          ? parsed.slice(0, 3)
+          : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function cacheAutomaticTriple(triple) {
+    if (
+      Array.isArray(triple) &&
+      triple.length >= 3 &&
+      triple.every(isStoredThemeColor)
+    ) {
+      safeLSSet(STORAGE_AUTO_PALETTE, JSON.stringify(triple.slice(0, 3)));
     }
   }
 
   const THEME_REGISTRY = {
     automatic: () => {
       try {
-        const triple = getFmDxThemeTriple();
-        if (!triple) return THEME_REGISTRY.vesper;
+        const triple =
+          getFmDxThemeTriple() ||
+          loadCachedAutomaticTriple() ||
+          ["rgb(28,34,40)", "rgb(92,104,116)", "rgb(184,194,204)"];
 
         const [main, mid, textColor] = triple;
 
@@ -820,7 +1190,15 @@
           }
         };
       } catch (e) {
-        return THEME_REGISTRY.vesper;
+        return {
+          name: "automatic",
+          colors: {
+            low: "rgb(28,34,40)",
+            mid: "rgb(92,104,116)",
+            high: "rgb(184,194,204)",
+            peak: "rgb(255,255,255)"
+          }
+        };
       }
     },
 
@@ -1057,21 +1435,47 @@
   // HARDENED AUTO-INHERIT REFRESH FOR "AUTOMATIC" THEME
   let ACTIVE_THEME = loadActiveTheme();
   let LAST_AUTO_THEME_SIG = JSON.stringify(getFmDxThemeTriple() || []);
+  let LAST_AUTO_THEME_CHECK = 0;
+
+  function refreshAutomaticTheme(force = false) {
+    try {
+      if ((safeLSGet(STORAGE_THEME) || "automatic") !== "automatic") {
+        return false;
+      }
+
+      const now = performance.now();
+      if (!force && now - LAST_AUTO_THEME_CHECK < 250) return false;
+      LAST_AUTO_THEME_CHECK = now;
+
+      // FM-DX may expose its theme registry after AudioMetrix is evaluated.
+      // Keep the current temporary fallback until a valid triple is ready.
+      refreshFmDxCssPalette(force);
+      const nextTriple = getFmDxThemeTriple();
+      if (!nextTriple) return false;
+      cacheAutomaticTriple(nextTriple);
+
+      const nextSig = JSON.stringify(nextTriple);
+      if (!force && nextSig === LAST_AUTO_THEME_SIG) return false;
+
+      LAST_AUTO_THEME_SIG = nextSig;
+      ACTIVE_THEME = THEME_REGISTRY.automatic();
+      invalidateVisualCaches();
+
+      // Theme resolution can complete after the startup canvas has already
+      // been painted with the temporary fallback. Force a repaint even while
+      // playback is stopped; otherwise the correct Automatic palette appears
+      // only after the user changes a layout or render setting.
+      requestRender();
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
 
   try {
-    new MutationObserver(() => {
+    AMX_RUNTIME.themeObserver = new MutationObserver(() => {
       try {
-        const sel = safeLSGet(STORAGE_THEME) || "automatic";
-        if (sel === "automatic") {
-          const nextTriple = getFmDxThemeTriple() || [];
-          const nextSig = JSON.stringify(nextTriple);
-
-          if (nextSig !== LAST_AUTO_THEME_SIG) {
-            LAST_AUTO_THEME_SIG = nextSig;
-            ACTIVE_THEME = THEME_REGISTRY.automatic();
-            invalidateVisualCaches();
-          }
-        }
+        refreshAutomaticTheme();
 
       } catch (e) {
         console.error(
@@ -1079,7 +1483,8 @@
           e
         );
       }
-    }).observe(document.body, {
+    });
+    AMX_RUNTIME.themeObserver.observe(document.body, {
       attributes: true,
       subtree: true,
       attributeFilter: ["class", "style"]
@@ -1091,6 +1496,771 @@
   // ─────────────────────────────────────────
   // CONFIG + STATE
   // ─────────────────────────────────────────
+  const VISUALIZER_NAMES = {
+    landscape: "Wave Landscape",
+    waterfall: "Spectrum Waterfall",
+    circular: "Circular Wave",
+    radial: "Radial Spectrum",
+    ribbon: "Ribbon / Helix",
+    stereoTrace: "Stereo Trace",
+    spectrogram: "Spectrogram",
+    goniometer: "Goniometer",
+    halo: "Halo", ripple: "Ripple", spiral: "Spiral",
+    tide: "Tide", layers: "Layers", shower: "Shower",
+    waveBloom: "Wave Bloom", wavePetals: "Wave Petals",
+    twistedRibbon: "Twisted Ribbon", fineHalo: "Fine Halo"
+  };
+  const CIRCULAR_STYLES = ["circular", "radial", "halo", "ripple", "spiral", "waveBloom", "wavePetals", "twistedRibbon", "fineHalo"];
+  const isCircularStyle = style => CIRCULAR_STYLES.includes(style);
+  const CIRCULAR_PALETTE = { themeKey: "", palette: [] };
+  let CIRCULAR_METER_STATE = null;
+
+  function createCircularNode() {
+    return {
+      wave: new Float32Array(128), spectrum: new Float32Array(121),
+      targets: new Float32Array(121), lookup: null, lookupKey: "",
+      pulseTimes: new Float64Array(24).fill(-Infinity),
+      pulseLevels: new Float32Array(24), pulseHead: 0,
+      lastPulse: -Infinity, lastLevel: 0, level: 0, peak: 0,
+      lastDraw: 0, lastSpectrum: -Infinity
+    };
+  }
+
+  // Analysis-only filters. Recompute each overlapping analyser window from
+  // scratch and discard its first half as warm-up; never alter playback.
+  function circularBandCoefficients(type, frequency, sampleRate) {
+    const w = Math.PI * 2 * Math.min(frequency, sampleRate * 0.45) / sampleRate;
+    const cos = Math.cos(w), alpha = Math.sin(w) / Math.SQRT2;
+    const a0 = 1 + alpha;
+    const b0 = (type === "lowpass" ? 1 - cos : 1 + cos) / 2;
+    return { b0: b0 / a0,
+      b1: (type === "lowpass" ? 1 - cos : -(1 + cos)) / a0,
+      b2: b0 / a0, a1: -2 * cos / a0, a2: (1 - alpha) / a0 };
+  }
+
+  function filterCircularBand(input, output, c) {
+    let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    for (let i = 0; i < output.length; i++) {
+      const x = input[i] || 0;
+      const y = c.b0 * x + c.b1 * x1 + c.b2 * x2 - c.a1 * y1 - c.a2 * y2;
+      output[i] = y; x2 = x1; x1 = x; y2 = y1; y1 = y;
+    }
+  }
+
+  function updateCircularBands(v, frame) {
+    const nodes = v.circles;
+    const left = STATE.audio.timeLeft, right = STATE.audio.timeRight;
+    const n = Math.min(left?.length || 0, right?.length || 0);
+    if (STATE.hasStreamObject !== true || n < 4) {
+      for (const node of nodes) {
+        node.wave.fill(0);node.spectrum.fill(0);node.level = 0;
+      }
+      return;
+    }
+    const sampleRate = STATE.audio.context?.sampleRate || 48000;
+    const key = `${sampleRate}|${n}`;
+    let analysis = v.bandAnalysis;
+    if (!analysis || analysis.key !== key) {
+      const ranges = [[30, 250], [250, 4000], [4000, 20000]];
+      analysis = v.bandAnalysis = {
+        key, coefficients: [
+          circularBandCoefficients("lowpass", 250, sampleRate),
+          circularBandCoefficients("highpass", 250, sampleRate),
+          circularBandCoefficients("lowpass", 4000, sampleRate),
+          circularBandCoefficients("highpass", 4000, sampleRate)
+        ],
+        buffers: Array.from({ length: 2 }, () => Array.from({ length: 4 }, () => new Float32Array(n))),
+        spectrumPositions: ranges.map(([low, high]) => Float32Array.from({ length: 121 }, (_, i) => {
+          const frequency = low * Math.pow(high / low, i / 120);
+          let band = 0;
+          while (band < EQ_BAND_COUNT - 2 && frequency > EQ_CENTER_FREQUENCIES[band + 1]) band++;
+          const t = Math.log(frequency / EQ_CENTER_FREQUENCIES[band]) /
+            Math.log(EQ_CENTER_FREQUENCIES[band + 1] / EQ_CENTER_FREQUENCIES[band]);
+          return clamp((band + t) * 8, 0, 120);
+        }))
+      };
+    }
+    for (let channel = 0; channel < 2; channel++) {
+      const source = channel ? right : left, buffers = analysis.buffers[channel], c = analysis.coefficients;
+      filterCircularBand(source, buffers[0], c[0]);
+      filterCircularBand(source, buffers[3], c[1]);
+      filterCircularBand(buffers[3], buffers[1], c[2]);
+      filterCircularBand(source, buffers[2], c[3]);
+    }
+    const start = Math.floor(n / 2), tail = n - start, gain = getScopeGainLinear();
+    for (let band = 0; band < 3; band++) {
+      const node = nodes[band], l = analysis.buffers[0][band], r = analysis.buffers[1][band];
+      let powerL = 0, powerR = 0;
+      for (let i = start; i < n; i++) { powerL += l[i] * l[i];powerR += r[i] * r[i]; }
+      node.level = clamp(Math.sqrt((powerL + powerR) / (tail * 2)) * gain * 2, 0, 1);
+      const waveform = powerL >= powerR ? l : r;
+      for (let i = 0; i < node.wave.length; i++) {
+        const first = start + Math.floor(i / node.wave.length * tail);
+        const last = Math.min(n, Math.max(first + 1, start + Math.floor((i + 1) / node.wave.length * tail)));
+        let sample = 0;
+        for (let j = first; j < last; j++) if (Math.abs(waveform[j]) > Math.abs(sample)) sample = waveform[j];
+        node.wave[i] = clamp(sample * gain, -1, 1);
+      }
+      const positions = analysis.spectrumPositions[band];
+      for (let i = 0; i < 121; i++) {
+        const p = positions[i], lo = Math.floor(p), hi = Math.min(120, lo + 1);
+        node.spectrum[i] = frame.spectrum[lo] + (frame.spectrum[hi] - frame.spectrum[lo]) * (p - lo);
+      }
+      node.scalar = false;
+    }
+  }
+
+  const CIRCULAR_WARNING_ZONES = {
+    Q: { threshold: 0.82, color: "#ffd400" },
+    A: { threshold: 0.58, color: "#ff0000" }
+  };
+
+  function circularWarningZone(node) {
+    return CIRCULAR_WARNING_ZONES[node.metric] || null;
+  }
+
+  function drawCircularStyle(ctx, style, cx, cy, radius, node, now) {
+    refreshVisualizerPalette(CIRCULAR_PALETTE);
+    const palette = CIRCULAR_PALETTE.palette;
+    const colors = ACTIVE_THEME.colors;
+    const samples = node.wave;
+    const level = clamp(node.level || 0, 0, 1);
+    const zone = circularWarningZone(node);
+    const warning = zone && level >= zone.threshold ? zone.color : null;
+    const points = radius < 35 ? 96 : 160;
+    const tau = Math.PI * 2;
+    const sampleAt = fraction => samples[Math.floor(fraction * samples.length) % samples.length] || 0;
+    const colour = fraction => palette[Math.round(clamp(fraction, 0, 1) * 63)];
+    const line = (alpha, color, width = 0.7) => {
+      ctx.globalAlpha = alpha; ctx.strokeStyle = color;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = CONFIG.display.glowIntensity > 0 ? 3 : 0;
+      ctx.lineWidth = width; ctx.stroke();
+    };
+    ctx.save();
+    ctx.lineJoin = "round"; ctx.lineCap = "round";
+    ctx.shadowColor = colors.high;
+    ctx.shadowBlur = CONFIG.display.glowIntensity > 0 ? 2 : 0;
+    if (style === "radial") {
+      const base = radius * 0.49;
+      ctx.beginPath(); ctx.arc(cx, cy, base, 0, tau);
+      line(0.45, colors.mid);
+      ctx.shadowBlur = 0;
+      for (let i = 0; i < node.spectrum.length; i++) {
+        const value = clamp(node.spectrum[i], 0, 1);
+        const angle = i / node.spectrum.length * tau - Math.PI / 2;
+        const outer = base + value * radius * 0.48;
+        ctx.beginPath();
+        ctx.moveTo(cx + Math.cos(angle) * base, cy + Math.sin(angle) * base);
+        ctx.lineTo(cx + Math.cos(angle) * outer, cy + Math.sin(angle) * outer);
+        const position = i / (node.spectrum.length - 1);
+        const rayColor = zone && position >= zone.threshold && position <= level && value > 0
+          ? zone.color : colour(value);
+        line(0.25 + value * 0.75, rayColor, Math.max(0.6, radius / 55));
+      }
+    } else if (style === "halo") {
+      ctx.beginPath(); ctx.arc(cx, cy, radius * 0.93, 0, tau);
+      line(0.30 + level * 0.65, colors.high, 1.3);
+      if (warning) {
+        ctx.beginPath();ctx.arc(cx, cy, radius * 0.93,
+          zone.threshold * tau - Math.PI / 2, level * tau - Math.PI / 2);
+        line(0.95, warning, 1.5);
+      }
+      ctx.shadowBlur = 0;
+      for (let i = 0; i < 48; i++) {
+        const angle = i / 48 * tau - Math.PI / 2;
+        const amount = Math.abs(sampleAt(i / 48));
+        const r = radius * (0.58 + amount * 0.14);
+        ctx.beginPath();
+        ctx.moveTo(cx + Math.cos(angle) * r, cy + Math.sin(angle) * r);
+        ctx.lineTo(cx + Math.cos(angle) * (r + radius * 0.05), cy + Math.sin(angle) * (r + radius * 0.05));
+        const position = i / 48;
+        line(0.15 + Math.max(amount, level) * 0.70,
+          zone && position >= zone.threshold && position <= level ? zone.color : colour(position));
+      }
+    } else if (style === "ripple") {
+      if (level > 0.01 && (
+        (Math.abs(level - node.lastLevel) > 0.018 && now - node.lastPulse > 65) ||
+        now - node.lastPulse > 150 + (1 - level) * 250
+      )) {
+        node.pulseTimes[node.pulseHead] = now;
+        node.pulseLevels[node.pulseHead] = level;
+        node.pulseHead = (node.pulseHead + 1) % node.pulseTimes.length;
+        node.lastPulse = now;
+      }
+      node.lastLevel = level;
+      const duration = CONFIG.display.visualizerTrail / 30 * 1000;
+      for (let ring = 0; ring < node.pulseTimes.length; ring++) {
+        const age = (now - node.pulseTimes[ring]) / duration;
+        if (age < 0 || age >= 1) continue;
+        ctx.beginPath();
+        for (let i = 0; i <= points; i++) {
+          const fraction = i / points, angle = fraction * tau;
+          const core = 0.43 + node.pulseLevels[ring] * 0.03;
+          const r = radius * Math.min(0.99, core + 0.025 + age * (0.965 - core) + sampleAt(fraction) * 0.015 * (1 - age));
+          const x = cx + Math.cos(angle) * r, y = cy + Math.sin(angle) * r;
+          if (!i) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        const ringColor = zone && node.pulseLevels[ring] >= zone.threshold ? zone.color : colour(1 - age);
+        line(Math.pow(1 - age, 0.65) * (0.30 + node.pulseLevels[ring] * 0.65), ringColor, 0.9);
+      }
+      ctx.beginPath(); ctx.arc(cx, cy, radius * (0.43 + level * 0.03), 0, tau);
+      line(0.55 + level * 0.40, warning || colors.high, 1.1);
+    } else if (style === "spiral") {
+      const turns = 5;
+      ctx.shadowBlur = 0;
+      for (let turn = 0; turn < turns; turn++) {
+        ctx.beginPath();
+        for (let i = 0; i <= points; i++) {
+          const fraction = i / points;
+          const position = (turn + fraction) / turns;
+          const angle = fraction * tau - Math.PI / 2;
+          const r = radius * position * (0.92 + sampleAt(fraction) * 0.065);
+          const x = cx + Math.cos(angle) * r, y = cy + Math.sin(angle) * r;
+          if (!i) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        line(0.40 + turn / turns * 0.5, warning || colour((turn + 1) / turns));
+      }
+    } else {
+      const simple = style === "circular";
+      const count = simple ? 1 : (radius < 35 ? 10 : 18);
+      const size = count * (points + 1) * 2;
+      if (!node.outline || node.outline.length !== size) node.outline = new Float32Array(size);
+      const outline = node.outline;
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      for (let curve = 0; curve < count; curve++) {
+        const t = count > 1 ? curve / (count - 1) : 1;
+        for (let i = 0; i <= points; i++) {
+          const fraction = i / points, angle = fraction * tau - Math.PI / 2;
+          const wave = sampleAt(fraction);
+          let r;
+          if (simple) {
+            r = node.scalar ? 0.66 + level * 0.29 : 0.86 + wave * 0.12;
+          } else if (style === "waveBloom") {
+            const fold = Math.sin(angle * 4 + wave * 1.8) * (0.045 + level * 0.09);
+            r = 0.36 + t * 0.48 + fold + wave * 0.055;
+          } else if (style === "wavePetals") {
+            const petal = Math.cos(angle * 5) * (0.035 + level * 0.12);
+            r = 0.35 + t * 0.46 + petal + wave * 0.04 * t;
+          } else if (style === "twistedRibbon") {
+            const twist = Math.sin(angle * 3 + wave * 2.4);
+            r = 0.80 + twist * (0.035 + level * 0.025) +
+              Math.sin(angle * 2 + wave * 1.7 + t * 0.6) * (t - 0.5) * 0.26;
+          } else {
+            // Fine Halo: a narrow translucent ribbon, locally folded.
+            r = 0.90 + wave * 0.035 +
+              Math.sin(angle * 3 + wave * 3.4 + t * 0.7) * (t - 0.5) * 0.085;
+          }
+          r = clamp(r, 0.12, 0.985) * radius;
+          const x = Math.cos(angle) * r, y = Math.sin(angle) * r;
+          const offset = (curve * (points + 1) + i) * 2;
+          outline[offset] = x;outline[offset + 1] = y;
+          minX = Math.min(minX, x);maxX = Math.max(maxX, x);
+          minY = Math.min(minY, y);maxY = Math.max(maxY, y);
+        }
+      }
+      // Fit the actual contour, rather than a generously padded nominal
+      // radius. This uses the available height without stretching the shape.
+      const fit = Math.min(radius * 1.97 / Math.max(0.001, maxX - minX),
+        radius * 1.97 / Math.max(0.001, maxY - minY));
+      ctx.translate(cx, cy);ctx.scale(fit, fit);
+      ctx.translate(-(minX + maxX) / 2, -(minY + maxY) / 2);
+      for (let curve = 0; curve < count; curve++) {
+        const t = count > 1 ? curve / (count - 1) : 1;
+        ctx.shadowBlur = CONFIG.display.glowIntensity > 0 && curve === count - 1 ? 2 : 0;
+        ctx.beginPath();
+        for (let i = 0; i <= points; i++) {
+          const offset = (curve * (points + 1) + i) * 2;
+          if (!i) ctx.moveTo(outline[offset], outline[offset + 1]);
+          else ctx.lineTo(outline[offset], outline[offset + 1]);
+        }
+        ctx.closePath();
+        line(simple ? 0.95 : 0.38 + t * 0.40,
+          warning || (simple ? colors.high : colour(0.25 + t * 0.75)), (simple ? 1.1 : 0.55) / fit);
+      }
+    }
+    ctx.restore();
+  }
+
+  function getCircularMeterState() {
+    const source = STATE.audio.timeLeft;
+    if (!CIRCULAR_METER_STATE || CIRCULAR_METER_STATE.source !== source) {
+      CIRCULAR_METER_STATE = {
+        source, L: createCircularNode(), R: createCircularNode(),
+        Q: createCircularNode(), A: createCircularNode()
+      };
+    }
+    return CIRCULAR_METER_STATE;
+  }
+
+  function updateCircularSpectra(now) {
+    const a = STATE.audio;
+    const state = getCircularMeterState();
+    const bins = Math.min(a.dataEqualizerLeft?.length || 0, a.dataEqualizerRight?.length || 0);
+    if (!bins) return;
+    const nyquist = (a.context?.sampleRate || 48000) / 2;
+    for (const key of ["L", "R"]) {
+      const node = state[key];
+      const buffer = key === "L" ? a.dataEqualizerLeft : a.dataEqualizerRight;
+      const analyser = key === "L" ? a.analyserEqualizerLeft : a.analyserEqualizerRight;
+      if (!analyser) continue;
+      const lookupKey = `${nyquist}|${bins}`;
+      if (node.lookupKey !== lookupKey) {
+        node.lookupKey = lookupKey;
+        node.lookup = Array.from({ length: 121 }, (_, i) => {
+          const p = i / 8, band = Math.min(EQ_BAND_COUNT - 2, Math.floor(p)), t = p - band;
+          const frequency = EQ_CENTER_FREQUENCIES[band] * Math.pow(EQ_CENTER_FREQUENCIES[band + 1] / EQ_CENTER_FREQUENCIES[band], t);
+          return { bin: frequency / nyquist * bins,
+            gain: EQ_PREAMP_GAINS[band] + (EQ_PREAMP_GAINS[band + 1] - EQ_PREAMP_GAINS[band]) * t,
+            floor: EQ_FLOOR_LEVELS[band] + (EQ_FLOOR_LEVELS[band + 1] - EQ_FLOOR_LEVELS[band]) * t };
+        });
+      }
+      for (let i = 0; i < 121; i++) {
+        const item = node.lookup[i], bin = item.bin;
+        let value = 0;
+        if (bin <= bins - 1) {
+          const lo = Math.max(0, Math.floor(bin)), hi = Math.min(bins - 1, lo + 1);
+          value = buffer[lo] + (buffer[hi] - buffer[lo]) * (bin - lo);
+        }
+        const minDb = analyser.minDecibels;
+        const db = clamp(minDb + value / 255 * (analyser.maxDecibels - minDb) + CONFIG.audio.dbGain, minDb, -30);
+        const scaled = (db - minDb) / Math.max(1, -30 - minDb) * 255 * item.gain;
+        node.targets[i] = STATE.hasStreamObject === true
+          ? Math.pow(clamp((scaled - item.floor) / (255 - item.floor), 0, 1), 1 / EQ_SENSITIVITY) : 0;
+      }
+      node.lastSpectrum = now;
+    }
+  }
+
+  function renderCircularMeters(ctx, canvas, layout, style) {
+    const width = getCanvasLogicalWidth(canvas), height = WRAPPER_HEIGHT;
+    resizeCanvasIfNeeded(canvas, width, height);
+    applyCanvasHiDpiTransform(canvas);
+    ctx.clearRect(0, 0, width, height);
+    const state = getCircularMeterState();
+    const keys = layout === "full" ? ["L", "R", "Q", "A"] : layout === "sa" ? ["Q", "A"] : ["L", "R"];
+    const slot = width / keys.length;
+    const radius = Math.max(1, Math.min(slot / 2 - 3, height / 2 - 2));
+    const now = performance.now(), colors = ACTIVE_THEME.colors;
+    const minDb = CONFIG.audio.minDb, range = Math.max(1, CONFIG.audio.maxDb - minDb);
+    const playing = STATE.hasStreamObject === true;
+    const gain = getScopeGainLinear();
+    ctx.save(); ctx.beginPath(); ctx.rect(0, 0, width, height); ctx.clip();
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index], node = state[key];
+      const left = key === "L", right = key === "R", isQ = key === "Q";
+      const channel = left ? STATE.levels.left : right ? STATE.levels.right : null;
+      const db = channel ? channel.smoothDb : isQ
+        ? mapStereoQualityToDb(STATE.levels.stereoQuality.smooth, minDb, range)
+        : mapAudioSampleToDb(STATE.levels.audio.smooth, minDb, range);
+      const peakDb = channel ? channel.peakDb : isQ
+        ? STATE.levels.stereoQuality.peakDb : mapAudioSampleToDb(STATE.levels.audio.peak, minDb, range);
+      node.level = playing ? clamp((db - minDb) / range, 0, 1) : 0;
+      node.peak = playing ? clamp((peakDb - minDb) / range, 0, 1) : 0;
+      node.scalar = isQ;
+      node.metric = key;
+      const source = left ? STATE.audio.timeLeft : right ? STATE.audio.timeRight : key === "A" ? STATE.audio.dataPeak : null;
+      const trigger = source?.length && playing ? findScopeTrigger(source) : 0;
+      for (let i = 0; i < node.wave.length; i++) {
+        const n = source?.length || 0;
+        node.wave[i] = n && playing ? clamp((source[(trigger + Math.floor(i / node.wave.length * n * 0.5)) % n] || 0) * gain, -1, 1) : 0;
+      }
+      const delta = node.lastDraw ? Math.min(0.1, (now - node.lastDraw) / 1000) : 1 / 60;
+      node.lastDraw = now;
+      const attack = 1 - Math.pow(1 - (0.08 + CONFIG.audio.attackSpeed * 0.42), Math.max(0.01, delta * 60));
+      const release = 1 - Math.pow(1 - (0.015 + CONFIG.audio.releaseSpeed * 0.12), Math.max(0.01, delta * 60));
+      for (let i = 0; i < node.spectrum.length; i++) {
+        if (channel) {
+          const target = playing ? node.targets[i] : 0;
+          node.spectrum[i] += (target - node.spectrum[i]) * (target > node.spectrum[i] ? attack : release);
+        } else {
+          // Q and A are circular meters, not invented frequency spectra.
+          node.spectrum[i] = i / node.spectrum.length <= node.level && node.level > 0 ? node.level : 0;
+        }
+      }
+      const cx = slot * (index + 0.5), cy = height / 2;
+      drawCircularStyle(ctx, style, cx, cy, radius, node, now);
+      // True value/peak arc remains readable independently of ornament style.
+      ctx.save();ctx.shadowBlur = 0;
+      const inner = radius * 0.34;
+      ctx.strokeStyle = colors.mid; ctx.globalAlpha = 0.22; ctx.lineWidth = 0.8;
+      ctx.beginPath();ctx.arc(cx, cy, inner, 0, Math.PI * 2);ctx.stroke();
+      if (playing) {
+        const zone = circularWarningZone(node);
+        const normalEnd = zone ? Math.min(node.level, zone.threshold) : node.level;
+        ctx.globalAlpha = 0.85; ctx.strokeStyle = colors.high;
+        ctx.shadowColor = colors.high;ctx.shadowBlur = CONFIG.display.glowIntensity > 0 ? 3 : 0;
+        ctx.beginPath();ctx.arc(cx, cy, inner, -Math.PI / 2, -Math.PI / 2 + normalEnd * Math.PI * 2);ctx.stroke();
+        if (zone && node.level > zone.threshold) {
+          ctx.strokeStyle = zone.color;ctx.shadowColor = zone.color;
+          ctx.beginPath();ctx.arc(cx, cy, inner, -Math.PI / 2 + zone.threshold * Math.PI * 2,
+            -Math.PI / 2 + node.level * Math.PI * 2);ctx.stroke();
+        }
+        if (CONFIG.display.showPeaks && Number.isFinite(node.peak)) {
+          const angle = node.peak * Math.PI * 2 - Math.PI / 2;
+          ctx.beginPath();ctx.moveTo(cx + Math.cos(angle) * (inner - 2), cy + Math.sin(angle) * (inner - 2));
+          ctx.lineTo(cx + Math.cos(angle) * (inner + 2), cy + Math.sin(angle) * (inner + 2));
+          const peakColor = zone && node.peak >= zone.threshold ? zone.color : colors.peak;
+          ctx.strokeStyle = peakColor;ctx.shadowColor = peakColor;ctx.stroke();
+        }
+      }
+      ctx.shadowBlur = 0;
+      const font = getCanvasFontStyle(STATE.dom.title);
+      const size = radius < 34 ? 8 : 10;
+      ctx.globalAlpha = 0.95; ctx.fillStyle = colors.high;
+      ctx.font = `600 ${size}px ${font?.fontFamily || "sans-serif"}`;
+      ctx.textAlign = "center";ctx.textBaseline = "middle";
+      const values = CONFIG.display.showReadouts && playing;
+      ctx.fillText(key, cx, cy - (values ? 5 : 0));
+      if (values) {
+        ctx.font = `${Math.max(7, size - 1)}px ${font?.fontFamily || "sans-serif"}`;
+        const value = isQ ? `${Math.round(STATE.levels.stereoQuality.smooth)}%` : Number.isFinite(db) ? `${db.toFixed(1)}` : "–";
+        const zone = circularWarningZone(node);
+        ctx.fillStyle = zone && node.level >= zone.threshold ? zone.color : colors.high;
+        ctx.fillText(value, cx, cy + 7);
+      }
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  let VISUALIZER_STATE = null;
+
+  function resetVisualizerState() {
+    VISUALIZER_STATE = null;
+    CIRCULAR_METER_STATE = null;
+  }
+
+  function getVisualizerState(style, now) {
+    const source = STATE.audio.timeLeft;
+    let v = VISUALIZER_STATE;
+    if (!v || v.style !== style || v.source !== source) {
+      v = VISUALIZER_STATE = {
+        style, source, lastCapture: -Infinity,
+        head: -1, count: 0, themeKey: "", correlation: 0, width: 0,
+        frames: Array.from({ length: 48 }, () => ({
+          spectrum: new Float32Array(121),
+          wave: new Float32Array(128), xy: new Float32Array(512)
+        })),
+        palette: [], image: null, imageCtx: null,
+        circles: Array.from({ length: 3 }, () => createCircularNode()), bandAnalysis: null,
+        particleHead: 0,
+        particles: Array.from({ length: 256 }, () => ({ born: -Infinity, x: 0, level: 0, strength: 0 }))
+      };
+    }
+    return v;
+  }
+
+  function captureVisualizerFrame(v, now) {
+    if (now - v.lastCapture < 1000 / 30) return false;
+    v.lastCapture = now;
+    v.head = (v.head + 1) % v.frames.length;
+    v.count = Math.min(v.frames.length, v.count + 1);
+    const frame = v.frames[v.head];
+    const detail = STATE.levels.equalizer.detail?.values;
+    frame.spectrum.fill(0);
+    if (detail) frame.spectrum.set(detail.subarray(0, 121));
+    const left = STATE.audio.timeLeft;
+    const right = STATE.audio.timeRight;
+    const n = Math.min(left?.length || 0, right?.length || 0);
+    const gain = getScopeGainLinear();
+    const playing = STATE.hasStreamObject === true;
+    // A shared trigger keeps circular and landscape traces stable.
+    const trigger = n > 1 && playing ? findScopeTrigger(left) : 0;
+    for (let i = 0; i < frame.wave.length; i++) {
+      const sample = n ? (trigger + Math.floor(i / frame.wave.length * n * 0.5)) % n : 0;
+      frame.wave[i] = playing && n
+        ? clamp(((left[sample] || 0) + (right[sample] || 0)) * 0.5 * gain, -1, 1)
+        : 0;
+    }
+    let ll = 0, rr = 0, lr = 0, midPower = 0, sidePower = 0;
+    for (let i = 0; i < 256; i++) {
+      const sample = Math.min(n - 1, Math.floor(i / 256 * n));
+      const l = n && playing ? left[sample] || 0 : 0;
+      const r = n && playing ? right[sample] || 0 : 0;
+      const mid = (l + r) * Math.SQRT1_2;
+      const side = (l - r) * Math.SQRT1_2;
+      frame.xy[i * 2] = clamp(side * gain, -1, 1);
+      frame.xy[i * 2 + 1] = clamp(mid * gain, -1, 1);
+      ll += l * l; rr += r * r; lr += l * r;
+      midPower += mid * mid; sidePower += side * side;
+    }
+    v.correlationValid = ll * rr > 1e-16;
+    v.correlation = v.correlationValid ? clamp(lr / Math.sqrt(ll * rr), -1, 1) : 0;
+    v.width = midPower + sidePower > 1e-12
+      ? Math.sqrt(sidePower / (midPower + sidePower)) : 0;
+    if (!playing) frame.spectrum.fill(0);
+    if (isCircularStyle(v.style)) updateCircularBands(v, frame);
+    return true;
+  }
+
+  function visualizerFrame(v, age) {
+    return v.frames[(v.head - age + v.frames.length) % v.frames.length];
+  }
+
+  function refreshVisualizerPalette(v) {
+    const colors = ACTIVE_THEME.colors;
+    const key = `${colors.low}|${colors.mid}|${colors.high}`;
+    if (v.themeKey === key) return;
+    v.themeKey = key;
+    const swatch = document.createElement("canvas");
+    swatch.width = 64; swatch.height = 1;
+    const paint = swatch.getContext("2d", { willReadFrequently: true });
+    const gradient = paint.createLinearGradient(0, 0, 64, 0);
+    gradient.addColorStop(0, colors.low);
+    gradient.addColorStop(0.5, colors.mid);
+    gradient.addColorStop(1, colors.high);
+    paint.fillStyle = gradient; paint.fillRect(0, 0, 64, 1);
+    const pixels = paint.getImageData(0, 0, 64, 1).data;
+    v.palette = Array.from({ length: 64 }, (_, i) =>
+      `rgb(${pixels[i * 4]},${pixels[i * 4 + 1]},${pixels[i * 4 + 2]})`);
+    // A theme change must not leave old colours in the spectrogram history.
+    if (v.imageCtx) v.imageCtx.clearRect(0, 0, 256, 121);
+  }
+
+  function renderVisualizer(ctx, canvas) {
+    const style = CONFIG.display.visualizerStyle;
+    const width = getCanvasLogicalWidth(canvas);
+    const height = WRAPPER_HEIGHT;
+    resizeCanvasIfNeeded(canvas, width, height);
+    applyCanvasHiDpiTransform(canvas);
+    ctx.clearRect(0, 0, width, height);
+    const now = performance.now();
+    const v = getVisualizerState(style, now);
+    const captured = captureVisualizerFrame(v, now);
+    refreshVisualizerPalette(v);
+    if (v.head < 0) return;
+    const current = visualizerFrame(v, 0);
+    const colors = ACTIVE_THEME.colors;
+    const showValues = CONFIG.display.showReadouts && STATE.hasStreamObject === true;
+    const reserve = (showValues ? 12 : 0) + (style === "goniometer" ? 7 : 0);
+    const w = Math.max(1, width - 12), h = Math.max(1, height - reserve - 2);
+    const cx = width / 2, cy = 1 + h / 2;
+    const radius = Math.max(1, Math.min(w / 2 - 1, h / 2 - 1));
+    const historyCount = Math.min(v.count, CONFIG.display.visualizerTrail);
+    const palette = (level) => v.palette[Math.round(clamp(level, 0, 1) * 63)];
+    const stroke = (alpha, color, lineWidth = 1, glow = true) => {
+      ctx.globalAlpha = alpha;
+      ctx.strokeStyle = color;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = glow && CONFIG.display.glowIntensity > 0 ? 3 : 0;
+      ctx.lineWidth = lineWidth;
+      ctx.stroke();
+    };
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, width, height); ctx.clip();
+    ctx.lineJoin = "round"; ctx.lineCap = "round";
+    if (CONFIG.display.glowIntensity > 0 && style !== "spectrogram") {
+      ctx.shadowColor = colors.high;
+      ctx.shadowBlur = 3;
+    }
+
+    if (style === "landscape" || style === "waterfall") {
+      const count = Math.max(1, historyCount);
+      for (let age = count - 1; age >= 0; age--) {
+        const frame = visualizerFrame(v, age);
+        ctx.shadowBlur = CONFIG.display.glowIntensity > 0 && age === 0 ? 3 : 0;
+        const depth = age / Math.max(1, count - 1);
+        const scale = 1 - depth * 0.35;
+        const left = cx - w * scale / 2;
+        const baseline = (style === "waterfall" ? h : h * 0.88) - depth * h * 0.60;
+        const samples = style === "waterfall" ? frame.spectrum : frame.wave;
+        ctx.beginPath();
+        for (let i = 0; i < samples.length; i++) {
+          const x = left + i / (samples.length - 1) * w * scale;
+          const amplitude = style === "waterfall" ? h * 0.47 : h * 0.11;
+          const y = baseline - samples[i] * amplitude * scale;
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        stroke((1 - depth * 0.82) * 0.85, palette(1 - depth * 0.8), age === 0 ? 1.3 : 0.7);
+      }
+    } else if (isCircularStyle(style)) {
+      const names = ["Low", "Medium", "High"];
+      const slot = width / 3;
+      const bandRadius = Math.max(1, Math.min(slot / 2 - 3, h / 2 - 1));
+      const font = getCanvasFontStyle(STATE.dom.title);
+      for (let band = 0; band < 3; band++) {
+        const bandX = slot * (band + 0.5);
+        drawCircularStyle(ctx, style, bandX, cy, bandRadius, v.circles[band], now);
+        ctx.save();ctx.shadowBlur = 0;
+        ctx.textAlign = "center";ctx.textBaseline = "middle";
+        ctx.font = `600 ${Math.min(9, Math.max(7, bandRadius * 0.21))}px ${font?.fontFamily || "sans-serif"}`;
+        ctx.strokeStyle = colors.low;ctx.lineWidth = 3;ctx.globalAlpha = 0.95;
+        ctx.strokeText(names[band], bandX, cy, slot - 8);
+        ctx.fillStyle = colors.high;ctx.fillText(names[band], bandX, cy, slot - 8);
+        ctx.restore();
+      }
+    } else if (style === "ribbon") {
+      const samples = current.wave;
+      const energy = current.spectrum.reduce((sum, value) => sum + value, 0) / 121;
+      // Three strands with audio-dependent twist, no free-running phase.
+      for (let strand = 0; strand < 3; strand++) {
+        ctx.beginPath();
+        for (let i = 0; i < samples.length; i++) {
+          const fraction = i / (samples.length - 1);
+          const angle = fraction * Math.PI * 10 + strand * Math.PI * 2 / 3 + samples[i] * 1.6;
+          const spread = Math.sin(fraction * Math.PI) * radius * (0.40 + energy * 0.60);
+          const x = 6 + fraction * w;
+          const y = cy + Math.cos(angle) * spread + samples[i] * radius * 0.18;
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        stroke(0.70, [colors.low, colors.mid, colors.high][strand], 1.1);
+      }
+    } else if (style === "stereoTrace" || style === "goniometer") {
+      const sizeX = w * 0.48;
+      const sizeY = h * 0.48;
+      if (style === "goniometer") {
+        ctx.shadowBlur = 0;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy - sizeY); ctx.lineTo(cx + sizeX, cy);
+        ctx.lineTo(cx, cy + sizeY); ctx.lineTo(cx - sizeX, cy); ctx.closePath();
+        ctx.moveTo(cx - sizeX, cy); ctx.lineTo(cx + sizeX, cy);
+        ctx.moveTo(cx, cy - sizeY); ctx.lineTo(cx, cy + sizeY);
+        stroke(0.35, colors.mid, 0.6, false);
+        if (CONFIG.display.glowIntensity > 0) ctx.shadowBlur = 3;
+      }
+      ctx.save();
+      if (style === "goniometer") {
+        ctx.beginPath();ctx.moveTo(cx, cy - sizeY);ctx.lineTo(cx + sizeX, cy);
+        ctx.lineTo(cx, cy + sizeY);ctx.lineTo(cx - sizeX, cy);ctx.closePath();ctx.clip();
+      }
+      const count = Math.min(historyCount, 16);
+      for (let age = count - 1; age >= 0; age--) {
+        const historyAge = count > 1 ? Math.round(age * (historyCount - 1) / (count - 1)) : 0;
+        const xy = visualizerFrame(v, historyAge).xy;
+        ctx.shadowBlur = CONFIG.display.glowIntensity > 0 && age === 0 ? 3 : 0;
+        ctx.beginPath();
+        for (let i = 0; i < 256; i++) {
+          const x = cx + xy[i * 2] * sizeX;
+          const y = cy - xy[i * 2 + 1] * sizeY;
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        stroke(age === 0 ? 0.85 : (1 - age / count) * 0.11, age === 0 ? colors.high : colors.mid, 0.75);
+      }
+      ctx.restore();
+      if (style === "goniometer") {
+        ctx.shadowBlur = 0;
+        const barX = cx - w * 0.35, barW = w * 0.70, barY = h + 2;
+        ctx.globalAlpha = 0.32; ctx.fillStyle = colors.low;
+        ctx.fillRect(barX, barY, barW, 3);
+        if (v.correlationValid) {
+          ctx.globalAlpha = 0.95; ctx.fillStyle = v.correlation < 0 ? colors.mid : colors.high;
+          ctx.fillRect(barX + (v.correlation + 1) * 0.5 * (barW - 2), barY - 1, 2, 5);
+        }
+      }
+    } else if (style === "tide") {
+      ctx.shadowBlur = 0;
+      const columns = Math.max(1, historyCount * 4);
+      const dx = w / columns;
+      for (let column = 0; column < columns; column++) {
+        const age = historyCount - 1 - Math.floor(column / 4);
+        const frame = visualizerFrame(v, age);
+        const segment = column % 4;
+        let power = 0;
+        for (let i = segment * 32; i < segment * 32 + 32; i++) power += frame.wave[i] * frame.wave[i];
+        const level = clamp(Math.sqrt(power / 32) * 2, 0, 1);
+        const amp = level * h * 0.49;
+        ctx.beginPath();ctx.moveTo(6 + column * dx, cy - amp);ctx.lineTo(6 + column * dx, cy + amp);
+        stroke(0.35 + level * 0.65, palette(level), Math.max(0.6, dx * 0.64));
+      }
+    } else if (style === "layers") {
+      ctx.shadowBlur = 0;
+      const count = Math.min(historyCount, 8);
+      for (let layer = 0; layer < count; layer++) {
+        const age = count > 1 ? Math.round((count - layer - 1) * (historyCount - 1) / (count - 1)) : 0;
+        const wave = visualizerFrame(v, age).wave;
+        const base = h * (0.15 + layer / Math.max(1, count - 1) * 0.69);
+        ctx.beginPath();
+        for (let i = 0; i < wave.length; i++) {
+          const x = 6 + i / (wave.length - 1) * w;
+          const y = clamp(base - wave[i] * h * 0.14, 1, h);
+          if (!i) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.lineTo(6 + w, h + 1);ctx.lineTo(6, h + 1);ctx.closePath();
+        ctx.globalAlpha = 0.10;ctx.fillStyle = palette((layer + 1) / count);ctx.fill();
+        // The upper boundary alone is the illuminated layer edge.
+        ctx.beginPath();
+        for (let i = 0; i < wave.length; i++) {
+          const x = 6 + i / (wave.length - 1) * w;
+          const y = clamp(base - wave[i] * h * 0.14, 1, h);
+          if (!i) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        stroke(0.45 + layer / Math.max(1, count - 1) * 0.4, palette((layer + 1) / count), 0.8);
+      }
+    } else if (style === "shower") {
+      if (captured && STATE.hasStreamObject === true) {
+        const previous = v.count > 1 ? visualizerFrame(v, 1).spectrum : null;
+        const tick = Math.floor(v.lastCapture / (1000 / 30));
+        for (let i = 0; i < current.spectrum.length; i += 2) {
+          const level = current.spectrum[i];
+          const rise = level - (previous ? previous[i] : 0);
+          const period = Math.max(2, Math.round(7 - level * 5));
+          if (level < 0.025 || (rise < 0.010 && (tick + i) % period !== 0)) continue;
+          const particle = v.particles[v.particleHead];
+          particle.born = now;particle.x = 6 + i / 120 * w;particle.level = level;
+          particle.strength = clamp(level + Math.max(0, rise) * 2.5, 0, 1);
+          v.particleHead = (v.particleHead + 1) % v.particles.length;
+        }
+      }
+      const duration = CONFIG.display.visualizerTrail / 30 * 1000;
+      for (const particle of v.particles) {
+        const age = (now - particle.born) / duration;
+        if (age < 0 || age >= 1) continue;
+        const y = 1 + age * (h - 1);
+        const length = Math.min(5 + particle.strength * 20, h + 1 - y);
+        ctx.beginPath();ctx.moveTo(particle.x, y);ctx.lineTo(particle.x, y + length);
+        stroke(Math.pow(1 - age, 0.65) * (0.35 + particle.strength * 0.65),
+          palette(Math.max(0.35, particle.strength)), 1 + particle.strength * 0.9);
+      }
+    } else if (style === "spectrogram") {
+      if (!v.image) {
+        v.image = document.createElement("canvas");
+        v.image.width = 256; v.image.height = 121;
+        v.imageCtx = v.image.getContext("2d");
+      }
+      if (captured) {
+        const paint = v.imageCtx;
+        const speed = CONFIG.display.visualizerTrail === 12 ? 4 : CONFIG.display.visualizerTrail === 24 ? 2 : 1;
+        paint.globalCompositeOperation = "copy";
+        paint.drawImage(v.image, speed, 0, 256 - speed, 121, 0, 0, 256 - speed, 121);
+        paint.globalCompositeOperation = "source-over";
+        paint.clearRect(256 - speed, 0, speed, 121);
+        for (let i = 0; i < 121; i++) {
+          const level = current.spectrum[i];
+          if (level < 0.008) continue;
+          paint.globalAlpha = 0.15 + level * 0.85;
+          paint.fillStyle = palette(level);
+          paint.fillRect(256 - speed, 120 - i, speed, 1);
+        }
+        paint.globalAlpha = 1;
+      }
+      ctx.imageSmoothingEnabled = false;
+      ctx.shadowColor = colors.high;
+      ctx.shadowBlur = CONFIG.display.glowIntensity > 0 ? 4 : 0;
+      ctx.drawImage(v.image, 6, 1, w, h);
+    }
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 0.85;
+    const font = getCanvasFontStyle(STATE.dom.title);
+    ctx.font = `9px ${font?.fontFamily || "sans-serif"}`;
+    ctx.fillStyle = colors.high;
+    ctx.textBaseline = "bottom";
+    if (style === "spectrogram") {
+      ctx.fillText("20k", 8, 14); ctx.fillText("30Hz", 8, h + 2);
+    }
+    if (CONFIG.display.showReadouts && STATE.hasStreamObject === true) {
+      const format = value => Number.isFinite(value) ? value.toFixed(1) : "–";
+      ctx.textAlign = "left";
+      ctx.fillText(`L ${format(STATE.levels.left.smoothDb)} dB`, 7, height - 1);
+      ctx.textAlign = "right";
+      const label = style === "goniometer"
+        ? `Corr ${v.correlationValid ? v.correlation.toFixed(2) : "–"} · Side ${(v.width * 100).toFixed(0)}%`
+        : `R ${format(STATE.levels.right.smoothDb)} dB`;
+      ctx.fillText(label, width - 7, height - 1);
+    }
+    ctx.restore();
+  }
+
   const CONFIG = {
     audio: {
       minThreshold: 0.0015,
@@ -1113,8 +2283,17 @@
     display: {
       glowIntensity: loadLSBool(STORAGE_GLOW_ENABLED, false) ? 1 : 0,
       barStyle: loadLSEnum(STORAGE_BARSTYLE, "simple", VALID_STYLES),
-      layoutMode: loadLSEnum(STORAGE_LAYOUT, "lr", ["lr", "sa", "full"]),
-      renderMode: loadLSEnum(STORAGE_RENDER, "bars", ["bars", "gauges", "mirrored"]),
+      layoutMode: loadLSEnum(STORAGE_LAYOUT, "lr", ["lr", "sa", "full", "equalizer", "vuHybrid", "oscilloscope", "visualizer"]),
+      renderMode: loadLSEnum(STORAGE_RENDER, "bars", ["bars", "gauges", "mirrored", "analogVu", ...CIRCULAR_STYLES]),
+      hybridMode: loadLSEnum(STORAGE_HYBRID_MODE, "stereo12", HYBRID_MODES),
+      equalizerRenderMode: loadLSEnum(STORAGE_EQ_RENDER, "bars", ["bars", "spectrum"]),
+      visualizerStyle: loadLSEnum("AMX_VISUALIZER_STYLE", "waterfall", Object.keys(VISUALIZER_NAMES)),
+      visualizerTrail: loadLSInt("AMX_VISUALIZER_TRAIL", 24, 12, 48),
+      oscilloscopeStyle: loadLSEnum(
+        STORAGE_SCOPE_STYLE,
+        "lines",
+        ["lines", "filled", "dots", "steps", "persistence", "envelope", "spindle"]
+      ),
       showPeaks: loadLSBool(STORAGE_SHOW_PEAKS, false),
       showReadouts: loadLSBool(STORAGE_SHOW_READOUTS, false),
       dimensions: {
@@ -1123,7 +2302,7 @@
         labelLeft: 5,
         canvasLeft: 25,
         borderRadius: "20px",
-        minTileWidth: 335,
+        minTileWidth: 350,
         tileWidthPercent: 32.9
       },
       defaultTitle: "STEREO LEVELS"
@@ -1140,13 +2319,21 @@
       splitter: null,
       analyserLeft: null,
       analyserRight: null,
+      analyserEqualizerLeft: null,
+      analyserEqualizerRight: null,
       analyserPeak: null,
+      midSideGainLToM: null,
+      midSideGainRToM: null,
+      midSideGainLToS: null,
+      midSideGainRToS: null,
       bassFilter: null,
       highPassFilter: null,
       lowPassFilter: null,
       source: null,
       dataLeft: null,
       dataRight: null,
+      dataEqualizerLeft: null,
+      dataEqualizerRight: null,
       dataPeak: null
     },
 
@@ -1156,6 +2343,26 @@
       min: 1,
       max: 4,
       lastEnergy: 0
+    },
+
+    // EQ/Hybrid stays visually updated at 60Hz. Only the expensive
+    // 4096-point spectrum snapshot is sampled at a lower cadence.
+    spectrumCadence: {
+      frame: 0,
+      interval: 2
+    },
+
+    oscilloscope: {
+      peakHistoryLeft: [],
+      peakHistoryRight: [],
+      peakDisplayLeft: 0,
+      peakDisplayRight: 0,
+      peakHoldUntilLeft: 0,
+      peakHoldUntilRight: 0,
+      persistenceLeft: [],
+      persistenceRight: [],
+      persistenceFrame: 0,
+      lastTs: 0
     },
 
     levels: {
@@ -1173,7 +2380,32 @@
       },
       stereoQuality: {
         instant: 0,
-        smooth: 0
+        smooth: 0,
+        peakDb: -999
+      },
+      equalizer: {
+        values: new Array(EQ_BAND_COUNT).fill(0),
+        targetValues: new Array(EQ_BAND_COUNT).fill(0),
+        peaks: new Array(EQ_BAND_COUNT).fill(0),
+        dbValues: new Array(EQ_BAND_COUNT).fill(-100),
+        peakHoldUntil: new Array(EQ_BAND_COUNT).fill(0),
+        lastUpdateTs: 0
+      },
+      hybridStereo12: {
+        values: new Array(HYBRID_STEREO_12_FREQUENCIES.length).fill(0),
+        targetValues: new Array(HYBRID_STEREO_12_FREQUENCIES.length).fill(0),
+        peaks: new Array(HYBRID_STEREO_12_FREQUENCIES.length).fill(0),
+        dbValues: new Array(HYBRID_STEREO_12_FREQUENCIES.length).fill(-100),
+        peakHoldUntil: new Array(HYBRID_STEREO_12_FREQUENCIES.length).fill(0),
+        lastUpdateTs: 0
+      },
+      hybridAudio10: {
+        values: new Array(HYBRID_AUDIO_10_FREQUENCIES.length).fill(0),
+        targetValues: new Array(HYBRID_AUDIO_10_FREQUENCIES.length).fill(0),
+        peaks: new Array(HYBRID_AUDIO_10_FREQUENCIES.length).fill(0),
+        dbValues: new Array(HYBRID_AUDIO_10_FREQUENCIES.length).fill(-100),
+        peakHoldUntil: new Array(HYBRID_AUDIO_10_FREQUENCIES.length).fill(0),
+        lastUpdateTs: 0
       }
     },
 
@@ -1205,13 +2437,39 @@
     layout: {
       width: 0,
       height: 0,
+      dpr: 1,
       dirty: true
     },
 
     peakHoldUntil: {
       left: 0,
       right: 0,
-      audio: 0
+      audio: 0,
+      quality: 0
+    },
+
+    monitoring: {
+      maxSamplePeak: {
+        left: 0,
+        right: 0
+      },
+      maxSamplePeakDb: {
+        left: -120,
+        right: -120
+      },
+      clipUntil: {
+        left: 0,
+        right: 0
+      },
+      clipped: {
+        left: false,
+        right: false
+      },
+      clipCount: {
+        left: 0,
+        right: 0
+      },
+      lastResetTs: 0
     },
 
     meta: {
@@ -1258,6 +2516,179 @@
       safeLSSet(STORAGE_ENABLE, cb.checked ? "true" : "false");
       window.location.reload();
     });
+  }
+
+
+  function isAdminDiagnosticsEnabled() {
+    return safeLSGet(STORAGE_DIAGNOSTICS) === "true";
+  }
+
+  function isFMdxAdmin() {
+    // FM-DX renders this quick dashboard only for authenticated admins.
+    // Using a server-rendered admin-only DOM marker avoids exposing the
+    // diagnostics control to ordinary users.
+    return !!document.querySelector(".admin-quick-dashboard");
+  }
+
+
+  function ensureDiagnosticsOverlay() {
+    if (!isFMdxAdmin() || !isAdminDiagnosticsEnabled()) {
+      if (AMX_RUNTIME.diagnosticsEl) {
+        AMX_RUNTIME.diagnosticsEl.remove();
+        AMX_RUNTIME.diagnosticsEl = null;
+      }
+      return null;
+    }
+
+    if (AMX_RUNTIME.diagnosticsEl?.isConnected) {
+      return AMX_RUNTIME.diagnosticsEl;
+    }
+
+    const el = document.createElement("div");
+    el.id = "amx-admin-diagnostics";
+
+    // Use explicit inline properties instead of a cssText block. Some FM-DX
+    // theme/plugin rules can override generic DIV sizing/display properties;
+    // explicit dimensions also prevent the overlay collapsing into a dot.
+    Object.assign(el.style, {
+      position: "fixed",
+      display: "block",
+      boxSizing: "border-box",
+      right: "12px",
+      bottom: "12px",
+      zIndex: "2147483000",
+      width: "390px",
+      minWidth: "300px",
+      maxWidth: "calc(100vw - 24px)",
+      minHeight: "112px",
+      height: "auto",
+      padding: "10px 12px",
+      margin: "0",
+      borderRadius: "10px",
+      background: "rgba(8, 10, 12, 0.78)",
+      backdropFilter: "blur(14px) saturate(135%)",
+      WebkitBackdropFilter: "blur(14px) saturate(135%)",
+      border: "1px solid rgba(255,255,255,.18)",
+      boxShadow: "0 8px 28px rgba(0,0,0,.35)",
+      color: "#eeeeee",
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+      fontSize: "11px",
+      fontWeight: "400",
+      lineHeight: "1.45",
+      textAlign: "left",
+      whiteSpace: "pre-wrap",
+      overflow: "visible",
+      opacity: "1",
+      visibility: "visible",
+      pointerEvents: "none",
+      transform: "none"
+    });
+    el.textContent =
+      "AudioMetrix — ADMIN DIAGNOSTICS\n" +
+      "Initializing runtime data…";
+
+    document.body.appendChild(el);
+    AMX_RUNTIME.diagnosticsEl = el;
+    return el;
+  }
+
+  function updateDiagnosticsOverlay() {
+    const el = ensureDiagnosticsOverlay();
+    if (!el) return;
+
+    try {
+      const ctx = STATE.audio?.context || null;
+      const canvas =
+        STATE.dom?.canvasNormal ||
+        STATE.dom?.canvasBars ||
+        STATE.dom?.canvasGauges ||
+        null;
+
+      // Do not depend on the locally-scoped isAudioTransportPlaying()
+      // helper. FM-DX's transport icon is authoritative and globally visible.
+      const transportIcon = document.querySelector(".playbutton .fa-solid");
+      const transport = transportIcon
+        ? (transportIcon.classList.contains("fa-stop") ? "PLAY" : "STOP")
+        : "unknown";
+
+      let logicalW = 0;
+      let logicalH = 0;
+      if (canvas) {
+        logicalW =
+          Number(canvas._amxLogicalWidth) ||
+          Math.round(canvas.getBoundingClientRect?.().width || 0);
+        logicalH =
+          Number(canvas._amxLogicalHeight) ||
+          Math.round(canvas.getBoundingClientRect?.().height || 0);
+      }
+
+      const dpr = Math.max(
+        1,
+        Math.min(Number(window.devicePixelRatio) || 1, 2)
+      );
+
+      let renderState = "unknown";
+      try {
+        renderState =
+          typeof RENDER_GATE !== "undefined" &&
+          RENDER_GATE?.rafId != null
+            ? "active"
+            : "paused";
+      } catch (_) {}
+
+      const lastRebind = AMX_RUNTIME.autoRebindLastCheck
+        ? Math.round(
+            (Date.now() - AMX_RUNTIME.autoRebindLastCheck) / 1000
+          ) + "s ago"
+        : "-";
+
+      const formatMonitorDb = (value) =>
+        Number.isFinite(value) && value > -119
+          ? value.toFixed(1)
+          : "-∞";
+
+      const getMonitorClipLabel = (channel) => {
+        const m = STATE.monitoring;
+        if (!m) return "-";
+        const active = performance.now() < (m.clipUntil?.[channel] || 0);
+        const count = m.clipCount?.[channel] || 0;
+        return active ? `CLIP(${count})` : (count ? `mem(${count})` : "OK");
+      };
+
+      el.textContent =
+        `AudioMetrix ${AMX_VERSION} — ADMIN DIAGNOSTICS\n` +
+        `Page: ${document.visibilityState} | Render: ${renderState} | Transport: ${transport}\n` +
+        `AudioContext: ${ctx?.state || "none"} @ ${ctx?.sampleRate || "-"} Hz\n` +
+        `Source: ${STATE.audio?.sourceLabel || STATE.audio?.sourceMode || "none"}\n` +
+        `MAX L/R: ${formatMonitorDb(STATE.monitoring?.maxSamplePeakDb?.left)} / ${formatMonitorDb(STATE.monitoring?.maxSamplePeakDb?.right)} dBFS | ` +
+        `CLIP: ${getMonitorClipLabel("left")} / ${getMonitorClipLabel("right")}\n` +
+        `Rebind: ${AMX_RUNTIME.autoRebindState || "unknown"} | last ${lastRebind}\n` +
+        `Layout: ${CONFIG.display?.layoutMode || "-"} | RenderMode: ${CONFIG.display?.renderMode || "-"}\n` +
+        `Canvas: ${Math.round(logicalW)}×${Math.round(logicalH)} | DPR ${dpr.toFixed(2)} | FPS gate ${
+          ["equalizer", "vuHybrid", "oscilloscope", "visualizer"].includes(CONFIG.display?.layoutMode) ? 60 : 30
+        }`;
+
+      el.style.borderColor = "rgba(255,255,255,.18)";
+    } catch (err) {
+      // Diagnostics must diagnose failures, never become one.
+      el.textContent =
+        `AudioMetrix ${AMX_VERSION} — ADMIN DIAGNOSTICS\n` +
+        `Diagnostics update error: ${err?.message || String(err)}\n` +
+        `Page: ${document.visibilityState}\n` +
+        `AudioContext: ${STATE.audio?.context?.state || "none"}\n` +
+        `Source: ${STATE.audio?.sourceMode || "none"}`;
+      el.style.borderColor = "rgba(255,120,120,.55)";
+
+      if (AMX_DEBUG) {
+        console.warn("[AudioMetrix] diagnostics update failed:", err);
+      }
+    }
+  }
+
+  function startDiagnosticsLoop() {
+    if (AMX_RUNTIME.diagnosticsTimer) clearInterval(AMX_RUNTIME.diagnosticsTimer);
+    updateDiagnosticsOverlay();
+    AMX_RUNTIME.diagnosticsTimer = setInterval(updateDiagnosticsOverlay, 750);
   }
 
   // STEREO SOFT MESSAGE CSS
@@ -1363,6 +2794,338 @@
     document.addEventListener("keydown", onKey);
   }
 
+  // ================================================================
+  // FLOATING SETTINGS PANEL MODULE
+  // All panel geometry, styling, scrolling, drag/resize and UI code
+  // is intentionally kept together in this section.
+  // ================================================================
+
+  function injectAMXPanelStyles() {
+    if (!document.getElementById("amx-sliders-css")) {
+      const css = document.createElement("style");
+      css.id = "amx-sliders-css";
+      css.textContent = `
+        #peak-hold-slider,
+        #attack-slider,
+        #release-slider,
+        #gain-slider {
+          -webkit-appearance: none !important;
+          appearance: none !important;
+          height: 22px !important;
+          border-radius: 22px !important;
+          background: var(--color-1) !important;
+          border: 2px solid var(--color-3) !important;
+          cursor: pointer !important;
+          outline: none !important;
+        }
+
+        #peak-hold-slider,
+        #attack-slider,
+        #release-slider,
+        #gain-slider {
+          width: 40% !important;
+          min-width: 115px !important;
+        }
+
+        #peak-hold-slider::-webkit-slider-thumb,
+        #attack-slider::-webkit-slider-thumb,
+        #release-slider::-webkit-slider-thumb,
+        #gain-slider::-webkit-slider-thumb {
+          -webkit-appearance: none !important;
+          width: 20px !important;
+          height: 20px !important;
+          border-radius: 50% !important;
+          background: var(--color-5) !important;
+          cursor: pointer !important;
+        }
+
+        #peak-hold-slider::-moz-range-thumb,
+        #attack-slider::-moz-range-thumb,
+        #release-slider::-moz-range-thumb,
+        #gain-slider::-moz-range-thumb {
+          width: 20px !important;
+          height: 20px !important;
+          border-radius: 50% !important;
+          background: var(--color-5) !important;
+          cursor: pointer !important;
+        }
+
+        #peak-hold-slider::-webkit-slider-runnable-track,
+        #attack-slider::-webkit-slider-runnable-track,
+        #release-slider::-webkit-slider-runnable-track,
+        #gain-slider::-webkit-slider-runnable-track,
+        #peak-hold-slider::-moz-range-track,
+        #attack-slider::-moz-range-track,
+        #release-slider::-moz-range-track,
+        #gain-slider::-moz-range-track {
+          height: 22px !important;
+          border-radius: 22px !important;
+          background: var(--color-1) !important;
+          border: 2px solid var(--color-3) !important;
+        }
+
+        .audio-row {
+          display: flex;
+          align-items: center;
+          gap: 4px !important;
+          margin-top: 4px;
+        }
+
+        .audio-row span.text-small:first-child {
+          min-width: 80px !important;
+          text-align: left;
+        }
+
+        .audio-row span.text-small:last-child {
+          min-width: 35px !important;
+          text-align: right;
+        }
+
+        .amx-settings-section {
+          width: 100%;
+          box-sizing: border-box;
+          margin: 6px 0 3px 0;
+          padding: 0 2px;
+          clear: both;
+          display: block;
+          flex: 0 0 100%;
+        }
+
+        .amx-settings-section::after {
+          content: "";
+          display: block;
+          width: 100%;
+          height: 1px;
+          margin-top: 1px;
+          background: var(--color-3);
+          opacity: 0.9;
+        }
+
+        .amx-settings-section-title {
+          text-align: left;
+          font-size: 14px;
+          line-height: 1.15;
+          font-weight: 600;
+          letter-spacing: 0.65px;
+          color: var(--color-4);
+          text-transform: uppercase;
+          opacity: 0.96;
+        }
+
+
+        /* Compact selector selected-fields only.
+           FM-DX dropdown.css gives .dropdown a fixed 48px height and its
+           input height:100%, so both wrapper and input must be resized.
+           The .options dropdown menu itself is intentionally untouched. */
+        #amx-floating-panel .form-group > .dropdown {
+          height: 34px !important;
+          min-height: 34px !important;
+          box-sizing: border-box !important;
+          border-radius: 5px !important;
+        }
+
+        #amx-floating-panel .form-group > .dropdown > input.form-control,
+        #amx-floating-panel .form-group > .dropdown > input[type="text"][readonly] {
+          height: 34px !important;
+          min-height: 34px !important;
+          line-height: 24px !important;
+          padding: 4px 28px 4px 12px !important;
+          box-sizing: border-box !important;
+          border-radius: 5px !important;
+        }
+
+        #amx-floating-panel .form-group > .dropdown.opened > input {
+          border-radius: 5px 5px 0 0 !important;
+        }
+
+        #amx-floating-panel .form-group > .dropdown.opened.dropdown-up > input {
+          border-radius: 0 0 5px 5px !important;
+        }
+
+        /* Re-center the FM-DX dropdown arrow for the shorter field. */
+        #amx-floating-panel .form-group > .dropdown::before {
+          top: 50% !important;
+          transform: translateY(-50%) rotate(-45deg) !important;
+        }
+
+        #amx-floating-panel .form-group > .dropdown.opened::before {
+          top: 50% !important;
+          transform: translateY(-50%) rotate(-225deg) !important;
+        }
+
+        /* Keep the selector title aligned to its own line rather than
+           inheriting the old 48px control rhythm. */
+        #amx-floating-panel .form-group > label.form-label {
+          line-height: 1.15 !important;
+          min-height: 0 !important;
+          height: auto !important;
+          margin-top: 0 !important;
+          margin-bottom: 3px !important;
+        }
+
+        /* Compact vertical rhythm inside the floating settings panel. */
+        #amx-floating-panel .form-group {
+          margin-top: 2px !important;
+          margin-bottom: 2px !important;
+        }
+
+        #amx-floating-panel .selectgroup {
+          margin-top: 1px !important;
+          margin-bottom: 1px !important;
+        }
+
+        /* Use the Audio Response slider rhythm as the common vertical rhythm. */
+        #amx-floating-panel .audio-row {
+          margin-top: 2px !important;
+          margin-bottom: 2px !important;
+        }
+
+        #amx-floating-panel label.form-label {
+          margin-top: 2px !important;
+          margin-bottom: 2px !important;
+        }
+
+        #amx-floating-panel .form-group + .form-group {
+          margin-top: 2px !important;
+        }
+
+        #amx-floating-panel .amx-settings-section + .form-group,
+        #amx-floating-panel .amx-settings-section + .selectgroup {
+          margin-top: 2px !important;
+        }
+
+        #amx-admin-diagnostics-setting .switch {
+          transform: scale(0.62);
+          transform-origin: right center;
+          margin-right: -8px;
+        }
+
+        /* Compact only the real layout box of switch rows.
+           The switches themselves keep their original transform:scale(...)
+           and horizontal placement exactly as in the working version. */
+        #amx-floating-panel .form-group.amx-compact-row {
+          height: 22px !important;
+          min-height: 22px !important;
+          max-height: 22px !important;
+          margin-top: 0 !important;
+          margin-bottom: 3px !important;
+          padding-top: 0 !important;
+          padding-bottom: 0 !important;
+          overflow: visible !important;
+        }
+
+        #amx-floating-panel .form-group.amx-compact-row > div {
+          height: 22px !important;
+          min-height: 22px !important;
+          max-height: 22px !important;
+          margin-top: 0 !important;
+          margin-bottom: 0 !important;
+          padding-top: 0 !important;
+          padding-bottom: 0 !important;
+          overflow: visible !important;
+        }
+
+        #amx-floating-panel #amx-admin-diagnostics-setting {
+          margin-top: 8px !important;
+        }
+
+        /* Diagnostics has two text lines, so it must not inherit the
+           22px compact switch-row height used by Glow/Peaks/Readouts. */
+        #amx-floating-panel .form-group.amx-diagnostics-row {
+          height: auto !important;
+          min-height: 34px !important;
+          max-height: none !important;
+          margin-bottom: 2px !important;
+          padding-top: 0 !important;
+          padding-bottom: 0 !important;
+          overflow: visible !important;
+        }
+
+        #amx-floating-panel .form-group.amx-diagnostics-row > div {
+          height: auto !important;
+          min-height: 34px !important;
+          max-height: none !important;
+          margin: 0 !important;
+          padding: 0 !important;
+          overflow: visible !important;
+        }
+
+        /* Final vertical rhythm for regular settings rows.
+           Audio Response slider rows intentionally stay tighter. */
+        #amx-floating-panel .form-group,
+        #amx-floating-panel .selectgroup {
+          margin-top: 8px !important;
+          margin-bottom: 8px !important;
+        }
+
+        #amx-floating-panel .audio-row {
+          margin-top: 2px !important;
+          margin-bottom: 2px !important;
+        }
+
+        /* Glass scrollbar colored from the selected-field accent. */
+        #amx-floating-panel #amx-panel-content {
+          scrollbar-width: thin;
+          scrollbar-color:
+            color-mix(in srgb, var(--color-4) 72%, transparent)
+            rgba(255,255,255,.05);
+        }
+
+        #amx-floating-panel #amx-panel-content::-webkit-scrollbar {
+          width: 8px;
+        }
+
+        #amx-floating-panel #amx-panel-content::-webkit-scrollbar-track {
+          margin: 4px 0;
+          border-radius: 4px;
+          background: rgba(255,255,255,.04);
+          box-shadow: inset 0 0 4px rgba(0,0,0,.28);
+        }
+
+        #amx-floating-panel #amx-panel-content::-webkit-scrollbar-thumb {
+          min-height: 28px;
+          border-radius: 4px;
+          border: 1px solid
+            color-mix(in srgb, var(--color-4) 48%, rgba(255,255,255,.18));
+          background:
+            linear-gradient(
+              90deg,
+              color-mix(in srgb, var(--color-4) 54%, transparent),
+              color-mix(in srgb, var(--color-4) 90%, rgba(255,255,255,.16)),
+              color-mix(in srgb, var(--color-4) 54%, transparent)
+            );
+          box-shadow:
+            inset 0 1px 1px rgba(255,255,255,.26),
+            inset 0 -1px 2px rgba(0,0,0,.24),
+            0 0 6px color-mix(in srgb, var(--color-4) 16%, transparent);
+        }
+
+        #amx-floating-panel #amx-panel-content::-webkit-scrollbar-thumb:hover {
+          background:
+            linear-gradient(
+              90deg,
+              color-mix(in srgb, var(--color-4) 66%, transparent),
+              var(--color-4),
+              color-mix(in srgb, var(--color-4) 66%, transparent)
+            );
+        }
+
+        /* --------------------------------
+           BAR STYLE DISABLED (gauges)
+        -------------------------------- */
+        .form-group.is-disabled {
+          opacity: 0.35;
+          filter: grayscale(1);
+        }
+
+        .form-group.is-disabled .dropdown {
+          pointer-events: none;
+        }
+      `;
+      document.head.appendChild(css);
+    }
+  }
+
   function ensureAMXSettingsLayer() {
     let layer = document.getElementById("amx-settings-layer");
     if (layer) return layer;
@@ -1407,53 +3170,56 @@
     return layer;
   }
 
+function isAMXMobileViewport() {
+  return (window.innerWidth || document.documentElement.clientWidth || 0) <= 767;
+}
+
 function saveAMXPanelGeometry(panel) {
   if (!panel) return;
 
-  const left = parseInt(panel.style.left, 10);
-  const top = parseInt(panel.style.top, 10);
-  const width = parseInt(panel.style.width, 10);
-  const height =
-    parseInt(panel.style.height, 10) ||
-    parseInt(panel.style.maxHeight, 10);
+  const rect = panel.getBoundingClientRect();
+  const left = Math.round(rect.left);
+  const top = Math.round(rect.top);
+  const width = Math.round(rect.width);
+  const height = Math.round(rect.height);
 
-  if (!isNaN(left)) safeLSSet(STORAGE_PANEL_LEFT, left);
-  if (!isNaN(top)) safeLSSet(STORAGE_PANEL_TOP, top);
-  if (!isNaN(width)) safeLSSet(STORAGE_PANEL_WIDTH, width);
-  if (!isNaN(height)) safeLSSet(STORAGE_PANEL_HEIGHT, height);
+  if (Number.isFinite(left)) safeLSSet(STORAGE_PANEL_LEFT, left);
+  if (Number.isFinite(top)) safeLSSet(STORAGE_PANEL_TOP, top);
+  if (Number.isFinite(width)) safeLSSet(STORAGE_PANEL_WIDTH, width);
+  if (Number.isFinite(height)) safeLSSet(STORAGE_PANEL_HEIGHT, height);
 }
 
   function restoreAMXPanelGeometry(panel) {
     if (!panel) return false;
-  
+
+    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    const margin = isAMXMobileViewport() ? 8 : 0;
+
     const left = loadLSInt(STORAGE_PANEL_LEFT, NaN);
     const top = loadLSInt(STORAGE_PANEL_TOP, NaN);
     const width = loadLSInt(STORAGE_PANEL_WIDTH, NaN);
     const height = loadLSInt(STORAGE_PANEL_HEIGHT, NaN);
-  
+
     let restored = false;
-  
+    const maxW = Math.max(160, vw - margin * 2);
+    const minW = Math.min(290, maxW);
+
     if (!isNaN(width) && width > 0) {
-      panel.style.width = width + "px";
+      panel.style.width = Math.min(Math.max(minW, width), maxW) + "px";
       restored = true;
+    } else {
+      panel.style.width = minW + "px";
     }
-  
+
     if (!isNaN(height) && height > 0) {
-      panel.style.height = height + "px";
-      panel.style.maxHeight = height + "px";
-  
-      if (panel._amxContentArea) {
-        const topBarHeight = 36;
-        const paddingVertical = 24;
-        const contentMax = height - topBarHeight - paddingVertical;
-        if (contentMax > 80) {
-          panel._amxContentArea.style.maxHeight = contentMax + "px";
-        }
-      }
-  
+      const maxH = Math.max(140, vh - margin * 2);
+      panel.style.height = Math.min(Math.max(140, height), maxH) + "px";
       restored = true;
+    } else {
+      panel.style.height = "auto";
     }
-  
+
     if (!isNaN(left) && !isNaN(top)) {
       panel.style.left = left + "px";
       panel.style.top = top + "px";
@@ -1462,49 +3228,71 @@ function saveAMXPanelGeometry(panel) {
       panel._amxUserMoved = true;
       restored = true;
     }
-  
+
     if (!isNaN(width) || !isNaN(height)) {
       panel._amxUserResized = true;
     }
-  
+
     return restored;
   }
 
   function clampAMXPanelToViewport(panel) {
     if (!panel) return;
-  
+
     const vw = window.innerWidth || document.documentElement.clientWidth || 0;
     const vh = window.innerHeight || document.documentElement.clientHeight || 0;
-  
-    const rect = panel.getBoundingClientRect();
-  
-    let left = parseInt(panel.style.left, 10);
-    let top = parseInt(panel.style.top, 10);
-    let width = parseInt(panel.style.width, 10);
-    let height = parseInt(panel.style.height, 10) || rect.height;
-  
-    if (isNaN(width) || width <= 0) width = rect.width;
-    if (isNaN(height) || height <= 0) height = rect.height;
-  
-    const minVisible = 40;
-    const maxLeft = Math.max(0, vw - minVisible);
-    const maxTop = Math.max(0, vh - minVisible);
-  
-    if (isNaN(left)) left = rect.left;
-    if (isNaN(top)) top = rect.top;
-  
-    if (left + minVisible > vw) left = maxLeft;
-    if (top + minVisible > vh) top = maxTop;
-  
-    if (left < 0) left = 0;
-    if (top < 0) top = 0;
-  
-    panel.style.left = left + "px";
-    panel.style.top = top + "px";
+    const mobile = isAMXMobileViewport();
+    const margin = mobile ? 8 : 0;
+
+    let rect = panel.getBoundingClientRect();
+    let left = Number.isFinite(parseFloat(panel.style.left))
+      ? parseFloat(panel.style.left)
+      : rect.left;
+    let top = Number.isFinite(parseFloat(panel.style.top))
+      ? parseFloat(panel.style.top)
+      : rect.top;
+
+    if (mobile) {
+      const maxW = Math.max(160, vw - margin * 2);
+      const minW = Math.min(290, maxW);
+      let width = rect.width;
+
+      if (width < minW || width > maxW) {
+        width = Math.min(Math.max(width, minW), maxW);
+        panel.style.width = Math.round(width) + "px";
+        rect = panel.getBoundingClientRect();
+      }
+
+      const maxH = Math.max(140, vh - margin * 2);
+      let height = rect.height;
+
+      if (height > maxH) {
+        panel.style.height = Math.round(maxH) + "px";
+        height = maxH;
+      }
+
+      const maxLeft = Math.max(margin, vw - rect.width - margin);
+      const maxTop = Math.max(margin, vh - height - margin);
+
+      left = Math.min(Math.max(left, margin), maxLeft);
+      top = Math.min(Math.max(top, margin), maxTop);
+    } else {
+      const minVisible = 40;
+      const maxLeft = Math.max(0, vw - minVisible);
+      const maxTop = Math.max(0, vh - minVisible);
+
+      if (left + minVisible > vw) left = maxLeft;
+      if (top + minVisible > vh) top = maxTop;
+      if (left < 0) left = 0;
+      if (top < 0) top = 0;
+    }
+
+    panel.style.left = Math.round(left) + "px";
+    panel.style.top = Math.round(top) + "px";
     panel.style.right = "auto";
     panel.style.bottom = "auto";
-  
-    saveAMXPanelGeometry(panel);
+
+    updateAMXContentScrolling(panel);
   }
 
   function createAMXFloatingPanel() {
@@ -1515,6 +3303,9 @@ function saveAMXPanelGeometry(panel) {
     panel.style.position = "fixed";
     panel.style.zIndex = "100000";
     panel.style.display = "none";
+    panel.style.flexDirection = "column";
+    panel.style.boxSizing = "border-box";
+    panel.style.overflow = "hidden";
     panel.style.pointerEvents = "auto";
 
     // Touch & selection safety (mobile + desktop)
@@ -1523,11 +3314,11 @@ function saveAMXPanelGeometry(panel) {
     panel.style.webkitUserSelect = "none";
 
     // Sizing
-    panel.style.width = "280px";
+    panel.style.width = "290px";
 
     // padding and appearance
     panel.style.padding = "12px";
-    panel.style.borderRadius = "14px";
+    panel.style.borderRadius = "10px";
 
     panel.style.background = "rgba(18, 20, 22, 0.72)";
     panel.style.backdropFilter = "blur(18px) saturate(140%)";
@@ -1615,14 +3406,16 @@ function saveAMXPanelGeometry(panel) {
       e.stopPropagation(); // important on mobile
 
       const willOpen = panel.style.display === "none";
-      panel.style.display = willOpen ? "block" : "none";
+      panel.style.display = willOpen ? "flex" : "none";
 
       if (willOpen) {
         const restored = restoreAMXPanelGeometry(panel);
+
         if (!restored) {
           positionAMXFloatingPanel(panel, container);
+          settleAMXPanelLayout(panel, true);
         } else {
-          clampAMXPanelToViewport(panel);
+          settleAMXPanelLayout(panel, true);
         }
       }
     };
@@ -1663,54 +3456,129 @@ function saveAMXPanelGeometry(panel) {
 
   // FLOATING SETTINGS PANEL — POSITION / DRAG / RESIZE / UI
   // ─────────────────────────────────────────────────────────
+  function updateAMXContentScrolling(panel) {
+    if (!panel || !panel._amxContentArea || panel.style.display === "none") return;
+
+    const content = panel._amxContentArea;
+    const topBar = panel._amxTopBar;
+
+    panel.style.display = "flex";
+    panel.style.flexDirection = "column";
+    panel.style.overflow = "hidden";
+
+    if (topBar) {
+      topBar.style.flex = "0 0 auto";
+      topBar.style.minHeight = "30px";
+    }
+
+    content.style.flex = "1 1 auto";
+    content.style.minHeight = "0";
+    content.style.maxHeight = "none";
+    content.style.overflowX = "hidden";
+    content.style.overflowY = "auto";
+    content.style.webkitOverflowScrolling = "touch";
+  }
+
+  function scheduleAMXContentScrollingUpdate(panel) {
+    requestAnimationFrame(() => updateAMXContentScrolling(panel));
+  }
+
+  function settleAMXPanelLayout(panel, saveAfter = false) {
+    if (!panel || panel.style.display === "none") return;
+
+    // Mobile browsers can report stale geometry immediately after
+    // orientation/restore. Two animation frames allow fonts, floats,
+    // viewport and flex sizing to settle before the final clamp/scroll pass.
+    requestAnimationFrame(() => {
+      clampAMXPanelToViewport(panel);
+      updateAMXContentScrolling(panel);
+
+      requestAnimationFrame(() => {
+        clampAMXPanelToViewport(panel);
+        updateAMXContentScrolling(panel);
+
+        // Never keep a scroll offset that is now beyond the real content.
+        const content = panel._amxContentArea;
+        if (content) {
+          const maxScroll = Math.max(
+            0,
+            content.scrollHeight - content.clientHeight
+          );
+          if (content.scrollTop > maxScroll) {
+            content.scrollTop = maxScroll;
+          }
+        }
+
+        if (saveAfter) {
+          saveAMXPanelGeometry(panel);
+        }
+      });
+    });
+  }
+
   function positionAMXFloatingPanel(panel, container) {
     if (!panel || !container) return;
 
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
+    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    const mobile = isAMXMobileViewport();
     const margin = 8;
 
-    const panelW = parseInt(panel.style.width, 10) || 320;
-    const tileRect = container.getBoundingClientRect();
-
-    const ps = document.getElementById("ps-container");
-    const psRect = ps ? ps.getBoundingClientRect() : null;
-    const anchorTop = psRect ? Math.round(psRect.top) : 12;
-
-    // reset
-    panel.style.top = "auto";
-    panel.style.left = "auto";
+    panel.style.display = "flex";
+    panel.style.flexDirection = "column";
+    panel.style.overflow = "hidden";
     panel.style.right = "auto";
     panel.style.bottom = "auto";
 
-    const isPortrait = vh > vw || vw < 520;
+    const maxW = Math.max(160, vw - margin * 2);
+    const minW = Math.min(290, maxW);
+    panel.style.minWidth = minW + "px";
+    panel.style.maxWidth = maxW + "px";
 
-    if (isPortrait) {
-      const top = Math.round(tileRect.bottom + margin);
-      const left = Math.max(margin, Math.round((vw - panelW) / 2));
+    let panelW = parseFloat(panel.style.width);
+    if (!Number.isFinite(panelW)) panelW = 290;
+    panelW = Math.min(Math.max(panelW, minW), maxW);
+    panel.style.width = Math.round(panelW) + "px";
+    panel.style.minHeight = "140px";
 
-      panel.style.top = top + "px";
-      panel.style.left = left + "px";
-      panel.style.maxHeight = Math.round(vh * 0.7) + "px";
-      panel.style.overflowY = "hidden";
-    } else {
-      let left = Math.round(tileRect.left - panelW - margin);
-      if (left < margin) left = margin;
+    const tileRect = container.getBoundingClientRect();
+    const ps = document.getElementById("ps-container");
+    const psRect = ps ? ps.getBoundingClientRect() : null;
+    const anchorTop = psRect ? Math.max(margin, Math.round(psRect.top)) : margin;
 
-      panel.style.top = anchorTop + "px";
-      panel.style.left = left + "px";
-      panel.style.maxHeight = Math.round(vh - anchorTop - margin) + "px";
-      panel.style.overflowY = "hidden";
+    let left = Math.round(tileRect.left - panelW - margin);
+    if (left < margin) {
+      left = mobile
+        ? Math.max(margin, Math.round((vw - panelW) / 2))
+        : margin;
+    }
+    if (left + panelW > vw - margin) {
+      left = Math.max(margin, vw - panelW - margin);
     }
 
-    // UPDATE INNER CONTENT HEIGHT (stable scroll)
-    if (panel._amxContentArea) {
-      const topBarHeight = 36;
-      const paddingVertical = 24;
-      const panelMax = parseInt(panel.style.maxHeight, 10);
+    panel.style.left = left + "px";
+    panel.style.top = anchorTop + "px";
 
-      const contentMax = panelMax - topBarHeight - paddingVertical;
-      panel._amxContentArea.style.maxHeight = contentMax + "px";
+    const availableH = Math.max(140, vh - anchorTop - margin);
+    panel.style.maxHeight = availableH + "px";
+
+    if (!panel._amxUserResized) {
+      panel.style.height = "auto";
+      requestAnimationFrame(() => {
+        const r = panel.getBoundingClientRect();
+        if (r.height > availableH) {
+          panel.style.height = availableH + "px";
+        }
+        clampAMXPanelToViewport(panel);
+        updateAMXContentScrolling(panel);
+      });
+    } else {
+      const currentH = parseFloat(panel.style.height);
+      if (Number.isFinite(currentH) && currentH > availableH) {
+        panel.style.height = availableH + "px";
+      }
+      clampAMXPanelToViewport(panel);
+      updateAMXContentScrolling(panel);
     }
   }
 
@@ -1723,13 +3591,17 @@ function saveAMXPanelGeometry(panel) {
     function requestReposition() {
       if (panel.style.display === "none") return;
 
-      // store user position and size
-      if (panel._amxUserMoved || panel._amxUserResized) return;
-
       if (!ticking) {
         ticking = true;
         requestAnimationFrame(function () {
-          positionAMXFloatingPanel(panel, container);
+          if (panel._amxUserMoved || panel._amxUserResized) {
+            clampAMXPanelToViewport(panel);
+            updateAMXContentScrolling(panel);
+            settleAMXPanelLayout(panel, true);
+          } else {
+            positionAMXFloatingPanel(panel, container);
+            settleAMXPanelLayout(panel, true);
+          }
           ticking = false;
         });
       }
@@ -1738,12 +3610,21 @@ function saveAMXPanelGeometry(panel) {
     window.addEventListener("scroll", requestReposition, { passive: true });
     window.addEventListener("resize", requestReposition);
     window.addEventListener("orientationchange", requestReposition);
+
+    AMX_RUNTIME.windowHandlers.push(
+      ["scroll", requestReposition, { passive: true }],
+      ["resize", requestReposition, undefined],
+      ["orientationchange", requestReposition, undefined]
+    );
   }
 
   function createPointerHandlers({ onMove, onUp }) {
     function getPoint(e) {
       if (e.touches && e.touches.length) {
         return e.touches[0];
+      }
+      if (e.changedTouches && e.changedTouches.length) {
+        return e.changedTouches[0];
       }
 
       return e;
@@ -1760,6 +3641,7 @@ function saveAMXPanelGeometry(panel) {
       document.removeEventListener("mouseup", upHandler);
       document.removeEventListener("touchmove", moveHandler);
       document.removeEventListener("touchend", upHandler);
+      document.removeEventListener("touchcancel", upHandler);
 
       if (typeof onUp === "function") {
         onUp(e, getPoint(e));
@@ -1771,6 +3653,7 @@ function saveAMXPanelGeometry(panel) {
       document.addEventListener("mouseup", upHandler);
       document.addEventListener("touchmove", moveHandler, { passive: false });
       document.addEventListener("touchend", upHandler);
+      document.addEventListener("touchcancel", upHandler);
     }
 
     return {
@@ -1818,14 +3701,22 @@ function saveAMXPanelGeometry(panel) {
         let newLeft = startLeft + dx;
         let newTop = startTop + dy;
   
+        const mobile = isAMXMobileViewport();
+        const viewportMargin = mobile ? 8 : 0;
         const minVisibleX = 80;
         const minVisibleY = 36;
-  
-        const minLeft = Math.min(0, vw - panelW);
-        const maxLeft = Math.max(0, vw - minVisibleX);
-  
-        const minTop = 0;
-        const maxTop = Math.max(0, vh - minVisibleY);
+
+        const minLeft = mobile
+          ? viewportMargin
+          : Math.min(0, vw - panelW);
+        const maxLeft = mobile
+          ? Math.max(viewportMargin, vw - panelW - viewportMargin)
+          : Math.max(0, vw - minVisibleX);
+
+        const minTop = mobile ? viewportMargin : 0;
+        const maxTop = mobile
+          ? Math.max(viewportMargin, vh - panelH - viewportMargin)
+          : Math.max(0, vh - minVisibleY);
   
         if (newLeft < minLeft) newLeft = minLeft;
         if (newLeft > maxLeft) newLeft = maxLeft;
@@ -1897,30 +3788,51 @@ function saveAMXPanelGeometry(panel) {
     if (!panel || panel._amxResizeEnabled) return;
     panel._amxResizeEnabled = true;
   
-    const corners = [
-      { dir: "nw", cursor: "nwse-resize" },
-      { dir: "ne", cursor: "nesw-resize" },
-      { dir: "sw", cursor: "nesw-resize" },
-      { dir: "se", cursor: "nwse-resize" }
+    const handles = [
+      { dir: "n",  cursor: "ns-resize",   type: "edge" },
+      { dir: "s",  cursor: "ns-resize",   type: "edge" },
+      { dir: "w",  cursor: "ew-resize",   type: "edge" },
+      { dir: "e",  cursor: "ew-resize",   type: "edge" },
+      { dir: "nw", cursor: "nwse-resize", type: "corner" },
+      { dir: "ne", cursor: "nesw-resize", type: "corner" },
+      { dir: "sw", cursor: "nesw-resize", type: "corner" },
+      { dir: "se", cursor: "nwse-resize", type: "corner" }
     ];
-  
-    corners.forEach(cfg => {
+
+    handles.forEach(cfg => {
       const grip = document.createElement("div");
       grip.className = "amx-resize-handle amx-resize-" + cfg.dir;
       grip.dataset.amxNoDrag = "1";
       grip.style.position = "absolute";
-      grip.style.width = "16px";
-      grip.style.height = "16px";
       grip.style.zIndex = "30";
       grip.style.cursor = cfg.cursor;
       grip.style.userSelect = "none";
       grip.style.touchAction = "none";
       grip.style.background = "transparent";
-  
+
+      // Keep resize hit-zones INSIDE the panel. Because the panel uses
+      // overflow:hidden, external hit-zones are clipped and hard to grab.
+      if (cfg.type === "corner") {
+        grip.style.width = "32px";
+        grip.style.height = "32px";
+      } else if (cfg.dir === "n" || cfg.dir === "s") {
+        grip.style.left = "24px";
+        grip.style.right = "24px";
+        grip.style.height = "18px";
+      } else {
+        grip.style.top = "24px";
+        grip.style.bottom = "24px";
+        grip.style.width = "18px";
+      }
+
       if (cfg.dir.includes("n")) grip.style.top = "0";
       if (cfg.dir.includes("s")) grip.style.bottom = "0";
       if (cfg.dir.includes("w")) grip.style.left = "0";
       if (cfg.dir.includes("e")) grip.style.right = "0";
+
+      grip.style.touchAction = "none";
+      grip.style.webkitUserSelect = "none";
+      grip.style.userSelect = "none";
   
       panel.appendChild(grip);
   
@@ -1943,8 +3855,8 @@ function saveAMXPanelGeometry(panel) {
           const vw = window.innerWidth || document.documentElement.clientWidth || 0;
           const vh = window.innerHeight || document.documentElement.clientHeight || 0;
   
-          const minW = 260;
-          const minH = 220;
+          const minW = 290;
+          const minH = 140;
   
           let newW = startW;
           let newH = startH;
@@ -2012,17 +3924,11 @@ function saveAMXPanelGeometry(panel) {
           panel.style.right = "auto";
           panel.style.bottom = "auto";
           panel.style.width = newW + "px";
-          panel.style.maxHeight = newH + "px";
           panel.style.height = newH + "px";
+          panel.style.minHeight = minH + "px";
+          panel.style.maxHeight = Math.max(minH, window.innerHeight - newTop - 8) + "px";
   
-          if (panel._amxContentArea) {
-            const topBarHeight = 36;
-            const paddingVertical = 24;
-            const contentMax = newH - topBarHeight - paddingVertical;
-            if (contentMax > 80) {
-              panel._amxContentArea.style.maxHeight = contentMax + "px";
-            }
-          }
+          scheduleAMXContentScrollingUpdate(panel);
   
           panel._amxUserMoved = true;
           panel._amxUserResized = true;
@@ -2078,6 +3984,7 @@ function saveAMXPanelGeometry(panel) {
       topBar.style.padding = "0 8px 0 10px";
       topBar.style.marginBottom = "6px";
       topBar.style.background = "transparent";
+      topBar.style.flex = "0 0 auto";
 
       const title = document.createElement("div");
       title.id = "amx-panel-title";
@@ -2134,8 +4041,13 @@ function saveAMXPanelGeometry(panel) {
       content.style.width = "100%";
       content.style.boxSizing = "border-box";
       content.style.padding = "4px 0 0 0";
+      content.style.display = "flow-root";
+      content.style.flex = "1 1 auto";
+      content.style.minHeight = "0";
       content.style.overflowY = "auto";
-      content.style.maxHeight = "200px";
+      content.style.overflowX = "hidden";
+      content.style.maxHeight = "none";
+      content.style.webkitOverflowScrolling = "touch";
 
       // UPDATE BANNER
       const updateBanner = document.createElement("div");
@@ -2164,107 +4076,23 @@ function saveAMXPanelGeometry(panel) {
       panel._amxContentArea = content;
       panel._amxTopBar = topBar;
 
+      if (typeof ResizeObserver === "function") {
+        const panelOverflowObserver = new ResizeObserver(() => {
+          if (panel.style.display !== "none") {
+            scheduleAMXContentScrollingUpdate(panel);
+          }
+        });
+        panelOverflowObserver.observe(panel);
+        panel._amxOverflowObserver = panelOverflowObserver;
+      }
+
       applyAMXUpdateBanner();
 
       // Enable dragging + resize
       enableAMXPanelDragging(panel, title);
       enableAMXPanelResize(panel);
 
-      // SHARED SLIDER CSS (inject ONCE)
-      if (!document.getElementById("amx-sliders-css")) {
-        const css = document.createElement("style");
-        css.id = "amx-sliders-css";
-        css.textContent = `
-          #peak-hold-slider,
-          #attack-slider,
-          #release-slider,
-          #gain-slider {
-            -webkit-appearance: none !important;
-            appearance: none !important;
-            height: 22px !important;
-            border-radius: 22px !important;
-            background: var(--color-1) !important;
-            border: 2px solid var(--color-3) !important;
-            cursor: pointer !important;
-            outline: none !important;
-          }
-
-          #peak-hold-slider,
-          #attack-slider,
-          #release-slider,
-          #gain-slider {
-            width: 40% !important;
-            min-width: 115px !important;
-          }
-
-          #peak-hold-slider::-webkit-slider-thumb,
-          #attack-slider::-webkit-slider-thumb,
-          #release-slider::-webkit-slider-thumb,
-          #gain-slider::-webkit-slider-thumb {
-            -webkit-appearance: none !important;
-            width: 20px !important;
-            height: 20px !important;
-            border-radius: 50% !important;
-            background: var(--color-5) !important;
-            cursor: pointer !important;
-          }
-
-          #peak-hold-slider::-moz-range-thumb,
-          #attack-slider::-moz-range-thumb,
-          #release-slider::-moz-range-thumb,
-          #gain-slider::-moz-range-thumb {
-            width: 20px !important;
-            height: 20px !important;
-            border-radius: 50% !important;
-            background: var(--color-5) !important;
-            cursor: pointer !important;
-          }
-
-          #peak-hold-slider::-webkit-slider-runnable-track,
-          #attack-slider::-webkit-slider-runnable-track,
-          #release-slider::-webkit-slider-runnable-track,
-          #gain-slider::-webkit-slider-runnable-track,
-          #peak-hold-slider::-moz-range-track,
-          #attack-slider::-moz-range-track,
-          #release-slider::-moz-range-track,
-          #gain-slider::-moz-range-track {
-            height: 22px !important;
-            border-radius: 22px !important;
-            background: var(--color-1) !important;
-            border: 2px solid var(--color-3) !important;
-          }
-
-          .audio-row {
-            display: flex;
-            align-items: center;
-            gap: 4px !important;
-            margin-top: 4px;
-          }
-
-          .audio-row span.text-small:first-child {
-            min-width: 80px !important;
-            text-align: left;
-          }
-
-          .audio-row span.text-small:last-child {
-            min-width: 35px !important;
-            text-align: right;
-          }
-
-          /* --------------------------------
-             BAR STYLE DISABLED (gauges)
-          -------------------------------- */
-          .form-group.is-disabled {
-            opacity: 0.35;
-            filter: grayscale(1);
-          }
-
-          .form-group.is-disabled .dropdown {
-            pointer-events: none;
-          }
-        `;
-        document.head.appendChild(css);
-      }
+      injectAMXPanelStyles();
 
       function bindDropdown(input, optionsSelector, onSelect) {
         if (!input) return;
@@ -2276,19 +4104,33 @@ function saveAMXPanelGeometry(panel) {
           opts.classList.toggle("opened");
         };
 
-        opts.querySelectorAll(".option").forEach((opt) => {
-          opt.onclick = () => {
-            const val = opt.dataset.value;
-            input.value = opt.textContent;
+        // Event delegation keeps dynamically replaced option sets functional.
+        opts.onclick = (event) => {
+          const opt = event.target.closest(".option");
+          if (!opt || !opts.contains(opt)) return;
 
-            if (typeof onSelect === "function") {
-              onSelect(val, opt);
-            }
+          const val = opt.dataset.value;
+          input.value = opt.textContent;
 
-            opts.classList.remove("opened");
-          };
-        });
+          if (typeof onSelect === "function") {
+            onSelect(val, opt);
+          }
+
+          opts.classList.remove("opened");
+        };
       }
+
+      function appendSettingsSectionTitle(label) {
+        const title = document.createElement("div");
+        title.className = "amx-settings-section amx-settings-section-title";
+        title.dataset.amxNoDrag = "1";
+        title.textContent = label;
+        content.appendChild(title);
+        return title;
+      }
+
+      // THEMING
+      appendSettingsSectionTitle("THEMING");
 
       // THEME SELECTOR
       const themeDiv = document.createElement("div");
@@ -2334,14 +4176,37 @@ function saveAMXPanelGeometry(panel) {
         if (!VALID_THEMES.includes(val)) return;
 
         safeLSSet(STORAGE_THEME, val);
-        ACTIVE_THEME = val === "automatic" ? THEME_REGISTRY.automatic() : THEME_REGISTRY[val];
-        invalidateVisualCaches();
+        if (val === "automatic") {
+          refreshAutomaticTheme(true);
+        } else {
+          ACTIVE_THEME = THEME_REGISTRY[val];
+          invalidateVisualCaches();
+        }
         requestRender();
       });
 
       // BAR STYLE AVAILABILITY (renderMode dependent)
       function updateBarStyleAvailability() {
-        const disabled = CONFIG.display.renderMode === "gauges";
+        const trailGroup = document.getElementById("amx-visualizer-trail-group");
+        if (trailGroup) trailGroup.style.display = (CONFIG.display.layoutMode === "visualizer" || (MIRRORED_LAYOUTS.includes(CONFIG.display.layoutMode) && isCircularStyle(CONFIG.display.renderMode))) ? "" : "none";
+        const disabled =
+          (MIRRORED_LAYOUTS.includes(CONFIG.display.layoutMode) && isCircularStyle(CONFIG.display.renderMode)) ||
+          CONFIG.display.layoutMode === "visualizer" ||
+          CONFIG.display.layoutMode === "oscilloscope" ||
+          (
+            CONFIG.display.layoutMode === "equalizer" &&
+            CONFIG.display.equalizerRenderMode === "spectrum"
+          ) ||
+          (
+            CONFIG.display.layoutMode !== "equalizer" &&
+            CONFIG.display.layoutMode !== "vuHybrid" &&
+            CONFIG.display.layoutMode !== "oscilloscope" &&
+            (
+              CONFIG.display.renderMode === "gauges" ||
+              CONFIG.display.renderMode === "analogVu"
+            )
+          );
+
         styleDiv.classList.toggle("is-disabled", disabled);
       }
 
@@ -2389,101 +4254,10 @@ function saveAMXPanelGeometry(panel) {
         requestRender();
       });
 
-      // LAYOUT MODE SELECTOR
-      const layoutDiv = document.createElement("div");
-      layoutDiv.className = "form-group";
-      layoutDiv.innerHTML = `
-        <label class="form-label"><i class="fa-solid m-right-10"></i>LAYOUT MODE</label>
-        <div class="dropdown">
-          <input type="text" id="amx-layout-input" class="form-control" readonly>
-          <div id="amx-layout-options" class="options">
-            <div class="option" data-value="lr">Stereo Bars</div>
-            <div class="option" data-value="sa">Stereo Quality & Audio Peak Bars</div>
-            <div class="option" data-value="full">Full Mode (Both)</div>
-          </div>
-        </div>
-      `;
-      content.appendChild(layoutDiv);
-
-      const layoutInput = document.getElementById("amx-layout-input");
-      const savedLayout = CONFIG.display.layoutMode;
-      layoutInput.value =
-        savedLayout === "lr" ? "Stereo Bars" :
-        savedLayout === "sa" ? "Stereo Quality & Audio Peak Bars" :
-        "Full Mode (Both)";
-
-      bindDropdown(layoutInput, "#amx-layout-options", (val) => {
-        CONFIG.display.layoutMode = val;
-        safeLSSet("AMX_LAYOUT_MODE", val);
-      
-        if (
-          CONFIG.display.renderMode === "mirrored" &&
-          !MIRRORED_LAYOUTS.includes(val)
-        ) {
-          CONFIG.display.renderMode = "bars";
-          safeLSSet("AMX_RENDER_MODE", "bars");
-          const renderInput = document.getElementById("amx-render-input");
-          if (renderInput) renderInput.value = "Bars";
-        }
-      
-        invalidateVisualCaches();
-        updateMirroredCanvasHeight();
-        requestRender();
-      });
-
-      // RENDER STYLE SELECTOR
-      const renderDiv = document.createElement("div");
-      renderDiv.className = "form-group";
-      renderDiv.innerHTML = `
-        <label class="form-label"><i class="fa-solid m-right-10"></i>RENDER STYLE</label>
-        <div class="dropdown">
-          <input type="text" id="amx-render-input" class="form-control" readonly>
-          <div id="amx-render-options" class="options">
-            <div class="option" data-value="bars">Bars</div>
-            <div class="option" data-value="mirrored">Mirrored</div>
-            <div class="option" data-value="gauges">Gauges</div>
-          </div>
-        </div>
-      `;
-      content.appendChild(renderDiv);
-
-      const renderInput = document.getElementById("amx-render-input");
-      const savedRender = CONFIG.display.renderMode;
-      renderInput.value =
-        savedRender === "bars" ? "Bars" :
-        savedRender === "gauges" ? "Gauges" :
-        "Mirrored";
-
-      bindDropdown(renderInput, "#amx-render-options", (val) => {
-        if (
-          val === "mirrored" &&
-          !MIRRORED_LAYOUTS.includes(CONFIG.display.layoutMode)
-        ) {
-          showAMXSoftMessage(
-            "Mirrored mode is only available when Layout Mode is set to Stereo Bars, Stereo Quality/Audio Peak, or Full.",
-            "fa-triangle-exclamation"
-          );
-        
-          renderInput.value =
-            CONFIG.display.renderMode === "bars" ? "Bars" :
-            CONFIG.display.renderMode === "gauges" ? "Gauges" :
-            "Mirrored";
-        
-          return;
-        }
-
-        CONFIG.display.renderMode = val;
-        safeLSSet("AMX_RENDER_MODE", val);
-        updateBarStyleAvailability();
-        invalidateVisualCaches();
-        updateMirroredCanvasHeight();
-        requestRender();
-      });
-
       // GLOW ENABLE / DISABLE
       {
         const wrapper = document.createElement("div");
-        wrapper.className = "form-group";
+        wrapper.className = "form-group amx-compact-row";
         wrapper.innerHTML = `
           <div style="display:flex; align-items:center;">
             <label class="form-label">
@@ -2513,10 +4287,289 @@ function saveAMXPanelGeometry(panel) {
         });
       }
 
+
+      // DISPLAY
+      appendSettingsSectionTitle("DISPLAY");
+
+      // LAYOUT MODE SELECTOR
+      const layoutDiv = document.createElement("div");
+      layoutDiv.className = "form-group";
+      layoutDiv.innerHTML = `
+        <label class="form-label"><i class="fa-solid m-right-10"></i>LAYOUT MODE</label>
+        <div class="dropdown">
+          <input type="text" id="amx-layout-input" class="form-control" readonly>
+          <div id="amx-layout-options" class="options">
+            <div class="option" data-value="lr">Stereo levels</div>
+            <div class="option" data-value="sa">Stereo quality &amp; RMS+Peak</div>
+            <div class="option" data-value="full">Audio levels (Full mode)</div>
+            <div class="option" data-value="equalizer">Equalizer</div>
+            <div class="option" data-value="vuHybrid">Vu Hybrid</div>
+            <div class="option" data-value="oscilloscope">Oscilloscope</div>
+            <div class="option" data-value="visualizer">Visualizer</div>
+          </div>
+        </div>
+      `;
+      content.appendChild(layoutDiv);
+
+      const layoutInput = document.getElementById("amx-layout-input");
+      const savedLayout = CONFIG.display.layoutMode;
+      layoutInput.value =
+        savedLayout === "lr" ? "Stereo levels" :
+        savedLayout === "sa" ? "Stereo quality & RMS+Peak" :
+        savedLayout === "full" ? "Audio levels (Full mode)" :
+        savedLayout === "vuHybrid" ? "Vu Hybrid" :
+        savedLayout === "oscilloscope" ? "Oscilloscope" :
+        savedLayout === "visualizer" ? "Visualizer" :
+        "Equalizer";
+
+      bindDropdown(layoutInput, "#amx-layout-options", (val) => {
+        if (!["lr", "sa", "full", "equalizer", "vuHybrid", "oscilloscope", "visualizer"].includes(val)) return;
+        CONFIG.display.layoutMode = val;
+        safeLSSet("AMX_LAYOUT_MODE", val);
+
+        if (val === "equalizer" && CONFIG.display.renderMode !== "bars") {
+          STATE._renderBeforeEqualizer = CONFIG.display.renderMode;
+          CONFIG.display.renderMode = "bars";
+          const renderInput = document.getElementById("amx-render-input");
+          if (renderInput) renderInput.value = "Bars";
+        } else if (
+          val !== "equalizer" &&
+          STATE._renderBeforeEqualizer &&
+          ["bars", "gauges", "mirrored", "analogVu", ...CIRCULAR_STYLES].includes(STATE._renderBeforeEqualizer)
+        ) {
+          CONFIG.display.renderMode = STATE._renderBeforeEqualizer;
+          const renderInput = document.getElementById("amx-render-input");
+          if (renderInput) {
+            renderInput.value =
+              isCircularStyle(CONFIG.display.renderMode) ? VISUALIZER_NAMES[CONFIG.display.renderMode] :
+              CONFIG.display.renderMode === "gauges" ? "Gauges" :
+              CONFIG.display.renderMode === "analogVu" ? "Analog VU" :
+              CONFIG.display.renderMode === "mirrored" ? "Mirrored" :
+              "Bars";
+          }
+          STATE._renderBeforeEqualizer = null;
+        }
+
+        if (
+          CONFIG.display.renderMode === "mirrored" &&
+          val !== "vuHybrid" &&
+          !MIRRORED_LAYOUTS.includes(val)
+        ) {
+          CONFIG.display.renderMode = "bars";
+          safeLSSet("AMX_RENDER_MODE", "bars");
+          const renderInput = document.getElementById("amx-render-input");
+          if (renderInput) renderInput.value = "Bars";
+        }
+
+        updateBarStyleAvailability();
+        const renderGroup = document.getElementById("amx-render-group");
+        if (renderGroup) {
+          renderGroup.classList.remove("is-disabled");
+        }
+        syncRenderSelectorOptions();
+        invalidateVisualCaches();
+        updateMirroredCanvasHeight();
+        requestRender();
+      });
+
+      // RENDER STYLE SELECTOR
+      const renderDiv = document.createElement("div");
+      renderDiv.id = "amx-render-group";
+      renderDiv.className = "form-group";
+      renderDiv.innerHTML = `
+        <label class="form-label"><i class="fa-solid m-right-10"></i>RENDER STYLE</label>
+        <div class="dropdown">
+          <input type="text" id="amx-render-input" class="form-control" readonly>
+          <div id="amx-render-options" class="options">
+            <div class="option" data-value="bars">Bars</div>
+            <div class="option" data-value="mirrored">Mirrored</div>
+            <div class="option" data-value="gauges">Gauges</div>
+            <div class="option" data-value="analogVu">Analog VU</div>
+          </div>
+        </div>
+      `;
+      content.appendChild(renderDiv);
+
+      const renderInput = document.getElementById("amx-render-input");
+      const savedRender = CONFIG.display.renderMode;
+      renderInput.value =
+        CONFIG.display.layoutMode === "equalizer" ? "Bars" :
+        isCircularStyle(savedRender) ? VISUALIZER_NAMES[savedRender] :
+        savedRender === "bars" ? "Bars" :
+        savedRender === "gauges" ? "Gauges" :
+        savedRender === "analogVu" ? "Analog VU" :
+        "Mirrored";
+
+      bindDropdown(renderInput, "#amx-render-options", (val) => {
+        if (CONFIG.display.layoutMode === "visualizer") {
+          if (!Object.prototype.hasOwnProperty.call(VISUALIZER_NAMES, val)) return;
+          CONFIG.display.visualizerStyle = val;
+          safeLSSet("AMX_VISUALIZER_STYLE", val);
+          resetVisualizerState();
+          invalidateVisualCaches();
+          requestRender();
+          return;
+        }
+        if (CONFIG.display.layoutMode === "vuHybrid") {
+          if (!HYBRID_MODES.includes(val)) return;
+          CONFIG.display.hybridMode = val;
+          safeLSSet(STORAGE_HYBRID_MODE, val);
+          invalidateVisualCaches();
+          requestRender();
+          return;
+        }
+
+        if (CONFIG.display.layoutMode === "equalizer") {
+          if (!["bars", "spectrum"].includes(val)) return;
+          CONFIG.display.equalizerRenderMode = val;
+          safeLSSet(STORAGE_EQ_RENDER, val);
+          updateBarStyleAvailability();
+          invalidateVisualCaches();
+          requestRender();
+          return;
+        }
+
+        if (CONFIG.display.layoutMode === "oscilloscope") {
+          if (!["lines", "filled", "dots", "steps", "persistence", "envelope", "spindle"].includes(val)) return;
+          CONFIG.display.oscilloscopeStyle = val;
+          safeLSSet(STORAGE_SCOPE_STYLE, val);
+          invalidateVisualCaches();
+          requestRender();
+          return;
+        }
+
+        if (
+          val === "mirrored" &&
+          !MIRRORED_LAYOUTS.includes(CONFIG.display.layoutMode)
+        ) {
+          showAMXSoftMessage(
+            "Mirrored mode is only available with Stereo levels, Stereo quality & RMS+Peak, or Full mode.",
+            "fa-triangle-exclamation"
+          );
+        
+          renderInput.value =
+            CONFIG.display.renderMode === "bars" ? "Bars" :
+            isCircularStyle(CONFIG.display.renderMode) ? VISUALIZER_NAMES[CONFIG.display.renderMode] :
+          CONFIG.display.renderMode === "gauges" ? "Gauges" :
+            CONFIG.display.renderMode === "analogVu" ? "Analog VU" :
+            "Mirrored";
+        
+          return;
+        }
+
+        if (!["bars", "gauges", "mirrored", "analogVu", ...CIRCULAR_STYLES].includes(val)) return;
+        CONFIG.display.renderMode = val;
+        safeLSSet("AMX_RENDER_MODE", val);
+        updateBarStyleAvailability();
+        invalidateVisualCaches();
+        updateMirroredCanvasHeight();
+        requestRender();
+      });
+
+      function syncRenderSelectorOptions() {
+        const options = document.getElementById("amx-render-options");
+        if (!options || !renderInput) return;
+        if (CONFIG.display.layoutMode === "visualizer") {
+          options.innerHTML = Object.entries(VISUALIZER_NAMES).map(([value, name]) =>
+            `<div class="option" data-value="${value}">${name}</div>`).join("");
+          renderInput.value = VISUALIZER_NAMES[CONFIG.display.visualizerStyle];
+          return;
+        }
+
+        if (CONFIG.display.layoutMode === "vuHybrid") {
+          options.innerHTML = `
+            <div class="option" data-value="stereo12">Stereo levels &amp; 12-band EQ</div>
+            <div class="option" data-value="audio10">Audio levels &amp; 10-band EQ</div>
+          `;
+          renderInput.value =
+            CONFIG.display.hybridMode === "audio10"
+              ? "Audio levels & 10-band EQ"
+              : "Stereo levels & 12-band EQ";
+          return;
+        }
+
+        if (CONFIG.display.layoutMode === "equalizer") {
+          options.innerHTML = `
+            <div class="option" data-value="bars">Bars</div>
+            <div class="option" data-value="spectrum">Spectrum</div>
+          `;
+          renderInput.value =
+            CONFIG.display.equalizerRenderMode === "spectrum"
+              ? "Spectrum"
+              : "Bars";
+          return;
+        }
+
+        if (CONFIG.display.layoutMode === "oscilloscope") {
+          options.innerHTML = `
+            <div class="option" data-value="lines">Lines</div>
+            <div class="option" data-value="filled">Filled</div>
+            <div class="option" data-value="dots">Dots</div>
+            <div class="option" data-value="steps">Steps</div>
+            <div class="option" data-value="persistence">Persistence</div>
+            <div class="option" data-value="envelope">Carrier / Envelope</div>
+            <div class="option" data-value="spindle">Spindle</div>
+          `;
+
+          renderInput.value =
+            CONFIG.display.oscilloscopeStyle === "filled" ? "Filled" :
+            CONFIG.display.oscilloscopeStyle === "dots" ? "Dots" :
+            CONFIG.display.oscilloscopeStyle === "steps" ? "Steps" :
+            CONFIG.display.oscilloscopeStyle === "persistence" ? "Persistence" :
+            CONFIG.display.oscilloscopeStyle === "envelope" ? "Carrier / Envelope" :
+            CONFIG.display.oscilloscopeStyle === "spindle" ? "Spindle" :
+            "Lines";
+          return;
+        }
+
+        options.innerHTML = `
+          <div class="option" data-value="bars">Bars</div>
+          <div class="option" data-value="mirrored">Mirrored</div>
+          <div class="option" data-value="gauges">Gauges</div>
+          <div class="option" data-value="analogVu">Analog VU</div>
+        `;
+        options.insertAdjacentHTML("beforeend", CIRCULAR_STYLES.map(value =>
+          `<div class="option" data-value="${value}">${VISUALIZER_NAMES[value]}</div>`).join(""));
+        renderInput.value =
+          CONFIG.display.layoutMode === "equalizer" ? "Bars" :
+          isCircularStyle(CONFIG.display.renderMode) ? VISUALIZER_NAMES[CONFIG.display.renderMode] :
+          CONFIG.display.renderMode === "gauges" ? "Gauges" :
+          CONFIG.display.renderMode === "analogVu" ? "Analog VU" :
+          CONFIG.display.renderMode === "mirrored" ? "Mirrored" :
+          "Bars";
+      }
+
+      syncRenderSelectorOptions();
+
+      const trailDiv = document.createElement("div");
+      trailDiv.id = "amx-visualizer-trail-group";
+      trailDiv.className = "form-group";
+      trailDiv.style.display = (CONFIG.display.layoutMode === "visualizer" || (MIRRORED_LAYOUTS.includes(CONFIG.display.layoutMode) && isCircularStyle(CONFIG.display.renderMode))) ? "" : "none";
+      trailDiv.innerHTML = `
+        <label class="form-label">VISUALIZER TRAIL</label>
+        <div class="dropdown">
+          <input type="text" id="amx-visualizer-trail-input" class="form-control" readonly>
+          <div id="amx-visualizer-trail-options" class="options">
+            <div class="option" data-value="12">Short</div>
+            <div class="option" data-value="24">Medium</div>
+            <div class="option" data-value="48">Long</div>
+          </div>
+        </div>`;
+      content.appendChild(trailDiv);
+      const trailInput = document.getElementById("amx-visualizer-trail-input");
+      trailInput.value = CONFIG.display.visualizerTrail <= 12 ? "Short" : CONFIG.display.visualizerTrail >= 48 ? "Long" : "Medium";
+      bindDropdown(trailInput, "#amx-visualizer-trail-options", (value) => {
+        const count = Number(value);
+        if (![12, 24, 48].includes(count)) return;
+        CONFIG.display.visualizerTrail = count;
+        safeLSSet("AMX_VISUALIZER_TRAIL", String(count));
+        requestRender();
+      });
+
       // SHOW PEAK INDICATOR
       {
         const wrapper = document.createElement("div");
-        wrapper.className = "form-group";
+        wrapper.className = "form-group amx-compact-row";
         wrapper.innerHTML = `
           <div style="display:flex; align-items:center;">
             <label class="form-label">
@@ -2553,7 +4606,7 @@ function saveAMXPanelGeometry(panel) {
 
       // SHOW REAL-TIME VALUES
       const readoutsDiv = document.createElement("div");
-      readoutsDiv.className = "form-group";
+      readoutsDiv.className = "form-group amx-compact-row";
       readoutsDiv.innerHTML = `
         <div style="display:flex; align-items:center;">
           <label class="form-label">
@@ -2581,14 +4634,16 @@ function saveAMXPanelGeometry(panel) {
           readoutsCb.checked ? "true" : "false"
         );
         applyVisualState();
+        requestRender();
       });
+
+      // AUDIO RESPONSE
+      appendSettingsSectionTitle("AUDIO RESPONSE");
 
       // AUDIO RESPONSE PANEL
       const audioDiv = document.createElement("div");
       audioDiv.className = "form-group";
       audioDiv.innerHTML = `
-        <label class="form-label"><i class="fa-solid m-right-10"></i>AUDIO RESPONSE</label>
-
         <div class="audio-row">
           <span class="text-small">Peak hold (ms)</span>
           <input id="peak-hold-slider" type="range" min="50" max="2000" step="50" />
@@ -2614,6 +4669,60 @@ function saveAMXPanelGeometry(panel) {
         </div>
       `;
       content.appendChild(audioDiv);
+
+
+      // ADMIN-ONLY DIAGNOSTICS
+      // This section is not created at all for normal users.
+      if (isFMdxAdmin()) {
+        appendSettingsSectionTitle("DIAGNOSTICS");
+
+        const diagnosticsDiv = document.createElement("div");
+        diagnosticsDiv.className = "form-group amx-diagnostics-row";
+        diagnosticsDiv.id = "amx-admin-diagnostics-setting";
+        diagnosticsDiv.dataset.amxNoDrag = "1";
+
+        const diagnosticsRow = document.createElement("div");
+        diagnosticsRow.style.display = "flex";
+        diagnosticsRow.style.alignItems = "center";
+        diagnosticsRow.style.justifyContent = "space-between";
+        diagnosticsRow.style.gap = "10px";
+
+        const diagnosticsLabel = document.createElement("div");
+        diagnosticsLabel.innerHTML = `
+          <div class="text-small text-bold">ADMIN RUNTIME DATA</div>
+          <div class="text-small" style="opacity:.68; margin-top:2px;">
+            Audio / rendering information
+          </div>
+        `;
+
+        const diagnosticsSwitch = document.createElement("div");
+        diagnosticsSwitch.className = "switch";
+        diagnosticsSwitch.style.display = "flex";
+        diagnosticsSwitch.style.alignItems = "center";
+        diagnosticsSwitch.innerHTML = `
+          <input type="checkbox" id="amx-diagnostics-toggle">
+          <label for="amx-diagnostics-toggle"></label>
+        `;
+
+        diagnosticsRow.appendChild(diagnosticsLabel);
+        diagnosticsRow.appendChild(diagnosticsSwitch);
+        diagnosticsDiv.appendChild(diagnosticsRow);
+        content.appendChild(diagnosticsDiv);
+
+        const diagnosticsCb =
+          diagnosticsSwitch.querySelector("#amx-diagnostics-toggle");
+
+        diagnosticsCb.checked = isAdminDiagnosticsEnabled();
+        diagnosticsCb.addEventListener("change", () => {
+          safeLSSet(
+            STORAGE_DIAGNOSTICS,
+            diagnosticsCb.checked ? "true" : "false"
+          );
+
+          // Apply immediately; no page refresh required.
+          updateDiagnosticsOverlay();
+        });
+      }
 
       // PEAK HOLD
       const peakHoldSlider = document.getElementById("peak-hold-slider");
@@ -2707,7 +4816,7 @@ function saveAMXPanelGeometry(panel) {
 
     if (type === "mirrored") {
       activeCanvas = cm;
-    } else if (type === "gauges") {
+    } else if (type === "gauges" || type === "analogVu") {
       activeCanvas = cg;
     } else {
       // NORMAL (default)
@@ -2731,6 +4840,10 @@ function saveAMXPanelGeometry(panel) {
     rafId: null,
     dirty: false
   };
+
+  // ================================================================
+  // END FLOATING SETTINGS PANEL MODULE
+  // ================================================================
 
   function requestRender() {
     RENDER_GATE.dirty = true;
@@ -2756,6 +4869,16 @@ function saveAMXPanelGeometry(panel) {
     return true;
   }
 
+  function shouldReadSpectrumSnapshot() {
+    const c = STATE.spectrumCadence;
+    c.frame++;
+
+    if (c.frame < c.interval) return false;
+
+    c.frame = 0;
+    return true;
+  }
+
   function readLayoutOnce() {
     if (!STATE.dom.contentWrapper) return;
     if (!STATE.layout.dirty) return;
@@ -2770,36 +4893,141 @@ function saveAMXPanelGeometry(panel) {
     STATE.layout.dirty = true;
   }
 
+  // HiDPI rendering: keep all meter geometry in logical CSS pixels while
+  // allocating a denser backing store for Retina/high-DPI displays and zoom.
+  const AMX_MAX_RENDER_DPR = 2;
+
+  function getAMXRenderDpr() {
+    const raw = Number(window.devicePixelRatio) || 1;
+    // Keep a modest supersampling floor so browser zoom below 100% still
+    // receives enough backing-store pixels, while avoiding fractional
+    // logical geometry and the vertical seams it caused in bar fills.
+    return Math.max(1.25, Math.min(AMX_MAX_RENDER_DPR, raw));
+  }
+
+  function getCanvasLogicalWidth(canvas) {
+    if (!canvas) return 0;
+    return Number(canvas._amxLogicalWidth) || 0;
+  }
+
+  function getCanvasLogicalHeight(canvas) {
+    if (!canvas) return 0;
+    return Number(canvas._amxLogicalHeight) || 0;
+  }
+
+  function getCanvasRenderedWidth(canvas) {
+    if (!canvas) return 0;
+    const rect = canvas.getBoundingClientRect();
+    return Math.max(0, Math.round(rect.width || 0));
+  }
+
+  function getExpectedCanvasWidth(canvas) {
+    const wrapperW = Math.max(0, Math.round(STATE.layout.width || 0));
+    if (!wrapperW) return getCanvasLogicalWidth(canvas);
+
+    if (canvas === STATE.dom.canvasMirror) {
+      const left = Math.max(4, CONFIG.display.dimensions.canvasLeft - 20);
+      return Math.max(1, wrapperW - left - Math.max(8, CONFIG.display.dimensions.canvasLeft - 15));
+    }
+
+    if (canvas === STATE.dom.canvasGauges) {
+      // Gauges use a symmetric full-width drawing surface so their group can
+      // be mathematically centered in the tile without clipping either edge.
+      return Math.max(1, wrapperW - 10);
+    }
+
+    // Normal bars keep their original inset track.
+    return Math.max(1, wrapperW - CONFIG.display.dimensions.canvasLeft - 5);
+  }
+
+  function applyCanvasHiDpiTransform(canvas) {
+    if (!canvas) return null;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+
+    const dpr = Number(canvas._amxDpr) || getAMXRenderDpr();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return ctx;
+  }
+
   function refreshLayoutAndCanvas() {
     const prevW = STATE.layout.width;
     const prevH = STATE.layout.height;
+    const prevDpr = STATE.layout.dpr || 1;
 
     markLayoutDirty();
     readLayoutOnce();
+    STATE.layout.dpr = getAMXRenderDpr();
 
-    if (
+    const layoutChanged =
       STATE.layout.width !== prevW ||
-      STATE.layout.height !== prevH
-    ) {
+      STATE.layout.height !== prevH;
+    const dprChanged = STATE.layout.dpr !== prevDpr;
+
+    if (layoutChanged || dprChanged) {
       invalidateVisualCaches();
+
+      // Reallocate existing canvases at the new density without changing
+      // their logical drawing coordinates or current layout heights.
+      [
+        STATE.dom.canvasNormal,
+        STATE.dom.canvasMirror,
+        STATE.dom.canvasGauges
+      ].forEach((canvas) => {
+        if (!canvas) return;
+        const renderedW = getCanvasRenderedWidth(canvas);
+        const logicalW = renderedW > 40
+          ? renderedW
+          : getExpectedCanvasWidth(canvas);
+        const logicalH = getCanvasLogicalHeight(canvas);
+        if (logicalW > 0 && logicalH > 0) {
+          resizeCanvasIfNeeded(canvas, logicalW, logicalH);
+        }
+      });
     }
 
     requestRender();
   }
 
   function resizeCanvasIfNeeded(canvas, w, h) {
-    if (!canvas) return;
+    if (!canvas) return false;
 
-    if (canvas.width !== w || canvas.height !== h) {
-      canvas.width  = w;
-      canvas.height = h;
+    // Keep logical meter geometry on integer CSS pixels. Fractional logical
+    // widths combined with a rounded backing store can create faint vertical
+    // seams between adjacent 1px bar columns.
+    const logicalW = Math.max(1, Math.round(Number(w) || 1));
+    const logicalH = Math.max(1, Math.round(Number(h) || 1));
+    const dpr = getAMXRenderDpr();
+    const pixelW = Math.max(1, Math.round(logicalW * dpr));
+    const pixelH = Math.max(1, Math.round(logicalH * dpr));
+
+    let changed = false;
+
+    if (canvas.width !== pixelW || canvas.height !== pixelH) {
+      canvas.width = pixelW;
+      canvas.height = pixelH;
+      changed = true;
     }
 
-    const sw = w + "px";
-    const sh = h + "px";
+    canvas._amxLogicalWidth = logicalW;
+    canvas._amxLogicalHeight = logicalH;
+    canvas._amxDpr = dpr;
+    delete canvas._amxScaleX;
+    delete canvas._amxScaleY;
 
-    if (canvas.style.width !== sw)  canvas.style.width  = sw;
-    if (canvas.style.height !== sh) canvas.style.height = sh;
+    // Keep the authored CSS width (usually calc(...)) intact. The backing
+    // store follows the actually rendered width; forcing a px width here
+    // breaks gauge/label alignment and can clip mirrored mode.
+    const sh = logicalH + "px";
+
+    if (canvas.style.height !== sh) {
+      canvas.style.height = sh;
+      changed = true;
+    }
+
+    applyCanvasHiDpiTransform(canvas);
+    STATE.layout.dpr = dpr;
+    return changed;
   }
 
   function updateMirroredCanvasHeight() {
@@ -2959,6 +5187,10 @@ function saveAMXPanelGeometry(panel) {
       return width;
     }
 
+    if (display.renderMode === "bars") {
+      return width - display.dimensions.canvasLeft - 20;
+    }
+
     return width - display.dimensions.canvasLeft - 5;
   }
 
@@ -3061,6 +5293,17 @@ function saveAMXPanelGeometry(panel) {
       }
     }
 
+    // Gauge labels live inside an inset overlay, while readouts are direct
+    // children of the full wrapper. Convert the same normalized gauge centre
+    // using the exact active overlay/canvas inset.
+    function gaugeReadoutLeft(centerFraction) {
+      const f = clamp01(centerFraction);
+      const inset = getGaugeHorizontalInset(layout);
+      const insetCorrection = inset - (inset * 2) * f;
+      const sign = insetCorrection < 0 ? "-" : "+";
+      return `calc(${f * 100}% ${sign} ${Math.abs(insetCorrection)}px)`;
+    }
+
     // 2) MIRRORED — outside of bars
     if (useMirrored) {
       let leftTopKey, rightTopKey, leftBottomKey, rightBottomKey;
@@ -3103,33 +5346,51 @@ function saveAMXPanelGeometry(panel) {
       return;
     }
 
+    if (layout === "visualizer" || isCircularStyle(render)) return;
+
+    // OSCILLOSCOPE — L/R readouts aligned with the two enlarged lanes.
+    if (layout === "oscilloscope") {
+      const scopeHeight = 94;
+      const scopeGap = 6;
+      const scopeLaneH = (scopeHeight - scopeGap) / 2;
+      const scopeTopCenter = scopeLaneH * 0.58 - 2;
+      const scopeBottomCenter =
+        scopeLaneH + scopeGap + scopeLaneH * 0.58 - 2;
+
+      showAt("L", xOut, scopeTopCenter + "px", T);
+      showAt("R", xOut, scopeBottomCenter + "px", T);
+      return;
+    }
+
     // 3) GAUGES — READOUTS POSITIONING
     if (render === "gauges") {
 
       const TOP = "40%";
-      const TOP_FULL = "25%";
+      const TOP_FULL = "35%";
       const T   = "translate(-50%, 0)";
 
+      const centers = getGaugeGeometry(layout).centers;
+
       // FULL — 4 gauges
-      if (layout === "full") {
-        showAt("L", "17.5%", TOP_FULL, T);
-        showAt("R", "40%",   TOP_FULL, T);
-        showAt("Q", "62.5%", TOP_FULL, T);
-        showAt("A", "85%",   TOP_FULL, T);
+      if (layout === "full" && centers.length === 4) {
+        showAt("L", gaugeReadoutLeft(centers[0]), TOP_FULL, T);
+        showAt("R", gaugeReadoutLeft(centers[1]), TOP_FULL, T);
+        showAt("Q", gaugeReadoutLeft(centers[2]), TOP_FULL, T);
+        showAt("A", gaugeReadoutLeft(centers[3]), TOP_FULL, T);
         return;
       }
 
       // SA — 2 gauges (Q / A)
-      if (layout === "sa") {
-        showAt("Q", "27%", TOP, T);
-        showAt("A", "75%", TOP, T);
+      if (layout === "sa" && centers.length === 2) {
+        showAt("Q", gaugeReadoutLeft(centers[0]), TOP, T);
+        showAt("A", gaugeReadoutLeft(centers[1]), TOP, T);
         return;
       }
 
       // LR — 2 gauges (L / R)
-      if (layout === "lr") {
-        showAt("L", "27%", TOP, T);
-        showAt("R", "75%", TOP, T);
+      if (layout === "lr" && centers.length === 2) {
+        showAt("L", gaugeReadoutLeft(centers[0]), TOP, T);
+        showAt("R", gaugeReadoutLeft(centers[1]), TOP, T);
         return;
       }
 
@@ -3279,55 +5540,20 @@ function saveAMXPanelGeometry(panel) {
     // UNIFIED GEOMETRY CACHE
     const xs = getPixelFillXs(barW);
 
-    // DRAW BAR — pixel accurate
-    const maxX =
-      fillFloor < colorLen
-        ? (fillFloor < xs.length ? fillFloor : xs.length)
-        : (colorLen < xs.length ? colorLen : xs.length);
-    for (let i = 0; i < maxX; i++) {
-      const x = xs[i];
-      ctx.fillStyle = colors[x];
-      ctx.fillRect(x, yy, 1, h);
+    const maxX = Math.min(fillFloor, colorLen, xs.length);
+    if (glowIntensity > 0 && maxX > 0) {
+      ctx.save();
+      ctx.globalAlpha = 0.44 * glowIntensity;
+      ctx.filter = "blur(7px)";
+      ctx.fillStyle = createBarsLinearGradient(ctx, barW, gcache.mode);
+      ctx.fillRect(0, yy, maxX, h);
+      ctx.restore();
     }
 
-    // SIMPLE GLOW — rim + soft fade (NO BLUR)
-    if (glowIntensity > 0) {
-
-      const rimExpand = 1.5;
-      const fadeExpand = 3.5;
-
-      const rimAlpha = 0.14 * glowIntensity;
-      const fadeAlpha = 0.02 * glowIntensity;
-
-      ctx.save();
-
-      // rim
-      ctx.globalAlpha = rimAlpha;
-      for (let i = 0; i < maxX; i++) {
-        const x = xs[i];
-        ctx.fillStyle = colors[x];
-        ctx.fillRect(
-          x - rimExpand,
-          yy - rimExpand,
-          1 + rimExpand * 2,
-          h + rimExpand * 2
-        );
-      }
-
-      // soft fade
-      ctx.globalAlpha = fadeAlpha;
-      for (let i = 0; i < maxX; i++) {
-        const x = xs[i];
-        ctx.fillStyle = colors[x];
-        ctx.fillRect(
-          x - fadeExpand,
-          yy - fadeExpand,
-          1 + fadeExpand * 2,
-          h + fadeExpand * 2
-        );
-      }
-
-      ctx.restore();
+    // DRAW BAR — clean fill above the unified gradient halo.
+    if (maxX > 0) {
+      ctx.fillStyle = createBarsLinearGradient(ctx, barW, gcache.mode);
+      ctx.fillRect(0, yy, maxX, h);
     }
 
     // EXTERNAL PEAK
@@ -3362,10 +5588,6 @@ function saveAMXPanelGeometry(panel) {
     const segmentCache = GEOMETRY_CACHE.segment;
 
     const doGlow = glowIntensity > 0;
-    const rimExpand = 1.2;
-    const fadeExpand = 3.8;
-    const rimAlpha = 0.22 * glowIntensity;
-    const fadeAlpha = 0.07 * glowIntensity;
 
     const renderMode = CONFIG.display.renderMode;
     const layoutMode = CONFIG.display.layoutMode;
@@ -3410,31 +5632,17 @@ function saveAMXPanelGeometry(panel) {
             ctx.fillStyle = segColor;
             ctx.fillRect(x, ry, segW, rowH);
 
-            // unified glow (stronger around segment)
             if (doGlow) {
-              // rim glow
               ctx.save();
-              ctx.globalAlpha = rimAlpha;
+              ctx.globalAlpha = 0.50 * glowIntensity;
+              ctx.filter = "blur(6px)";
               ctx.fillStyle = segColor;
-              ctx.fillRect(
-                x - rimExpand,
-                ry - rimExpand,
-                segW + rimExpand * 2,
-                rowH + rimExpand * 2
-              );
+              ctx.fillRect(x, ry, segW, rowH);
               ctx.restore();
 
-              // soft fade
-              ctx.save();
-              ctx.globalAlpha = fadeAlpha;
+              // Restore a crisp fill above the blurred segment halo.
               ctx.fillStyle = segColor;
-              ctx.fillRect(
-                x - fadeExpand,
-                ry - fadeExpand,
-                segW + fadeExpand * 2,
-                rowH + fadeExpand * 2
-              );
-              ctx.restore();
+              ctx.fillRect(x, ry, segW, rowH);
             }
           }
         }
@@ -3488,31 +5696,17 @@ function saveAMXPanelGeometry(panel) {
         ctx.fillStyle = segColor;
         ctx.fillRect(x, y, segW, segH);
 
-        // unified glow (same profile as mirrored)
         if (doGlow) {
-          // rim glow
           ctx.save();
-          ctx.globalAlpha = rimAlpha;
+          ctx.globalAlpha = 0.50 * glowIntensity;
+          ctx.filter = "blur(6px)";
           ctx.fillStyle = segColor;
-          ctx.fillRect(
-            x - rimExpand,
-            y - rimExpand,
-            segW + rimExpand * 2,
-            segH + rimExpand * 2
-          );
+          ctx.fillRect(x, y, segW, segH);
           ctx.restore();
 
-          // soft fade
-          ctx.save();
-          ctx.globalAlpha = fadeAlpha;
+          // Restore a crisp fill above the blurred segment halo.
           ctx.fillStyle = segColor;
-          ctx.fillRect(
-            x - fadeExpand,
-            y - fadeExpand,
-            segW + fadeExpand * 2,
-            segH + fadeExpand * 2
-          );
-          ctx.restore();
+          ctx.fillRect(x, y, segW, segH);
         }
       }
     }
@@ -3548,10 +5742,8 @@ function saveAMXPanelGeometry(panel) {
     const circledotsCache = GEOMETRY_CACHE.circledots;
 
     const doGlow = glowIntensity > 0;
-    const rimExpand  = 1.4;
-    const fadeExpand = 4.5;
-    const rimAlpha  = 0.24 * glowIntensity;
-    const fadeAlpha = 0.08 * glowIntensity;
+    const glowAlpha = 0.58 * glowIntensity;
+    const glowBlur = 7;
 
     // MIRRORED MODE (2 rows) — only for LR / SA
     if (isMirroredLRSA) {
@@ -3590,26 +5782,20 @@ function saveAMXPanelGeometry(panel) {
           ctx.arc(x, cy, radius, 0, Math.PI * 2);
           ctx.fill();
 
-          // UNIFIED GLOW
           if (doGlow) {
-
-            // rim
             ctx.save();
-            ctx.globalAlpha = rimAlpha;
+            ctx.globalAlpha = glowAlpha;
+            ctx.filter = `blur(${glowBlur}px)`;
             ctx.fillStyle = c;
             ctx.beginPath();
-            ctx.arc(x, cy, radius + rimExpand, 0, Math.PI * 2);
+            ctx.arc(x, cy, radius, 0, Math.PI * 2);
             ctx.fill();
             ctx.restore();
 
-            // soft fade
-            ctx.save();
-            ctx.globalAlpha = fadeAlpha;
             ctx.fillStyle = c;
             ctx.beginPath();
-            ctx.arc(x, cy, radius + fadeExpand, 0, Math.PI * 2);
+            ctx.arc(x, cy, radius, 0, Math.PI * 2);
             ctx.fill();
-            ctx.restore();
           }
         }
       }
@@ -3652,26 +5838,20 @@ function saveAMXPanelGeometry(panel) {
       ctx.arc(x, cy, radius, 0, Math.PI * 2);
       ctx.fill();
 
-      // UNIFIED GLOW
       if (doGlow) {
-
-        // rim
         ctx.save();
-        ctx.globalAlpha = rimAlpha;
+        ctx.globalAlpha = glowAlpha;
+        ctx.filter = `blur(${glowBlur}px)`;
         ctx.fillStyle = c;
         ctx.beginPath();
-        ctx.arc(x, cy, radius + rimExpand, 0, Math.PI * 2);
+        ctx.arc(x, cy, radius, 0, Math.PI * 2);
         ctx.fill();
         ctx.restore();
 
-        // soft fade
-        ctx.save();
-        ctx.globalAlpha = fadeAlpha;
         ctx.fillStyle = c;
         ctx.beginPath();
-        ctx.arc(x, cy, radius + fadeExpand, 0, Math.PI * 2);
+        ctx.arc(x, cy, radius, 0, Math.PI * 2);
         ctx.fill();
-        ctx.restore();
       }
     }
 
@@ -3705,8 +5885,8 @@ function saveAMXPanelGeometry(panel) {
 
     // Glow constants precomputed once
     const doGlow = glowIntensity > 0;
-    const glowAlpha = 0.38 * glowIntensity;
-    const glowBlur = 5.5;
+    const glowAlpha = 0.66 * glowIntensity;
+    const glowBlur = 7;
 
     const matrixdotsCache = GEOMETRY_CACHE.matrixdots;
     const matrixCountCache = GEOMETRY_CACHE.matrixCount;
@@ -3718,7 +5898,6 @@ function saveAMXPanelGeometry(panel) {
       const radius = Math.max(2, Math.min(maxR, Math.floor(height * 0.085)));
       const stepX = radius * 2 + 2;
       const stepY = radius * 2 + 2;
-      const glowR = radius + 1.9;
 
       const centerY = y + height * 0.5;
 
@@ -3777,9 +5956,14 @@ function saveAMXPanelGeometry(panel) {
             ctx.filter = `blur(${glowBlur}px)`;
             ctx.fillStyle = c;
             ctx.beginPath();
-            ctx.arc(x, cy, glowR, 0, Math.PI * 2);
+            ctx.arc(x, cy, radius, 0, Math.PI * 2);
             ctx.fill();
             ctx.restore();
+
+            ctx.fillStyle = c;
+            ctx.beginPath();
+            ctx.arc(x, cy, radius, 0, Math.PI * 2);
+            ctx.fill();
           }
         }
       }
@@ -3795,7 +5979,6 @@ function saveAMXPanelGeometry(panel) {
 
     const radius = Math.max(2, Math.round(visualHeight * 0.19));
     const gapX = radius * 2 + 2;
-    const glowR = radius + 1.9;
 
     const matrixYOffset = isFullMirrored ? 6 : 0;
     const visualTop = isFullMirrored
@@ -3835,9 +6018,14 @@ function saveAMXPanelGeometry(panel) {
         ctx.filter = `blur(${glowBlur}px)`;
         ctx.fillStyle = c;
         ctx.beginPath();
-        ctx.arc(x, row1Y, glowR, 0, Math.PI * 2);
+        ctx.arc(x, row1Y, radius, 0, Math.PI * 2);
         ctx.fill();
         ctx.restore();
+
+        ctx.fillStyle = c;
+        ctx.beginPath();
+        ctx.arc(x, row1Y, radius, 0, Math.PI * 2);
+        ctx.fill();
       }
 
       // ROW 2
@@ -3852,9 +6040,14 @@ function saveAMXPanelGeometry(panel) {
         ctx.filter = `blur(${glowBlur}px)`;
         ctx.fillStyle = c;
         ctx.beginPath();
-        ctx.arc(x, row2Y, glowR, 0, Math.PI * 2);
+        ctx.arc(x, row2Y, radius, 0, Math.PI * 2);
         ctx.fill();
         ctx.restore();
+
+        ctx.fillStyle = c;
+        ctx.beginPath();
+        ctx.arc(x, row2Y, radius, 0, Math.PI * 2);
+        ctx.fill();
       }
     }
 
@@ -3894,10 +6087,6 @@ function saveAMXPanelGeometry(panel) {
     const reflCache =
       renderPillars._reflCache ||
       (renderPillars._reflCache = new Map());
-
-    const glowGeomCache =
-      renderPillars._glowGeomCache ||
-      (renderPillars._glowGeomCache = new Map());
 
     // TRIANGLE PATH
     const midY = topY + h * 0.5;
@@ -3976,6 +6165,35 @@ function saveAMXPanelGeometry(panel) {
       ctx.restore();
     }
 
+    // UNIFIED GRADIENT HALO — same mechanism as the vertical pillar.
+    // The active triangular path is blurred behind the clean signal fill.
+    if (glowIntensity > 0 && fillX > 1) {
+      const fx = Math.min(fillFloor, colors.length, xs.length);
+      if (fx > 0) {
+        const fillRatio = fx / Math.max(1, W);
+        const activeTop =
+          midY + (topY - midY) * fillRatio;
+        const activeBottom =
+          midY + (bottomY - midY) * fillRatio;
+        const activePath = new Path2D();
+        activePath.moveTo(0, midY);
+        activePath.lineTo(fx, activeTop);
+        activePath.lineTo(fx, activeBottom);
+        activePath.closePath();
+
+        ctx.save();
+        ctx.globalAlpha = 0.46 * glowIntensity;
+        ctx.filter = "blur(7px)";
+        ctx.fillStyle = createBarsLinearGradient(
+          ctx,
+          W,
+          gcache.mode
+        );
+        ctx.fill(activePath);
+        ctx.restore();
+      }
+    }
+
     // SIGNAL FILL (pixel fill) — CACHED GEOMETRY
     if (fillX > 0) {
       const fx = Math.min(fillFloor, colors.length, xs.length);
@@ -3983,110 +6201,10 @@ function saveAMXPanelGeometry(panel) {
       ctx.save();
       ctx.clip(path);
 
-      for (let i = 0; i < fx; i++) {
-        const x = xs[i];
-        ctx.fillStyle = colors[i];
-        ctx.fillRect(x, topY, 1, h);
-      }
+      ctx.fillStyle = createBarsLinearGradient(ctx, W, gcache.mode);
+      ctx.fillRect(0, topY, fx, h);
 
       ctx.restore();
-    }
-
-    // TRIANGLE GLOW — rim + soft fade + ultra-soft outer haze
-    if (glowIntensity > 0 && fillX > 1) {
-
-      const fx = Math.min(fillFloor, colors.length, xs.length);
-      if (fx > 0) {
-
-        // glow profile
-        const rimExpand   = 1.0;
-        const fadeExpand  = 2.5;
-        const hazeExpand  = 8.0;
-
-        const rimAlpha   = 0.18 * glowIntensity;
-        const fadeAlpha  = 0.06 * glowIntensity;
-        const hazeAlpha  = 0.003 * glowIntensity;
-        const edgeAlpha  = 1.10 * glowIntensity;
-
-        const glowGeomKey = `${topY}|${h}|${W}`;
-        let glowGeom = glowGeomCache.get(glowGeomKey);
-
-        if (!glowGeom) {
-          const topYs = new Array(xs.length);
-          const spanHs = new Array(xs.length);
-
-          for (let i = 0; i < xs.length; i++) {
-            const x = xs[i];
-            const top = midY + (topY - midY) * (x / W);
-            const bot = midY + (bottomY - midY) * (x / W);
-            topYs[i] = top;
-            spanHs[i] = bot - top;
-          }
-
-          glowGeom = { topYs, spanHs };
-          glowGeomCache.set(glowGeomKey, glowGeom);
-        }
-
-        const topYs = glowGeom.topYs;
-        const spanHs = glowGeom.spanHs;
-
-        ctx.save();
-
-        // RIM GLOW
-        ctx.globalAlpha = rimAlpha;
-        for (let i = 0; i < fx; i++) {
-          const x = xs[i];
-          ctx.fillStyle = colors[i];
-          ctx.fillRect(
-            x - rimExpand,
-            topYs[i] - rimExpand,
-            1 + rimExpand * 2,
-            spanHs[i] + rimExpand * 2
-          );
-        }
-
-        // INNER SOFT FADE
-        ctx.globalAlpha = fadeAlpha;
-        for (let i = 0; i < fx; i++) {
-          const x = xs[i];
-          ctx.fillStyle = colors[i];
-          ctx.fillRect(
-            x - fadeExpand,
-            topYs[i] - fadeExpand,
-            1 + fadeExpand * 2,
-            spanHs[i] + fadeExpand * 2
-          );
-        }
-
-        // ULTRA-SOFT OUTER HAZE
-        ctx.globalAlpha = hazeAlpha;
-        for (let i = 0; i < fx; i++) {
-          const x = xs[i];
-          ctx.fillStyle = colors[i];
-          ctx.fillRect(
-            x - hazeExpand,
-            topYs[i] - hazeExpand,
-            1 + hazeExpand * 2,
-            spanHs[i] + hazeExpand * 2
-          );
-        }
-
-        // BC EDGE ACCENT
-        ctx.globalAlpha = edgeAlpha;
-        for (let i = fx - 2; i < fx; i++) {
-          if (i < 0) continue;
-          const x = xs[i];
-          ctx.fillStyle = colors[i];
-          ctx.fillRect(
-            x - fadeExpand,
-            topYs[i] - fadeExpand - 1,
-            1 + fadeExpand * 2,
-            spanHs[i] + fadeExpand * 2 + 2
-          );
-        }
-
-        ctx.restore();
-      }
     }
 
     // REFLECTION
@@ -4219,41 +6337,23 @@ function saveAMXPanelGeometry(panel) {
 
       // bar glow
       if (glowIntensity > 0 && maxFillX > 0) {
-
-        const rimAlpha  = 0.16 * glowIntensity;
-        const fadeAlpha = 0.05 * glowIntensity;
-
-        // rim
-        const yRim = innerY - 2;
-        const hRim = innerH + 8;
-
-        // fade
-        const yFade = innerY - 6;
-        const hFade = innerH + 14;
-
         ctx.save();
-        ctx.globalCompositeOperation = "source-over";
-
-        // rim around
-        if (rimAlpha > 0.001) {
-          ctx.globalAlpha = rimAlpha;
-          for (let i = 0; i < maxFillX; i++) {
-            const x = xs[i];
-            ctx.fillStyle = colors[i];
-            ctx.fillRect(x - 1, yRim, 2, hRim);
-          }
-        }
-
-        // fade further out
-        if (fadeAlpha > 0.001) {
-          ctx.globalAlpha = fadeAlpha;
-          for (let i = 0; i < maxFillX; i++) {
-            const x = xs[i];
-            ctx.fillStyle = colors[i];
-            ctx.fillRect(x - 2, yFade, 4, hFade);
-          }
-        }
-
+        ctx.globalAlpha = 0.54 * glowIntensity;
+        ctx.filter = "blur(8px)";
+        ctx.fillStyle = createBarsLinearGradient(
+          ctx,
+          effectiveW,
+          gcache.mode
+        );
+        ctx.beginPath();
+        ctx.roundRect(
+          0,
+          innerY,
+          maxFillX,
+          innerH,
+          Math.min(innerH / 2, maxFillX / 2)
+        );
+        ctx.fill();
         ctx.restore();
       }
 
@@ -4284,11 +6384,8 @@ function saveAMXPanelGeometry(panel) {
         ctx.save();
         ctx.clip(inner);
 
-        for (let i = 0; i < maxFillX; i++) {
-          const x = xs[i];
-          ctx.fillStyle = colors[i];
-          ctx.fillRect(x, innerY, 1, innerH);
-        }
+        ctx.fillStyle = createBarsLinearGradient(ctx, effectiveW, gcache.mode);
+        ctx.fillRect(0, innerY, maxFillX, innerH);
 
         ctx.restore();
       }
@@ -4415,58 +6512,23 @@ function saveAMXPanelGeometry(panel) {
 
       // 1) GLOW
       if (glowIntensity > 0 && fillW > 1) {
-
-        const fx = fillLimit;
-
-        const rimExpand  = 1.5;
-        const fadeExpand = 4.5;
-        const hazeExpand = 2.5;
-
-        const rimAlpha  = 0.16 * glowIntensity;
-        const fadeAlpha = 0.035 * glowIntensity;
-        const hazeAlpha = 0.02 * glowIntensity;
-
-        ctx.save(); // NO CLIP — free halo
-
-        // RIM
-        ctx.globalAlpha = rimAlpha;
-        for (let i = 0; i < fx; i++) {
-          const x = xs[i];
-          ctx.fillStyle = colors[i];
-          ctx.fillRect(
-            x - rimExpand,
-            ry - rimExpand,
-            1 + rimExpand * 2,
-            rh + rimExpand * 2
-          );
-        }
-
-        // FADE
-        ctx.globalAlpha = fadeAlpha;
-        for (let i = 0; i < fx; i++) {
-          const x = xs[i];
-          ctx.fillStyle = colors[i];
-          ctx.fillRect(
-            x - fadeExpand,
-            ry - fadeExpand,
-            1 + fadeExpand * 2,
-            rh + fadeExpand * 2
-          );
-        }
-
-        // HAZE
-        ctx.globalAlpha = hazeAlpha;
-        for (let i = 0; i < fx; i++) {
-          const x = xs[i];
-          ctx.fillStyle = colors[i];
-          ctx.fillRect(
-            x - hazeExpand,
-            ry - hazeExpand,
-            1 + hazeExpand * 2,
-            rh + hazeExpand * 2
-          );
-        }
-
+        ctx.save();
+        ctx.globalAlpha = 0.56 * glowIntensity;
+        ctx.filter = "blur(8px)";
+        ctx.fillStyle = createBarsLinearGradient(
+          ctx,
+          effectiveW,
+          gcache.mode
+        );
+        ctx.beginPath();
+        ctx.roundRect(
+          0,
+          ry,
+          fillLimit,
+          rh,
+          Math.min(radius, fillLimit / 2)
+        );
+        ctx.fill();
         ctx.restore();
       }
 
@@ -4545,11 +6607,8 @@ function saveAMXPanelGeometry(panel) {
         ctx.globalAlpha = 0.90;
 
         const maxX = fillLimit;
-        for (let i = 0; i < maxX; i++) {
-          const x = xs[i];
-          ctx.fillStyle = colors[i];
-          ctx.fillRect(x, ry, 1, rh);
-        }
+        ctx.fillStyle = createBarsLinearGradient(ctx, effectiveW, gcache.mode);
+        ctx.fillRect(0, ry, maxX, rh);
         ctx.restore();
       }
 
@@ -4724,11 +6783,12 @@ function saveAMXPanelGeometry(panel) {
   }
 
   function syncCanvasAndWrapperHeight(canvas, canvasStyle, contentWrapperStyle, neededHeight) {
-    const nextHeight = neededHeight + "px";
+    const logicalWidth = getCanvasLogicalWidth(canvas) || STATE.layout.width || 300;
+    const logicalHeight = Math.max(1, Math.round(neededHeight));
+    const nextHeight = logicalHeight + "px";
 
-    if (canvas.height !== neededHeight) {
-      canvas.height = neededHeight;
-    }
+    resizeCanvasIfNeeded(canvas, logicalWidth, logicalHeight);
+
     if (canvasStyle.height !== nextHeight) {
       canvasStyle.height = nextHeight;
     }
@@ -4752,10 +6812,2135 @@ function saveAMXPanelGeometry(panel) {
     ));
   }
 
+  function createEqualizerGradient(ctx, x, top, width, height) {
+    const colors = ACTIVE_THEME.colors;
+    // Identical X coordinates force a strictly vertical colour axis.
+    const gradientX = Math.round(x + width / 2) + 0.5;
+    const key = `${gradientX}|${top}|${height}|${ctx.canvas.width}|${ctx.canvas.height}|${ctx.canvas._amxDpr}|${ctx.canvas._amxLogicalWidth}|${ctx.canvas._amxLogicalHeight}|${colors.low}|${colors.mid}|${colors.high}`;
+    const cached = EQUALIZER_GRADIENT_CACHE.get(ctx);
+    if (cached && cached.key === key) return cached.gradient;
+    const gradient = ctx.createLinearGradient(
+      gradientX,
+      top + height,
+      gradientX,
+      top
+    );
+    gradient.addColorStop(0, colors.low);
+    gradient.addColorStop(0.50, colors.mid);
+    gradient.addColorStop(1, colors.high);
+    EQUALIZER_GRADIENT_CACHE.set(ctx, { key, gradient });
+    return gradient;
+  }
+
+  function getVerticalSegmentMetrics(width) {
+    const gap = 2;
+    const height = Math.max(3, Math.min(6, Math.round(width * 0.30)));
+    return { gap, height, step: height + gap };
+  }
+
+  function snapVerticalThresholdToSegmentGap(threshold, height, width) {
+    const segment = getVerticalSegmentMetrics(width);
+    const targetPx = clamp(threshold, 0, 1) * height;
+    const gapIndex = Math.max(
+      1,
+      Math.round((targetPx + segment.gap / 2) / segment.step)
+    );
+    const gapMidPx = gapIndex * segment.step - segment.gap / 2;
+    return clamp(gapMidPx / Math.max(1, height), 0.001, 0.999);
+  }
+
+  function getVerticalDotMetrics(width, height, style) {
+    const cols = style === "matrixdots" ? 2 : 1;
+    const columnGap = style === "matrixdots" ? 2 : 0;
+    const widthRadius =
+      (width - columnGap * (cols - 1)) / (cols * 2);
+    const heightRadius =
+      height / (style === "matrixdots" ? 30 : 15);
+    const radius = Math.max(
+      1.5,
+      Math.min(widthRadius * 0.88, heightRadius)
+    );
+    const rowGap = style === "matrixdots" ? 2 : 3;
+    return {
+      cols,
+      columnGap,
+      radius,
+      rowGap,
+      stepY: radius * 2 + rowGap
+    };
+  }
+
+  function snapVerticalThresholdToDotGap(
+    threshold,
+    height,
+    width,
+    style
+  ) {
+    const dot = getVerticalDotMetrics(width, height, style);
+    const targetPx = clamp(threshold, 0, 1) * height;
+    const gapIndex = Math.max(
+      1,
+      Math.round((targetPx + dot.rowGap / 2) / dot.stepY)
+    );
+    const gapMidPx = gapIndex * dot.stepY - dot.rowGap / 2;
+    return clamp(gapMidPx / Math.max(1, height), 0.001, 0.999);
+  }
+
+  function snapVerticalThreshold(threshold, height, width, style) {
+    if (style === "segment") {
+      return snapVerticalThresholdToSegmentGap(threshold, height, width);
+    }
+    if (style === "circledots" || style === "matrixdots") {
+      return snapVerticalThresholdToDotGap(
+        threshold,
+        height,
+        width,
+        style
+      );
+    }
+    return threshold;
+  }
+
+  function createVerticalMeterGradient(
+    ctx,
+    x,
+    top,
+    width,
+    height,
+    mode = 0,
+    discreteStyle = null
+  ) {
+    const colors = ACTIVE_THEME.colors;
+    const gradientX = Math.round(x + width / 2) + 0.5;
+    const gradient = ctx.createLinearGradient(
+      gradientX,
+      top + height,
+      gradientX,
+      top
+    );
+
+    if (mode === 1) {
+      const baseThreshold = 0.58;
+      const threshold = snapVerticalThreshold(
+        baseThreshold,
+        height,
+        width,
+        discreteStyle
+      );
+      gradient.addColorStop(0.00, colors.low);
+      gradient.addColorStop(0.40 * baseThreshold, colors.mid);
+      gradient.addColorStop(0.80 * baseThreshold, colors.high);
+      gradient.addColorStop(threshold - 0.001, colors.high);
+      gradient.addColorStop(threshold + 0.001, "#ff0000");
+      gradient.addColorStop(1.00, "#ff0000");
+    } else if (mode === 2) {
+      const baseThreshold = 0.82;
+      const threshold = snapVerticalThreshold(
+        baseThreshold,
+        height,
+        width,
+        discreteStyle
+      );
+      gradient.addColorStop(0.00, colors.high);
+      gradient.addColorStop(0.40 * baseThreshold, colors.mid);
+      gradient.addColorStop(0.80 * baseThreshold, colors.low);
+      gradient.addColorStop(threshold - 0.001, colors.low);
+      gradient.addColorStop(threshold + 0.001, "#ffd400");
+      gradient.addColorStop(1.00, "#ffd400");
+    } else {
+      gradient.addColorStop(0.00, colors.low);
+      gradient.addColorStop(0.50, colors.mid);
+      gradient.addColorStop(0.80, colors.high);
+      gradient.addColorStop(1.00, colors.high);
+    }
+    return gradient;
+  }
+
+  const EQUALIZER_SEGMENT_GLASS_CACHE = new WeakMap();
+
+  function getEqualizerSegmentGlass(ctx, y, height) {
+    let cache = EQUALIZER_SEGMENT_GLASS_CACHE.get(ctx);
+    if (!cache) {
+      cache = new Map();
+      EQUALIZER_SEGMENT_GLASS_CACHE.set(ctx, cache);
+    }
+
+    const glassKey = `${y}|${height}`;
+    let glass = cache.get(glassKey);
+    if (!glass) {
+      // Same emboss profile used by drawSegmentGlassLayer. In the vertical
+      // equalizer the segments are stacked, but each individual segment keeps
+      // the original top-to-bottom glass axis.
+      glass = ctx.createLinearGradient(0, y, 0, y + height);
+      glass.addColorStop(0.00, "rgba(255,255,255,0.45)");
+      glass.addColorStop(0.08, "rgba(255,255,255,0.25)");
+      glass.addColorStop(0.25, "rgba(255,255,255,0.12)");
+      glass.addColorStop(0.55, "rgba(255,255,255,0.03)");
+      glass.addColorStop(0.70, "rgba(0,0,0,0.08)");
+      glass.addColorStop(0.88, "rgba(0,0,0,0.18)");
+      glass.addColorStop(1.00, "rgba(0,0,0,0.28)");
+      cache.set(glassKey, glass);
+    }
+    return glass;
+  }
+
+  function drawEqualizerPeak(
+    ctx,
+    x,
+    top,
+    width,
+    height,
+    levelNorm,
+    peakNorm,
+    style
+  ) {
+    if (
+      !CONFIG.display.showPeaks ||
+      STATE.hasStreamObject !== true
+    ) return;
+
+    const level = clamp(levelNorm, 0, 1);
+    const effectivePeak = Math.max(
+      level,
+      clamp(peakNorm, 0, 1)
+    );
+    const fillTop =
+      top + height - Math.round(level * height);
+    let peakY = Math.round(
+      top + height - effectivePeak * height
+    );
+    let peakH = Math.max(2, Math.round(width * 0.10));
+
+    if (style === "segment") {
+      const segment = getVerticalSegmentMetrics(width);
+      const segmentGap = segment.gap;
+      const segmentH = segment.height;
+      const segmentStep = segment.step;
+      const peakFromBottom = Math.max(
+        segmentH,
+        top + height - peakY
+      );
+      const peakSegmentIndex = Math.max(
+        1,
+        Math.ceil(peakFromBottom / segmentStep)
+      );
+      peakY =
+        top + height -
+        peakSegmentIndex * segmentStep +
+        segmentGap;
+      peakH = segmentH;
+
+      // Keep the indicator in the first free segment above the live fill.
+      // This prevents the active colour from visually merging with, or
+      // appearing above, the held peak.
+      let highestActiveY = null;
+      for (
+        let y = top + height - segmentH;
+        y >= top;
+        y -= segmentStep
+      ) {
+        if (y + segmentH >= fillTop) {
+          highestActiveY = y;
+        } else {
+          break;
+        }
+      }
+      if (highestActiveY !== null) {
+        peakY = Math.min(
+          peakY,
+          highestActiveY - segmentStep
+        );
+      }
+    } else {
+      // The complete peak marker stays above the live fill, even when the
+      // held peak and current level have the same value.
+      peakY = Math.min(
+        peakY,
+        fillTop - Math.ceil(peakH / 2)
+      );
+    }
+    ctx.save();
+    ctx.fillStyle = ACTIVE_THEME.colors.peak;
+    const drawY =
+      style === "segment"
+        ? Math.max(top, peakY)
+        : Math.max(top, peakY - peakH / 2);
+    ctx.fillRect(x, drawY, width, peakH);
+    ctx.restore();
+  }
+
+  function getVerticalAudioPeakNorm(
+    levelNorm,
+    heldPeakNorm,
+    height,
+    stateKey
+  ) {
+    if (!STATE.render) STATE.render = {};
+    if (!STATE.render.verticalAudioPeak) {
+      STATE.render.verticalAudioPeak = {};
+    }
+
+    const bucket = STATE.render.verticalAudioPeak;
+    if (STATE.hasStreamObject !== true) {
+      delete bucket[stateKey];
+      return clamp(levelNorm, 0, 1);
+    }
+
+    const pixelNorm = 1 / Math.max(1, height);
+    const live = clamp(levelNorm, 0, 1);
+    const held = clamp(heldPeakNorm, 0, 1);
+    const atVisualFloor =
+      live <= 0.5 * pixelNorm &&
+      held <= 0.5 * pixelNorm;
+
+    const state = (
+      bucket[stateKey] ??= {
+        pos: live,
+        vel: 0,
+        lastPeak: held
+      }
+    );
+
+    const base = atVisualFloor
+      ? 0
+      : Math.min(
+          1,
+          live + pixelNorm
+        );
+    const throwNorm = 8 * pixelNorm;
+    const isNewPeak =
+      held > state.lastPeak + 0.5 * pixelNorm;
+    const target = isNewPeak
+      ? Math.min(1, held + throwNorm)
+      : base;
+
+    state.lastPeak = held;
+
+    const RETURN = 0.28;
+    const DAMPING = 0.78;
+    const delta = target - state.pos;
+
+    if (delta > 0) {
+      state.pos = Math.min(1, target);
+      state.vel = 0;
+    } else {
+      state.vel += (base - state.pos) * RETURN;
+      state.vel *= DAMPING;
+      state.pos += state.vel;
+    }
+
+    state.pos = Math.max(base, Math.min(1, state.pos));
+    return state.pos;
+  }
+
+  function renderEqualizerBand(
+    ctx,
+    x,
+    top,
+    width,
+    height,
+    levelNorm,
+    peakNorm,
+    style,
+    gradient,
+    meterMode = 0
+  ) {
+    const level = clamp(levelNorm, 0, 1);
+    const fillHeight = Math.round(height * level);
+    const fillTop = top + height - fillHeight;
+    const glow = CONFIG.display.glowIntensity > 0;
+    const shellRadius = Math.max(2, Math.min(width * 0.42, 7));
+    // Only the glass styles tint their inactive shell dynamically.
+    let tintColor = null;
+    if (
+      fillHeight > 0 &&
+      (
+        style === "pillars" ||
+        style === "beveled3d" ||
+        style === "glasstube"
+      )
+    ) {
+      const tintPalette = buildBarsGradient(meterMode, 256).colors;
+      tintColor = tintPalette[
+        Math.max(
+          0,
+          Math.min(
+            tintPalette.length - 1,
+            Math.round(level * (tintPalette.length - 1))
+          )
+        )
+      ];
+    }
+
+    const drawGradientGlowRect = (
+      gx,
+      gy,
+      gw,
+      gh,
+      blur = 4,
+      alpha = 0.16
+    ) => {
+      if (!glow || gw <= 0 || gh <= 0) return;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.filter = `blur(${blur}px)`;
+      ctx.fillStyle = gradient;
+      ctx.fillRect(gx, gy, gw, gh);
+      ctx.restore();
+    };
+
+    const drawGradientGlowPath = (
+      path,
+      blur = 4,
+      alpha = 0.18
+    ) => {
+      if (!glow || !path || fillHeight <= 0) return;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.filter = `blur(${blur}px)`;
+      ctx.fillStyle = gradient;
+      ctx.fill(path);
+      ctx.restore();
+    };
+
+    if (style === "segment") {
+      const segment = getVerticalSegmentMetrics(width);
+      const segmentGap = segment.gap;
+      const segmentH = segment.height;
+      const step = segment.step;
+      for (let y = top + height - segmentH; y >= top; y -= step) {
+        const active = y + segmentH >= fillTop;
+
+        if (active && glow) {
+          ctx.save();
+          ctx.fillStyle = gradient;
+          ctx.globalAlpha = 0.35;
+          ctx.fillRect(
+            x - 1,
+            y - 1,
+            width + 2,
+            segmentH + 2
+          );
+          ctx.globalAlpha = 0.14;
+          ctx.fillRect(
+            x - 2,
+            y - 2,
+            width + 4,
+            segmentH + 4
+          );
+          ctx.restore();
+        }
+
+        // Exact glass/emboss profile from the horizontal segmented renderer.
+        // The static glass is painted first and remains strictly inside the
+        // segment, so it cannot produce an external shadow.
+        ctx.fillStyle = getEqualizerSegmentGlass(ctx, y, segmentH);
+        ctx.fillRect(x, y, width, segmentH);
+
+        // Match renderSegment exactly: active fill is painted over the glass,
+        // therefore the coloured segment itself is not embossed.
+        if (active) {
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(x, y, width, segmentH);
+          ctx.clip();
+          ctx.fillStyle = gradient;
+          ctx.fillRect(x, top, width, height);
+          ctx.restore();
+        }
+      }
+    } else if (style === "circledots" || style === "matrixdots") {
+      const dot = getVerticalDotMetrics(width, height, style);
+      const cols = dot.cols;
+      const dotGap = dot.columnGap;
+      const dotR = dot.radius;
+      const stepY = dot.stepY;
+      const totalDotsW = cols * dotR * 2 + (cols - 1) * dotGap;
+      const startX = x + (width - totalDotsW) / 2 + dotR;
+
+      for (let cy = top + height - dotR; cy >= top + dotR; cy -= stepY) {
+        if (cy - dotR < fillTop) continue;
+        for (let col = 0; col < cols; col++) {
+          const cx = startX + col * (dotR * 2 + dotGap);
+          if (glow) {
+            ctx.save();
+            ctx.globalAlpha =
+              style === "matrixdots" ? 0.70 : 0.54;
+            ctx.filter = "blur(6px)";
+            ctx.fillStyle = gradient;
+            ctx.beginPath();
+            ctx.arc(cx, cy, dotR, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+          }
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(cx, cy, dotR, 0, Math.PI * 2);
+          ctx.clip();
+          ctx.fillStyle = gradient;
+          ctx.fillRect(x, top, width, height);
+          ctx.restore();
+        }
+      }
+    } else if (style === "pillars") {
+      // Full vertical glass wedge: point at the floor, widening upwards.
+      if (fillHeight > 0) {
+        const halfActiveWidth =
+          (fillHeight / height) * (width / 2);
+        const activePillar = new Path2D();
+        activePillar.moveTo(x + width / 2, top + height);
+        activePillar.lineTo(
+          x + width / 2 - halfActiveWidth,
+          fillTop
+        );
+        activePillar.lineTo(
+          x + width / 2 + halfActiveWidth,
+          fillTop
+        );
+        activePillar.closePath();
+        drawGradientGlowPath(activePillar, 7, 0.48);
+      }
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(x + width / 2, top + height);
+      ctx.lineTo(x, top);
+      ctx.lineTo(x + width, top);
+      ctx.closePath();
+      ctx.clip();
+      ctx.fillStyle = "rgba(80,80,80,0.20)";
+      ctx.fillRect(x, top, width, height);
+      if (fillHeight > 0) {
+        ctx.globalAlpha = 0.05 + level * 0.10;
+        ctx.fillStyle = tintColor;
+        ctx.fillRect(x, top, width, height);
+        ctx.globalAlpha = 1;
+      }
+      if (fillHeight > 0) {
+        ctx.fillStyle = gradient;
+        ctx.fillRect(x, fillTop, width, fillHeight);
+      }
+      const glass = ctx.createLinearGradient(x, 0, x + width, 0);
+      glass.addColorStop(0, "rgba(0,0,0,0.30)");
+      glass.addColorStop(0.24, "rgba(255,255,255,0.24)");
+      glass.addColorStop(0.72, "rgba(255,255,255,0.06)");
+      glass.addColorStop(1, "rgba(0,0,0,0.34)");
+      ctx.fillStyle = glass;
+      ctx.fillRect(x, top, width, height);
+      ctx.restore();
+    } else if (style === "beveled3d") {
+      const inset = Math.max(2, Math.round(width * 0.18));
+      const bevelRadius = Math.max(
+        2,
+        Math.min(3.5, width * 0.22)
+      );
+
+      // Outer glass shell.
+      ctx.save();
+      ctx.beginPath();
+      ctx.roundRect(x, top, width, height, bevelRadius);
+      ctx.clip();
+      ctx.fillStyle = "rgba(70,70,70,0.18)";
+      ctx.fillRect(x, top, width, height);
+      if (fillHeight > 0) {
+        ctx.globalAlpha = 0.06 + level * 0.22;
+        ctx.fillStyle = tintColor;
+        ctx.fillRect(x, top, width, height);
+        ctx.globalAlpha = 1;
+      }
+      const shell = ctx.createLinearGradient(x, 0, x + width, 0);
+      shell.addColorStop(0, "rgba(0,0,0,0.42)");
+      shell.addColorStop(0.20, "rgba(255,255,255,0.34)");
+      shell.addColorStop(0.55, "rgba(255,255,255,0.10)");
+      shell.addColorStop(1, "rgba(0,0,0,0.45)");
+      ctx.fillStyle = shell;
+      ctx.fillRect(x, top, width, height);
+      ctx.restore();
+
+      // Inner coloured core.
+      if (fillHeight > 0) {
+        const innerX = x + inset;
+        const innerW = Math.max(2, width - inset * 2);
+        const innerTop = Math.max(top + inset, fillTop);
+        const innerBottom = top + height - inset;
+        if (innerBottom > innerTop) {
+          drawGradientGlowRect(
+            innerX,
+            innerTop,
+            innerW,
+            innerBottom - innerTop,
+            8,
+            0.52
+          );
+          ctx.save();
+          ctx.beginPath();
+          ctx.roundRect(
+            innerX,
+            innerTop,
+            innerW,
+            innerBottom - innerTop,
+            Math.max(1.5, bevelRadius - inset * 0.35)
+          );
+          ctx.clip();
+          ctx.fillStyle = gradient;
+          ctx.fillRect(innerX, top, innerW, height);
+          const liquidLight = ctx.createLinearGradient(innerX, 0, innerX + innerW, 0);
+          liquidLight.addColorStop(0, "rgba(255,255,255,0.38)");
+          liquidLight.addColorStop(0.40, "rgba(255,255,255,0.10)");
+          liquidLight.addColorStop(1, "rgba(0,0,0,0.26)");
+          ctx.fillStyle = liquidLight;
+          ctx.fillRect(innerX, innerTop, innerW, innerBottom - innerTop);
+          ctx.restore();
+        }
+      }
+
+      ctx.strokeStyle = "rgba(255,255,255,0.42)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.roundRect(
+        x + 0.5,
+        top + 0.5,
+        width - 1,
+        height - 1,
+        bevelRadius
+      );
+      ctx.stroke();
+    } else if (style === "glasstube") {
+      // Translucent tube body remains visible even at silence.
+      ctx.save();
+      ctx.beginPath();
+      ctx.roundRect(x, top, width, height, shellRadius);
+      ctx.clip();
+      ctx.fillStyle = "rgba(70,70,70,0.18)";
+      ctx.fillRect(x, top, width, height);
+      if (fillHeight > 0) {
+        ctx.globalAlpha = 0.08 + level * 0.16;
+        ctx.fillStyle = tintColor;
+        ctx.fillRect(x, top, width, height);
+        ctx.globalAlpha = 1;
+      }
+
+      if (fillHeight > 0) {
+        ctx.restore();
+        drawGradientGlowRect(
+          x,
+          fillTop,
+          width,
+          fillHeight,
+          8,
+          0.52
+        );
+        ctx.save();
+        ctx.beginPath();
+        ctx.roundRect(x, top, width, height, shellRadius);
+        ctx.clip();
+        ctx.globalAlpha = 0.92;
+        ctx.fillStyle = gradient;
+        ctx.fillRect(x, fillTop, width, fillHeight);
+        ctx.globalAlpha = 1;
+      }
+
+      const tubeGlass = ctx.createLinearGradient(x, 0, x + width, 0);
+      tubeGlass.addColorStop(0, "rgba(0,0,0,0.36)");
+      tubeGlass.addColorStop(0.18, "rgba(255,255,255,0.40)");
+      tubeGlass.addColorStop(0.42, "rgba(255,255,255,0.12)");
+      tubeGlass.addColorStop(0.78, "rgba(255,255,255,0.04)");
+      tubeGlass.addColorStop(1, "rgba(0,0,0,0.38)");
+      ctx.fillStyle = tubeGlass;
+      ctx.fillRect(x, top, width, height);
+      ctx.restore();
+
+      ctx.strokeStyle = "rgba(255,255,255,0.44)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.roundRect(x + 0.5, top + 0.5, width - 1, height - 1, shellRadius);
+      ctx.stroke();
+    } else {
+      // Simple vertical bar.
+      if (fillHeight > 0) {
+        drawGradientGlowRect(
+          x,
+          fillTop,
+          width,
+          fillHeight,
+          7,
+          0.44
+        );
+        ctx.save();
+        ctx.fillStyle = gradient;
+        ctx.fillRect(x, fillTop, width, fillHeight);
+        ctx.restore();
+      }
+    }
+
+    drawEqualizerPeak(
+      ctx,
+      x,
+      top,
+      width,
+      height,
+      levelNorm,
+      peakNorm,
+      style
+    );
+  }
+
+  function renderEqualizer(ctx, canvas, barStyle) {
+    const renderedWidth = getCanvasRenderedWidth(canvas);
+    const width =
+      renderedWidth > 40 ? renderedWidth : getCanvasLogicalWidth(canvas);
+    const desiredHeight = 100;
+
+    if (
+      getCanvasLogicalWidth(canvas) !== width ||
+      getCanvasLogicalHeight(canvas) !== desiredHeight
+    ) {
+      resizeCanvasIfNeeded(canvas, width, desiredHeight);
+      STATE.dom.ctx = canvas.getContext("2d");
+      ctx = STATE.dom.ctx;
+      applyCanvasHiDpiTransform(canvas);
+    }
+
+    const height = getCanvasLogicalHeight(canvas);
+    ctx.clearRect(0, 0, width, height);
+
+    const sidePad = 5;
+    const showValues =
+      CONFIG.display.showReadouts &&
+      STATE.hasStreamObject === true;
+    const topPad = 0;
+    const labelH = 11;
+    const gap = 3;
+    const drawingW = Math.max(1, width - sidePad * 2);
+    const bandW = Math.max(
+      6,
+      (drawingW - gap * (EQ_BAND_COUNT - 1)) / EQ_BAND_COUNT
+    );
+    const groupW = bandW * EQ_BAND_COUNT + gap * (EQ_BAND_COUNT - 1);
+    const startX = (width - groupW) / 2;
+    const meterH = height - labelH;
+    const eq = STATE.levels.equalizer;
+    const fontSource = STATE.dom.labels?.left || STATE.dom.title;
+    const inheritedFont = fontSource
+      ? getCanvasFontStyle(fontSource)
+      : null;
+    const fontFamily =
+      inheritedFont?.fontFamily || "sans-serif";
+    const fontWeight =
+      inheritedFont?.fontWeight || "600";
+    const verticalGradient = createEqualizerGradient(
+      ctx,
+      startX,
+      topPad,
+      groupW,
+      meterH
+    );
+
+    for (let i = 0; i < EQ_BAND_COUNT; i++) {
+      const x = startX + i * (bandW + gap);
+      renderEqualizerBand(
+        ctx,
+        x,
+        topPad,
+        bandW,
+        meterH,
+        eq.values[i] || 0,
+        eq.peaks[i] || 0,
+        barStyle,
+        verticalGradient
+      );
+
+      if (showValues) {
+        const db = eq.dbValues[i];
+        const valueText =
+          Number.isFinite(db) && db > -99
+            ? String(Math.round(db))
+            : "–";
+        const displayedValue = getThrottledCanvasReadout(
+          "equalizer16",
+          i,
+          valueText
+        );
+        ctx.save();
+        ctx.fillStyle = "#ffffff";
+        ctx.globalAlpha = 0.95;
+        ctx.font = `${fontWeight} 7px ${fontFamily}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        ctx.shadowColor = "rgba(0,0,0,0.95)";
+        ctx.shadowBlur = 4;
+        ctx.shadowOffsetY = 1;
+        ctx.fillText(
+          displayedValue,
+          x + bandW / 2,
+          2
+        );
+        ctx.restore();
+      }
+    }
+
+    // One compact label per band; typography follows the active FM-DX theme.
+    ctx.save();
+    ctx.fillStyle = "#ffffff";
+    ctx.globalAlpha = 0.92;
+    ctx.font = `${fontWeight} 7px ${fontFamily}`;
+    ctx.textBaseline = "bottom";
+    ctx.shadowColor = "rgba(0,0,0,0.95)";
+    ctx.shadowBlur = 2;
+
+    EQ_BAND_LABELS.forEach((label, index) => {
+      const labelX =
+        startX + index * (bandW + gap) + bandW / 2;
+      ctx.textAlign = "center";
+      ctx.fillText(label, labelX, height - 1);
+    });
+    ctx.restore();
+  }
+
+  // Fine spectrum detail shares the existing FFT snapshot and audio cadence.
+  function updateSpectrumDetail(eq, audio, now, deltaSeconds, readSpectrum) {
+    const count = (EQ_BAND_COUNT - 1) * 8 + 1;
+    const left = audio.dataEqualizerLeft;
+    const right = audio.dataEqualizerRight;
+    if (!left || !right) return;
+    let detail = eq.detail;
+    if (!detail || detail.source !== left) {
+      detail = eq.detail = {
+        source: left, values: new Float32Array(count),
+        targets: new Float32Array(count), peaks: new Float32Array(count),
+        hold: new Float64Array(count)
+      };
+    }
+    const analyser = audio.analyserEqualizerLeft;
+    const nyquist = (audio.context?.sampleRate || 48000) / 2;
+    const bins = Math.min(left.length, right.length);
+    const minDb = analyser.minDecibels;
+    const maxDb = analyser.maxDecibels;
+    if (readSpectrum) {
+      for (let i = 0; i < count; i++) {
+        const position = i / 8;
+        const band = Math.min(EQ_BAND_COUNT - 2, Math.floor(position));
+        const mix = position - band;
+        const frequency = EQ_CENTER_FREQUENCIES[band] *
+          Math.pow(EQ_CENTER_FREQUENCIES[band + 1] / EQ_CENTER_FREQUENCIES[band], mix);
+        const bin = frequency / nyquist * bins;
+        let byte = 0;
+        if (bin <= bins - 1) {
+          const lo = Math.max(0, Math.floor(bin));
+          const hi = Math.min(bins - 1, lo + 1);
+          const a = (left[lo] + right[lo]) * 0.5;
+          const b = (left[hi] + right[hi]) * 0.5;
+          byte = a + (b - a) * (bin - lo);
+        }
+        const db = clamp(minDb + byte / 255 * (maxDb - minDb) + CONFIG.audio.dbGain, minDb, maxDb);
+        const gain = EQ_PREAMP_GAINS[band] + (EQ_PREAMP_GAINS[band + 1] - EQ_PREAMP_GAINS[band]) * mix;
+        const floor = EQ_FLOOR_LEVELS[band] + (EQ_FLOOR_LEVELS[band + 1] - EQ_FLOOR_LEVELS[band]) * mix;
+        const scaled = (clamp(db, minDb, -30) - minDb) / (-30 - minDb) * 255 * gain;
+        const target = Math.pow(clamp((scaled - floor) / (255 - floor), 0, 1), 1 / EQ_SENSITIVITY);
+        if (Math.abs(target - detail.targets[i]) >= EQ_HYSTERESIS) detail.targets[i] = target;
+      }
+    }
+    const frameScale = Math.max(0.01, deltaSeconds * 60);
+    const attack = 1 - Math.pow(1 - (0.08 + CONFIG.audio.attackSpeed * 0.42), frameScale);
+    const release = 1 - Math.pow(1 - (0.015 + CONFIG.audio.releaseSpeed * 0.12), frameScale);
+    for (let i = 0; i < count; i++) {
+      const previous = detail.values[i];
+      const target = detail.targets[i];
+      const next = previous + (target - previous) * (target > previous ? attack : release);
+      detail.values[i] = next < 0.008 ? 0 : next;
+      if (next >= detail.peaks[i]) {
+        detail.peaks[i] = next;
+        detail.hold[i] = now + CONFIG.audio.peakHoldMs;
+      } else if (now >= detail.hold[i]) {
+        detail.peaks[i] = Math.max(next, detail.peaks[i] -
+          (0.15 + CONFIG.audio.releaseSpeed * 0.55) * deltaSeconds);
+      }
+    }
+  }
+
+  // Relief is derived from local FFT peaks/slopes, never decorative stripes.
+  function drawSpectrumRelief(ctx, traceFill, firstX, lastX, top, height, values) {
+    const colors = ACTIVE_THEME.colors;
+    const accent = colors.accent || colors.high;
+    const key = `${colors.low}|${accent}`;
+    let cached = SPECTRUM_RELIEF_CACHE.get(ctx);
+    if (!cached || cached.key !== key) {
+      const makeStamp = (color) => {
+        const stamp = document.createElement("canvas");
+        stamp.width = 4; stamp.height = 128;
+        const paint = stamp.getContext("2d");
+        paint.fillStyle = color;
+        paint.fillRect(0, 0, 4, 128);
+        paint.globalCompositeOperation = "destination-in";
+        const fade = paint.createLinearGradient(0, 0, 0, 128);
+        fade.addColorStop(0, "rgba(0,0,0,0.9)");
+        fade.addColorStop(0.18, "rgba(0,0,0,0.65)");
+        fade.addColorStop(0.58, "rgba(0,0,0,0.16)");
+        fade.addColorStop(1, "rgba(0,0,0,0)");
+        paint.fillStyle = fade;
+        paint.fillRect(0, 0, 4, 128);
+        return stamp;
+      };
+      cached = { key, light: makeStamp(accent), dark: makeStamp(colors.low) };
+      SPECTRUM_RELIEF_CACHE.set(ctx, cached);
+    }
+    const dx = (lastX - firstX) / Math.max(1, values.length - 1);
+    const baseline = top + height;
+    ctx.save();
+    ctx.clip(traceFill);
+    for (let i = 0; i < values.length; i++) {
+      const level = clamp(values[i] || 0, 0, 1);
+      if (level < 0.008) continue;
+      const left = values[Math.max(0, i - 1)] || 0;
+      const right = values[Math.min(values.length - 1, i + 1)] || 0;
+      const slope = right - left;
+      const crest = Math.max(0, level - (left + right) * 0.5);
+      const x = firstX + i * dx;
+      const y = baseline - level * height;
+      // Vertical illumination drops from the trace. Adjacent rising/falling
+      // slopes form moving highlight/shadow pairs as spectral peaks change.
+      ctx.globalAlpha = Math.min(0.75, 0.10 + level * 0.30 + Math.max(0, slope) * 2.8 + crest * 3);
+      ctx.drawImage(cached.light, x - dx * 0.5, y, dx + 0.3, level * height);
+      ctx.globalAlpha = Math.min(0.72, Math.max(0, -slope) * 4 + crest * 1.4);
+      if (ctx.globalAlpha > 0.01) {
+        ctx.drawImage(cached.dark, x, y, Math.max(0.6, dx * 0.65), level * height * 0.92);
+      }
+    }
+    ctx.restore();
+  }
+
+  function renderEqualizerSpectrum(ctx, canvas) {
+    const renderedWidth = getCanvasRenderedWidth(canvas);
+    const width =
+      renderedWidth > 40 ? renderedWidth : getCanvasLogicalWidth(canvas);
+    const desiredHeight = 100;
+
+    if (
+      getCanvasLogicalWidth(canvas) !== width ||
+      getCanvasLogicalHeight(canvas) !== desiredHeight
+    ) {
+      resizeCanvasIfNeeded(canvas, width, desiredHeight);
+      STATE.dom.ctx = canvas.getContext("2d");
+      ctx = STATE.dom.ctx;
+      applyCanvasHiDpiTransform(canvas);
+    }
+
+    const height = getCanvasLogicalHeight(canvas);
+    ctx.clearRect(0, 0, width, height);
+
+    const sidePad = 5;
+    const gap = 3;
+    const labelH = 11;
+    const top = 0;
+    const plotH = height - labelH;
+    const baseline = top + plotH;
+    const drawingW = Math.max(1, width - sidePad * 2);
+    const bandW = Math.max(
+      6,
+      (drawingW - gap * (EQ_BAND_COUNT - 1)) /
+        EQ_BAND_COUNT
+    );
+    const groupW =
+      bandW * EQ_BAND_COUNT +
+      gap * (EQ_BAND_COUNT - 1);
+    const startX = (width - groupW) / 2;
+    const endX = startX + groupW;
+    const eq = STATE.levels.equalizer;
+    const gradient = createEqualizerGradient(
+      ctx,
+      startX,
+      top,
+      groupW,
+      plotH
+    );
+
+    const pointX = (index) =>
+      startX + index * (bandW + gap) + bandW / 2;
+    const levelY = (value) =>
+      baseline - clamp(value || 0, 0, 1) * plotH;
+
+    const traceValues = eq.detail?.values || eq.values;
+    const tracePeaks = eq.detail?.peaks || eq.peaks;
+    const traceX = (index) => pointX(0) +
+      index / Math.max(1, traceValues.length - 1) * (pointX(EQ_BAND_COUNT - 1) - pointX(0));
+
+    const traceFill = new Path2D();
+    traceFill.moveTo(startX, baseline);
+    traceFill.lineTo(traceX(0), levelY(traceValues[0]));
+    for (let i = 1; i < traceValues.length; i++) {
+      traceFill.lineTo(traceX(i), levelY(traceValues[i]));
+    }
+    traceFill.lineTo(endX, baseline);
+    traceFill.closePath();
+
+    if (CONFIG.display.glowIntensity > 0) {
+      ctx.save();
+      ctx.globalAlpha =
+        0.48 * CONFIG.display.glowIntensity;
+      ctx.filter = "blur(7px)";
+      ctx.fillStyle = gradient;
+      ctx.fill(traceFill);
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.globalAlpha = 0.30;
+    ctx.fillStyle = gradient;
+    ctx.fill(traceFill);
+    ctx.restore();
+
+    drawSpectrumRelief(
+      ctx, traceFill, pointX(0), pointX(EQ_BAND_COUNT - 1), top, plotH, traceValues
+    );
+
+    const traceLine = new Path2D();
+    traceLine.moveTo(traceX(0), levelY(traceValues[0]));
+    for (let i = 1; i < traceValues.length; i++) {
+      traceLine.lineTo(traceX(i), levelY(traceValues[i]));
+    }
+
+    ctx.save();
+    ctx.lineWidth = 1.6;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.strokeStyle = gradient;
+    ctx.stroke(traceLine);
+    ctx.restore();
+
+    if (
+      CONFIG.display.showPeaks &&
+      STATE.hasStreamObject === true
+    ) {
+      const peakLine = new Path2D();
+      peakLine.moveTo(traceX(0), levelY(tracePeaks[0]));
+      for (let i = 1; i < tracePeaks.length; i++) {
+        peakLine.lineTo(traceX(i), levelY(tracePeaks[i]));
+      }
+      ctx.save();
+      ctx.lineWidth = 1.35;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.strokeStyle = ACTIVE_THEME.colors.peak;
+      ctx.stroke(peakLine);
+      ctx.restore();
+    }
+
+    const fontSource = STATE.dom.labels?.left || STATE.dom.title;
+    const inheritedFont = fontSource
+      ? getCanvasFontStyle(fontSource)
+      : null;
+    const fontFamily =
+      inheritedFont?.fontFamily || "sans-serif";
+    const fontWeight =
+      inheritedFont?.fontWeight || "600";
+
+    if (
+      CONFIG.display.showReadouts &&
+      STATE.hasStreamObject === true
+    ) {
+      for (let i = 0; i < EQ_BAND_COUNT; i++) {
+        const db = eq.dbValues[i];
+        const valueText =
+          Number.isFinite(db) && db > -99
+            ? String(Math.round(db))
+            : "–";
+        const displayedValue = getThrottledCanvasReadout(
+          "equalizer16:spectrum",
+          i,
+          valueText
+        );
+        ctx.save();
+        ctx.fillStyle = "#ffffff";
+        ctx.globalAlpha = 0.95;
+        ctx.font = `${fontWeight} 7px ${fontFamily}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        ctx.shadowColor = "rgba(0,0,0,0.95)";
+        ctx.shadowBlur = 4;
+        ctx.shadowOffsetY = 1;
+        ctx.fillText(displayedValue, pointX(i), 2);
+        ctx.restore();
+      }
+    }
+
+    ctx.save();
+    ctx.fillStyle = "#ffffff";
+    ctx.globalAlpha = 0.92;
+    ctx.textBaseline = "bottom";
+    ctx.textAlign = "center";
+    ctx.shadowColor = "rgba(0,0,0,0.95)";
+    ctx.shadowBlur = 2;
+    ctx.font = `${fontWeight} 8px ${fontFamily}`;
+    EQ_LABEL_ANCHORS.forEach((anchor) => {
+      ctx.fillText(
+        anchor.text,
+        pointX(anchor.index),
+        height - 1
+      );
+    });
+    ctx.restore();
+  }
+
+  function formatSpectrumFrequencyLabel(frequency) {
+    if (frequency >= 1000) {
+      const value = frequency / 1000;
+      return `${Number.isInteger(value) ? value : value.toFixed(2).replace(/0+$/, "").replace(/\.$/, "")}K`;
+    }
+    return String(frequency);
+  }
+
+  function getThrottledCanvasReadout(groupKey, index, nextValue) {
+    if (!STATE.render) STATE.render = {};
+    if (!STATE.render.canvasReadouts) {
+      STATE.render.canvasReadouts = {};
+    }
+
+    const group = (
+      STATE.render.canvasReadouts[groupKey] ??= []
+    );
+    if (
+      group[index] === undefined ||
+      _readoutFrame === 0
+    ) {
+      group[index] =
+        nextValue == null ? "" : String(nextValue);
+    }
+    return group[index];
+  }
+
+  function renderVuHybrid(ctx, canvas, barStyle) {
+    const renderedWidth = getCanvasRenderedWidth(canvas);
+    const width =
+      renderedWidth > 40 ? renderedWidth : getCanvasLogicalWidth(canvas);
+    const desiredHeight = 100;
+
+    if (
+      getCanvasLogicalWidth(canvas) !== width ||
+      getCanvasLogicalHeight(canvas) !== desiredHeight
+    ) {
+      resizeCanvasIfNeeded(canvas, width, desiredHeight);
+      STATE.dom.ctx = canvas.getContext("2d");
+      ctx = STATE.dom.ctx;
+      applyCanvasHiDpiTransform(canvas);
+    }
+
+    const height = getCanvasLogicalHeight(canvas);
+    ctx.clearRect(0, 0, width, height);
+
+    const mode = CONFIG.display.hybridMode;
+    const audioPreset = mode === "audio10";
+    const meterKeys = audioPreset
+      ? ["L", "R", "Q", "A"]
+      : ["L", "R"];
+    const frequencies = audioPreset
+      ? HYBRID_AUDIO_10_FREQUENCIES
+      : HYBRID_STEREO_12_FREQUENCIES;
+    const spectrum = audioPreset
+      ? STATE.levels.hybridAudio10
+      : STATE.levels.hybridStereo12;
+
+    const sidePad = 5;
+    const gap = 3;
+    const labelH = 11;
+    const top = 0;
+    const meterH = height - labelH;
+    const referenceDrawingW = Math.max(1, width - sidePad * 2);
+    const bandW = Math.max(
+      6,
+      (referenceDrawingW - gap * (EQ_BAND_COUNT - 1)) /
+        EQ_BAND_COUNT
+    );
+    const referenceGridW =
+      EQ_BAND_COUNT * bandW +
+      gap * (EQ_BAND_COUNT - 1);
+    const startX = (width - referenceGridW) / 2;
+    const eqStartSlot = audioPreset ? 6 : 4;
+    const eqStartX =
+      startX + eqStartSlot * (bandW + gap);
+    const eqGroupW =
+      frequencies.length * bandW +
+      Math.max(0, frequencies.length - 1) * gap;
+    const showValues =
+      CONFIG.display.showReadouts &&
+      STATE.hasStreamObject === true;
+
+    const fontSource = STATE.dom.labels?.left || STATE.dom.title;
+    const inheritedFont = fontSource
+      ? getCanvasFontStyle(fontSource)
+      : null;
+    const fontFamily =
+      inheritedFont?.fontFamily || "sans-serif";
+    const fontWeight =
+      inheritedFont?.fontWeight || "600";
+
+    const minDb = CONFIG.audio.minDb;
+    const range = CONFIG.audio.maxDb - minDb;
+    const qRaw = clamp(
+      STATE.levels.stereoQuality.smooth,
+      0,
+      STEREO_Q_MAX
+    ) || 0;
+    const audioSmooth = clamp(
+      STATE.levels.audio.smooth,
+      0,
+      255
+    ) || 0;
+    const qDb = mapStereoQualityToDb(qRaw, minDb, range);
+    const qPeakDb = Number.isFinite(
+      STATE.levels.stereoQuality.peakDb
+    )
+      ? STATE.levels.stereoQuality.peakDb
+      : qDb;
+    const audioMapped = mapAudioLevelsToDb(
+      STATE.levels.audio,
+      minDb,
+      range
+    );
+
+    const meterData = {
+      L: {
+        level: fracFromDb(STATE.levels.left.smoothDb, 1),
+        peak: fracFromDb(STATE.levels.left.peakDb, 1),
+        mode: 0,
+        readout: Math.round(clamp(
+          STATE.levels.left.smoothDb,
+          minDb,
+          CONFIG.audio.maxDb
+        ) ?? minDb)
+      },
+      R: {
+        level: fracFromDb(STATE.levels.right.smoothDb, 1),
+        peak: fracFromDb(STATE.levels.right.peakDb, 1),
+        mode: 0,
+        readout: Math.round(clamp(
+          STATE.levels.right.smoothDb,
+          minDb,
+          CONFIG.audio.maxDb
+        ) ?? minDb)
+      },
+      Q: {
+        level: fracFromDb(qDb, 1),
+        peak: fracFromDb(qPeakDb, 1),
+        mode: 2,
+        readout: `${Math.round(qRaw)}%`
+      },
+      A: {
+        level: fracFromDb(audioMapped.audioSmoothDb, 1),
+        peak: 0,
+        mode: 1,
+        readout: `${Math.round((audioSmooth / 255) * 100)}%`
+      }
+    };
+
+    meterData.A.peak = getVerticalAudioPeakNorm(
+      meterData.A.level,
+      fracFromDb(audioMapped.audioPeakDb, 1),
+      meterH,
+      `audio:${Math.round(startX)}:${Math.round(meterH)}`
+    );
+
+    meterKeys.forEach((key, index) => {
+      const x = startX + index * (bandW + gap);
+      const data = meterData[key];
+      const meterGradient = createVerticalMeterGradient(
+        ctx,
+        x,
+        top,
+        bandW,
+        meterH,
+        data.mode,
+        barStyle
+      );
+      renderEqualizerBand(
+        ctx,
+        x,
+        top,
+        bandW,
+        meterH,
+        data.level,
+        data.peak,
+        barStyle,
+        meterGradient,
+        data.mode
+      );
+
+      if (showValues) {
+        const nextReadout = String(data.readout);
+        const displayedReadout = getThrottledCanvasReadout(
+          `${mode}:meters`,
+          index,
+          nextReadout
+        );
+        ctx.save();
+        ctx.fillStyle = "#ffffff";
+        ctx.globalAlpha = 0.95;
+        ctx.font = `${fontWeight} 7px ${fontFamily}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        ctx.shadowColor = "rgba(0,0,0,0.95)";
+        ctx.shadowBlur = 4;
+        ctx.shadowOffsetY = 1;
+        ctx.fillText(
+          displayedReadout,
+          x + bandW / 2,
+          2
+        );
+        ctx.restore();
+      }
+    });
+
+    const spectrumGradient = createEqualizerGradient(
+      ctx,
+      eqStartX,
+      top,
+      eqGroupW,
+      meterH
+    );
+
+    frequencies.forEach((frequency, index) => {
+      const x = eqStartX + index * (bandW + gap);
+      renderEqualizerBand(
+        ctx,
+        x,
+        top,
+        bandW,
+        meterH,
+        spectrum.values[index] || 0,
+        spectrum.peaks[index] || 0,
+        barStyle,
+        spectrumGradient
+      );
+
+      if (showValues) {
+        const db = spectrum.dbValues[index];
+        const valueText =
+          Number.isFinite(db) && db > -99
+            ? String(Math.round(db))
+            : "–";
+        const displayedValue = getThrottledCanvasReadout(
+          `${mode}:equalizer`,
+          index,
+          valueText
+        );
+        ctx.save();
+        ctx.fillStyle = "#ffffff";
+        ctx.globalAlpha = 0.95;
+        ctx.font = `${fontWeight} 7px ${fontFamily}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        ctx.shadowColor = "rgba(0,0,0,0.95)";
+        ctx.shadowBlur = 4;
+        ctx.shadowOffsetY = 1;
+        ctx.fillText(displayedValue, x + bandW / 2, 2);
+        ctx.restore();
+      }
+    });
+
+    ctx.save();
+    ctx.fillStyle = "#ffffff";
+    ctx.globalAlpha = 0.92;
+    ctx.font = `${fontWeight} 7px ${fontFamily}`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "bottom";
+    ctx.shadowColor = "rgba(0,0,0,0.95)";
+    ctx.shadowBlur = 2;
+
+    meterKeys.forEach((key, index) => {
+      const x = startX + index * (bandW + gap);
+      ctx.fillText(key, x + bandW / 2, height - 1);
+    });
+
+    frequencies.forEach((frequency, index) => {
+      const x = eqStartX + index * (bandW + gap);
+      ctx.fillText(
+        formatSpectrumFrequencyLabel(frequency),
+        x + bandW / 2,
+        height - 1
+      );
+    });
+    ctx.restore();
+  }
+
   // METERS RENDERER
+
+  // ─────────────────────────────────────────────────────────
+  // STEREO OSCILLOSCOPE — Float32 L/R waveform, no extra analyser
+  // ─────────────────────────────────────────────────────────
+  function findScopeTrigger(samples) {
+    if (!samples || samples.length < 8) return 0;
+
+    // Positive-going zero crossing in the first half stabilizes the waveform
+    // without adding DSP or a second time-domain buffer.
+    const limit = Math.max(2, Math.floor(samples.length * 0.5));
+    for (let i = 1; i < limit; i++) {
+      if (samples[i - 1] < 0 && samples[i] >= 0) {
+        return i;
+      }
+    }
+    return 0;
+  }
+
+  function createScopeThemeGradient(ctx, x, width) {
+    // Reuse the exact horizontal low→mid→high gradient engine of LR Bars.
+        return createBarsLinearGradient(ctx, width, 0);
+  }
+
+  function getScopeSmoothedSample(samples, index) {
+    if (!samples || !samples.length) return 0;
+
+    const i = Math.max(0, Math.min(samples.length - 1, index));
+    let sum = 0;
+    let count = 0;
+
+    // Small visual-only smoothing, keeping the trace uniform and fluid.
+    for (let k = -2; k <= 2; k++) {
+      const j = i + k;
+      if (j >= 0 && j < samples.length) {
+        sum += samples[j] || 0;
+        count++;
+      }
+    }
+
+    return Math.max(-1, Math.min(1, count ? sum / count : 0));
+  }
+
+  function getScopeGainLinear() {
+    return Math.pow(10, (CONFIG.audio.dbGain || 0) / 20);
+  }
+
+  function getScopeResponseScale(channel) {
+    const levels =
+      channel === "right"
+        ? STATE.levels.right
+        : STATE.levels.left;
+
+    const minDb = CONFIG.audio.minDb;
+    const maxDb = CONFIG.audio.maxDb;
+    const range = Math.max(1, maxDb - minDb);
+
+    const db = clamp(
+      Number.isFinite(levels.smoothDb) ? levels.smoothDb : minDb,
+      minDb,
+      maxDb
+    );
+
+    // The waveform still preserves its real shape, but its visible excursion
+    // follows the same smoothed level response as L/R Bars.
+    const normalized = Math.max(0, Math.min(1, (db - minDb) / range));
+    return 0.48 + normalized * 0.52;
+  }
+
+  function getScopeInstantPeak(samples) {
+    if (!samples || !samples.length) return 0;
+    const gain = getScopeGainLinear();
+    let peak = 0;
+
+    for (let i = 0; i < samples.length; i++) {
+      const v = Math.abs((samples[i] || 0) * gain);
+      if (v > peak) peak = v;
+    }
+
+    return Math.min(1.5, peak);
+  }
+
+  function updateScopePeakHistory(channel, samples, now, historyLength) {
+    const scope = STATE.oscilloscope;
+    if (!scope) return [];
+
+    const isRight = channel === "right";
+    const history = isRight
+      ? scope.peakHistoryRight
+      : scope.peakHistoryLeft;
+
+    const displayKey = isRight ? "peakDisplayRight" : "peakDisplayLeft";
+    const holdKey = isRight ? "peakHoldUntilRight" : "peakHoldUntilLeft";
+
+    const instantPeak = getScopeInstantPeak(samples);
+    let displayed = scope[displayKey] || 0;
+
+    const attack = Math.max(0.01, Math.min(1, CONFIG.audio.attackSpeed));
+    const release = Math.max(0.01, Math.min(1, CONFIG.audio.releaseSpeed));
+
+    if (instantPeak >= displayed) {
+      // Same attack idea as the bars: rise toward the new peak.
+      displayed += (instantPeak - displayed) * attack;
+      scope[holdKey] = now + CONFIG.audio.peakHoldMs;
+    } else if (now >= (scope[holdKey] || 0)) {
+      // After hold expires, release smoothly toward the live signal.
+      displayed += (instantPeak - displayed) * release;
+    }
+
+    if (displayed < 0.001) displayed = 0;
+    scope[displayKey] = displayed;
+
+    history.push(displayed);
+
+    const maxLen = Math.max(32, Math.floor(historyLength));
+    if (history.length > maxLen) {
+      history.splice(0, history.length - maxLen);
+    }
+
+    return history;
+  }
+
+  function getScopeWaveformPoints(
+    samples,
+    trigger,
+    x,
+    yCenter,
+    width,
+    amplitude,
+    channel
+  ) {
+    if (!samples || samples.length < 2 || width <= 1) return [];
+
+    const available = Math.max(2, samples.length - trigger);
+    const count = Math.min(samples.length, available);
+    const gain = getScopeGainLinear();
+    const responseScale = getScopeResponseScale(channel);
+    const points = new Array(count);
+
+    for (let i = 0; i < count; i++) {
+      const idx = trigger + i;
+      let sample = getScopeSmoothedSample(samples, idx);
+      sample *= gain * responseScale;
+      sample = Math.max(-1.15, Math.min(1.15, sample));
+
+      points[i] = {
+        x: x + (i / Math.max(1, count - 1)) * width,
+        y: yCenter - sample * amplitude
+      };
+    }
+
+    return points;
+  }
+
+  function buildScopeLinePath(ctx, points) {
+    if (!points || points.length < 2) return false;
+
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+
+    for (let i = 1; i < points.length; i++) {
+      ctx.lineTo(points[i].x, points[i].y);
+    }
+
+    return true;
+  }
+
+  function buildScopeStepPath(ctx, points) {
+    if (!points || points.length < 2) return false;
+
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+
+    for (let i = 1; i < points.length; i++) {
+      const prev = points[i - 1];
+      const cur = points[i];
+      const midX = (prev.x + cur.x) / 2;
+
+      ctx.lineTo(midX, prev.y);
+      ctx.lineTo(midX, cur.y);
+      ctx.lineTo(cur.x, cur.y);
+    }
+
+    return true;
+  }
+
+  function drawScopeGlowPasses(ctx, points, gradient, activeAlpha) {
+    if (CONFIG.display.glowIntensity <= 0) return;
+
+    const glow = Math.max(0, CONFIG.display.glowIntensity);
+
+    ctx.save();
+    ctx.strokeStyle = gradient;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.globalAlpha = activeAlpha * 0.18;
+    ctx.lineWidth = 8 + glow * 2.4;
+    ctx.filter = `blur(${3 + glow * 2.2}px)`;
+    if (buildScopeLinePath(ctx, points)) ctx.stroke();
+    ctx.restore();
+
+    ctx.save();
+    ctx.strokeStyle = gradient;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.globalAlpha = activeAlpha * 0.28;
+    ctx.lineWidth = 5.5 + glow * 1.15;
+    ctx.filter = `blur(${1.5 + glow * 0.95}px)`;
+    if (buildScopeLinePath(ctx, points)) ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawScopePersistence(ctx, points, gradient, activeAlpha, channel) {
+    const scope = STATE.oscilloscope;
+    const history = channel === "right" ? scope.persistenceRight : scope.persistenceLeft;
+
+    scope.persistenceFrame = (scope.persistenceFrame + 1) % 2;
+    if (scope.persistenceFrame === 0) {
+      const stride = Math.max(1, Math.floor(points.length / 180));
+      const snapshot = [];
+      for (let i = 0; i < points.length; i += stride) snapshot.push({ x: points[i].x, y: points[i].y });
+      history.push(snapshot);
+      if (history.length > 8) history.shift();
+    }
+
+    for (let h = 0; h < history.length; h++) {
+      const age = (h + 1) / history.length;
+      ctx.save();
+      ctx.strokeStyle = gradient;
+      ctx.lineWidth = 1.1 + age * 0.9;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.globalAlpha = activeAlpha * (0.08 + age * 0.22);
+      if (buildScopeLinePath(ctx, history[h])) ctx.stroke();
+      ctx.restore();
+    }
+
+    if (CONFIG.display.glowIntensity > 0) drawScopeGlowPasses(ctx, points, gradient, activeAlpha * 0.72);
+
+    ctx.save();
+    ctx.strokeStyle = gradient;
+    ctx.lineWidth = 2.3;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.globalAlpha = activeAlpha * 1.0;
+    if (buildScopeLinePath(ctx, points)) ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawScopeEnvelope(ctx, points, gradient, activeAlpha, yCenter) {
+    const bucketCount = Math.max(28, Math.min(72, Math.round(points.length / 6)));
+    const bucketSize = Math.max(1, Math.floor(points.length / bucketCount));
+    const upper = [];
+    const lower = [];
+
+    for (let b = 0; b < bucketCount; b++) {
+      const from = b * bucketSize;
+      const to = Math.min(points.length, from + bucketSize);
+      if (from >= points.length) break;
+
+      let maxDeviation = 0;
+      let px = points[from].x;
+      for (let i = from; i < to; i++) {
+        maxDeviation = Math.max(maxDeviation, Math.abs(points[i].y - yCenter));
+        px = points[i].x;
+      }
+      upper.push({ x: px, y: yCenter - maxDeviation });
+      lower.push({ x: px, y: yCenter + maxDeviation });
+    }
+
+    ctx.save();
+    ctx.strokeStyle = gradient;
+    ctx.lineWidth = 1.0;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.globalAlpha = activeAlpha * 0.78;
+    if (buildScopeLinePath(ctx, points)) ctx.stroke();
+    ctx.restore();
+
+    for (const trace of [upper, lower]) {
+      if (CONFIG.display.glowIntensity > 0) {
+        ctx.save();
+        ctx.strokeStyle = gradient;
+        ctx.lineWidth = 4.2;
+        ctx.globalAlpha = activeAlpha * 0.18;
+        ctx.filter = `blur(${1.5 + CONFIG.display.glowIntensity * 0.8}px)`;
+        if (buildScopeLinePath(ctx, trace)) ctx.stroke();
+        ctx.restore();
+      }
+      ctx.save();
+      ctx.strokeStyle = gradient;
+      ctx.lineWidth = 2.25;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.globalAlpha = activeAlpha * 0.98;
+      if (buildScopeLinePath(ctx, trace)) ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+
+  function drawScopeSpindle(ctx, points, gradient, activeAlpha, yCenter) {
+    if (!points || points.length < 8) return;
+
+    // Build a slow amplitude envelope from the real waveform.
+    // This produces the repeated fusiform / AM lobes seen on a real scope.
+    const bucketCount = Math.max(
+      34,
+      Math.min(86, Math.round(points.length / 5))
+    );
+    const bucketSize = Math.max(
+      1,
+      Math.floor(points.length / bucketCount)
+    );
+
+    const envelope = [];
+
+    for (let b = 0; b < bucketCount; b++) {
+      const from = b * bucketSize;
+      const to = Math.min(points.length, from + bucketSize);
+      if (from >= points.length) break;
+
+      let maxDeviation = 0;
+      let x = points[from].x;
+
+      for (let i = from; i < to; i++) {
+        const deviation = Math.abs(points[i].y - yCenter);
+        if (deviation > maxDeviation) {
+          maxDeviation = deviation;
+        }
+        x = points[i].x;
+      }
+
+      envelope.push({
+        x,
+        amp: maxDeviation
+      });
+    }
+
+    if (envelope.length < 3) return;
+
+    // Smooth envelope slightly so each lobe looks spindle-shaped rather
+    // than jagged, while still following the source audio.
+    const smoothEnvelope = envelope.map((item, i) => {
+      let sum = 0;
+      let count = 0;
+
+      for (let k = -2; k <= 2; k++) {
+        const j = i + k;
+        if (j >= 0 && j < envelope.length) {
+          sum += envelope[j].amp;
+          count++;
+        }
+      }
+
+      return {
+        x: item.x,
+        amp: count ? sum / count : item.amp
+      };
+    });
+
+    const upper = smoothEnvelope.map(p => ({
+      x: p.x,
+      y: yCenter - p.amp
+    }));
+    const lower = smoothEnvelope.map(p => ({
+      x: p.x,
+      y: yCenter + p.amp
+    }));
+
+    // Dense carrier strokes inside the envelope. Their varying height creates
+    // the classic AM / spindle appearance rather than a simple outline.
+    const carrierCount = Math.max(
+      70,
+      Math.min(180, Math.round((points[points.length - 1].x - points[0].x) / 2.2))
+    );
+
+    ctx.save();
+    ctx.strokeStyle = gradient;
+    ctx.lineWidth = 0.72;
+    ctx.globalAlpha = activeAlpha * 0.58;
+
+    if (CONFIG.display.glowIntensity > 0) {
+      ctx.shadowColor = ACTIVE_THEME.colors.mid;
+      ctx.shadowBlur = 1 + CONFIG.display.glowIntensity * 0.9;
+    }
+
+    ctx.beginPath();
+
+    for (let i = 0; i < carrierCount; i++) {
+      const t = i / Math.max(1, carrierCount - 1);
+
+      // Interpolate the slow envelope at this x.
+      const ePos = t * (smoothEnvelope.length - 1);
+      const e0 = Math.floor(ePos);
+      const e1 = Math.min(smoothEnvelope.length - 1, e0 + 1);
+      const mix = ePos - e0;
+      const amp =
+        smoothEnvelope[e0].amp * (1 - mix) +
+        smoothEnvelope[e1].amp * mix;
+
+      const x =
+        points[0].x +
+        t * (points[points.length - 1].x - points[0].x);
+
+      // Fast carrier phase with a tiny phase wobble to avoid sterile
+      // computer-perfect lines and resemble a real oscilloscope trace.
+      const carrier =
+        Math.sin(t * Math.PI * 2 * 24 + Math.sin(t * Math.PI * 6) * 0.35);
+
+      const top = yCenter - amp * Math.abs(carrier);
+      const bottom = yCenter + amp * Math.abs(carrier);
+
+      ctx.moveTo(x, top);
+      ctx.lineTo(x, bottom);
+    }
+
+    ctx.stroke();
+    ctx.restore();
+
+    // Envelope outlines stay brighter and define the spindle lobes.
+    if (CONFIG.display.glowIntensity > 0) {
+      for (const trace of [upper, lower]) {
+        ctx.save();
+        ctx.strokeStyle = gradient;
+        ctx.lineWidth = 4.5;
+        ctx.globalAlpha = activeAlpha * 0.14;
+        ctx.filter = `blur(${1.4 + CONFIG.display.glowIntensity * 0.85}px)`;
+        if (buildScopeLinePath(ctx, trace)) ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    for (const trace of [upper, lower]) {
+      ctx.save();
+      ctx.strokeStyle = gradient;
+      ctx.lineWidth = 1.55;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.globalAlpha = activeAlpha * 0.88;
+      if (buildScopeLinePath(ctx, trace)) ctx.stroke();
+      ctx.restore();
+    }
+
+    // Fine centre carrier line, similar to the bright central body seen
+    // in modulated-signal oscilloscope captures.
+    ctx.save();
+    ctx.strokeStyle = gradient;
+    ctx.lineWidth = 0.8;
+    ctx.globalAlpha = activeAlpha * 0.42;
+    if (buildScopeLinePath(ctx, points)) ctx.stroke();
+    ctx.restore();
+  }
+
+
+  function drawScopeWaveform(ctx, samples, trigger, x, yCenter, width, amplitude, channel) {
+    if (!samples || samples.length < 2 || width <= 1) return;
+
+    const points = getScopeWaveformPoints(samples, trigger, x, yCenter, width, amplitude, channel);
+    if (points.length < 2) return;
+
+    const gradient = createScopeThemeGradient(ctx, x, width);
+    const activeAlpha = STATE.hasStreamObject ? 1 : 0.34;
+    const style = CONFIG.display.oscilloscopeStyle || "lines";
+
+    // LINES = former Glow.
+    if (style === "lines") {
+      drawScopeGlowPasses(ctx, points, gradient, activeAlpha);
+      ctx.save();
+      ctx.strokeStyle = gradient;
+      ctx.lineWidth = 3.8;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.globalAlpha = activeAlpha * 0.99;
+      if (buildScopeLinePath(ctx, points)) ctx.stroke();
+      ctx.restore();
+      return;
+    }
+
+    // FILLED: substantially more opaque, close to Spectrum density.
+    if (style === "filled") {
+      if (CONFIG.display.glowIntensity > 0) {
+        ctx.save();
+        ctx.strokeStyle = gradient;
+        ctx.lineWidth = 5.2;
+        ctx.globalAlpha = activeAlpha * 0.25;
+        ctx.filter = `blur(${2 + CONFIG.display.glowIntensity * 1.2}px)`;
+        if (buildScopeLinePath(ctx, points)) ctx.stroke();
+        ctx.restore();
+      }
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, yCenter);
+      for (let i = 0; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y);
+      ctx.lineTo(points[points.length - 1].x, yCenter);
+      ctx.closePath();
+      ctx.fillStyle = gradient;
+      ctx.globalAlpha = activeAlpha * 0.58;
+      ctx.fill();
+      ctx.restore();
+
+      ctx.save();
+      ctx.strokeStyle = gradient;
+      ctx.lineWidth = 2.5;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.globalAlpha = activeAlpha;
+      if (buildScopeLinePath(ctx, points)) ctx.stroke();
+      ctx.restore();
+      return;
+    }
+
+    // DOTS: deliberately larger phosphor dots.
+    if (style === "dots") {
+      const step = Math.max(3, Math.round(points.length / Math.max(30, width / 7)));
+
+      if (CONFIG.display.glowIntensity > 0) {
+        ctx.save();
+        ctx.fillStyle = gradient;
+        ctx.globalAlpha = activeAlpha * 0.25;
+        ctx.filter = `blur(${1.8 + CONFIG.display.glowIntensity}px)`;
+        ctx.beginPath();
+        for (let i = 0; i < points.length; i += step) {
+          ctx.moveTo(points[i].x + 3.4, points[i].y);
+          ctx.arc(points[i].x, points[i].y, 3.4, 0, Math.PI * 2);
+        }
+        ctx.fill();
+        ctx.restore();
+      }
+
+      ctx.save();
+      ctx.fillStyle = gradient;
+      ctx.globalAlpha = activeAlpha;
+      ctx.beginPath();
+      for (let i = 0; i < points.length; i += step) {
+        ctx.moveTo(points[i].x + 2.05, points[i].y);
+        ctx.arc(points[i].x, points[i].y, 2.05, 0, Math.PI * 2);
+      }
+      ctx.fill();
+      ctx.restore();
+      return;
+    }
+
+    // STEPS: fewer, visibly larger sample-and-hold steps.
+    if (style === "steps") {
+      const coarse = [];
+      const targetSteps = Math.max(16, Math.round(width / 18));
+      const stride = Math.max(1, Math.floor(points.length / targetSteps));
+      for (let i = 0; i < points.length; i += stride) coarse.push(points[i]);
+      if (coarse[coarse.length - 1] !== points[points.length - 1]) coarse.push(points[points.length - 1]);
+
+      if (CONFIG.display.glowIntensity > 0) {
+        ctx.save();
+        ctx.strokeStyle = gradient;
+        ctx.lineWidth = 4.2;
+        ctx.globalAlpha = activeAlpha * 0.18;
+        ctx.filter = `blur(${1.5 + CONFIG.display.glowIntensity}px)`;
+        if (buildScopeStepPath(ctx, coarse)) ctx.stroke();
+        ctx.restore();
+      }
+
+      ctx.save();
+      ctx.strokeStyle = gradient;
+      ctx.lineWidth = 2.2;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "square";
+      ctx.globalAlpha = activeAlpha * 0.98;
+      if (buildScopeStepPath(ctx, coarse)) ctx.stroke();
+      ctx.restore();
+      return;
+    }
+
+    if (style === "persistence") {
+      drawScopePersistence(ctx, points, gradient, activeAlpha, channel);
+      return;
+    }
+
+    if (style === "envelope") {
+      drawScopeEnvelope(ctx, points, gradient, activeAlpha, yCenter);
+      return;
+    }
+
+    if (style === "spindle") {
+      drawScopeSpindle(ctx, points, gradient, activeAlpha, yCenter);
+      return;
+    }
+  }
+
+
+  function drawScopePeakHistory(
+    ctx,
+    history,
+    x,
+    yCenter,
+    width,
+    amplitude
+  ) {
+    if (!history || history.length < 2) return;
+
+    ctx.save();
+    ctx.strokeStyle = ACTIVE_THEME.colors.peak;
+    ctx.lineWidth = 1.15;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.globalAlpha = STATE.hasStreamObject ? 0.96 : 0.30;
+
+    if (CONFIG.display.glowIntensity > 0) {
+      ctx.shadowColor = ACTIVE_THEME.colors.peak;
+      ctx.shadowBlur = 2 + CONFIG.display.glowIntensity * 3;
+    }
+
+    ctx.beginPath();
+
+    for (let i = 0; i < history.length; i++) {
+      const norm = Math.max(0, Math.min(1.25, history[i] || 0));
+      const px = x + (i / Math.max(1, history.length - 1)) * width;
+
+      // Independent peak-history line: upper region of each channel lane,
+      // like the held peak line in Spectrum rather than an outline.
+      // Same vertical reference as the main waveform. The held-peak trace
+      // now lives inside the waveform lane rather than floating above it.
+      const py =
+        yCenter -
+        Math.min(1, norm) * amplitude * 0.42;
+
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function renderOscilloscope(ctx, canvas) {
+    const left = STATE.audio.timeLeft;
+    const right = STATE.audio.timeRight;
+    if (!ctx || !canvas || !left || !right) return;
+
+    // Use the full normal canvas area. L/R labels live outside the canvas at
+    // the left, and readouts live at the right edge of the wrapper.
+    const logicalW = getCanvasLogicalWidth(canvas);
+    const targetH = 94;
+
+    if (getCanvasLogicalHeight(canvas) !== targetH) {
+      resizeCanvasIfNeeded(canvas, logicalW, targetH);
+      STATE.dom.ctx = canvas.getContext("2d");
+      ctx = STATE.dom.ctx;
+      applyCanvasHiDpiTransform(canvas);
+    }
+
+    const width = getCanvasLogicalWidth(canvas);
+    const height = getCanvasLogicalHeight(canvas);
+    if (width <= 2 || height <= 2) return;
+
+    ctx.clearRect(0, 0, width, height);
+
+    const padX = 0;
+
+    // EXACT drawable length of normal LR Bars, independent of the user's
+    // stored render mode. This keeps the waveform ending before the readouts.
+    const drawW = Math.max(
+      1,
+      width - CONFIG.display.dimensions.canvasLeft - 26
+    );
+
+    // Two large lanes use almost all available vertical canvas space.
+    const laneGap = 6;
+    const laneH = (height - laneGap) / 2;
+    const topLaneTop = 0;
+    const bottomLaneTop = laneH + laneGap;
+    const topCenter = topLaneTop + laneH * 0.58;
+    const bottomCenter = bottomLaneTop + laneH * 0.58;
+
+    // Much larger excursion than before.
+    const amplitude = laneH * 0.47;
+
+    // Background grid retained.
+    ctx.save();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = ACTIVE_THEME.colors.low;
+    ctx.globalAlpha = 0.20;
+
+    for (let i = 0; i <= 8; i++) {
+      const gx = padX + (drawW * i) / 8;
+      ctx.beginPath();
+      ctx.moveTo(gx, 2);
+      ctx.lineTo(gx, height - 2);
+      ctx.stroke();
+    }
+
+    [topCenter, bottomCenter].forEach(y => {
+      ctx.globalAlpha = 0.32;
+      ctx.beginPath();
+      ctx.moveTo(padX, y);
+      ctx.lineTo(padX + drawW, y);
+      ctx.stroke();
+    });
+
+    ctx.globalAlpha = 0.14;
+    ctx.beginPath();
+    ctx.moveTo(padX, laneH + laneGap / 2);
+    ctx.lineTo(padX + drawW, laneH + laneGap / 2);
+    ctx.stroke();
+    ctx.restore();
+
+    const trigger = findScopeTrigger(left);
+    const now =
+      (typeof performance !== "undefined" && performance.now)
+        ? performance.now()
+        : Date.now();
+
+    drawScopeWaveform(
+      ctx,
+      left,
+      trigger,
+      padX,
+      topCenter,
+      drawW,
+      amplitude,
+      "left"
+    );
+
+    drawScopeWaveform(
+      ctx,
+      right,
+      trigger,
+      padX,
+      bottomCenter,
+      drawW,
+      amplitude,
+      "right"
+    );
+
+    if (CONFIG.display.showPeaks) {
+      const historyLength = Math.max(64, Math.round(drawW / 2));
+
+      const peakLeft = updateScopePeakHistory(
+        "left",
+        left,
+        now,
+        historyLength
+      );
+
+      const peakRight = updateScopePeakHistory(
+        "right",
+        right,
+        now,
+        historyLength
+      );
+
+      drawScopePeakHistory(
+        ctx,
+        peakLeft,
+        padX,
+        topCenter,
+        drawW,
+        amplitude
+      );
+
+      drawScopePeakHistory(
+        ctx,
+        peakRight,
+        padX,
+        bottomCenter,
+        drawW,
+        amplitude
+      );
+    }
+  }
+
+
   function renderMeters() {
+    refreshAutomaticTheme();
+
     const layout = CONFIG.display.layoutMode;
-    const render = CONFIG.display.renderMode;
+    const render =
+      layout === "equalizer" || layout === "vuHybrid" || layout === "oscilloscope" || layout === "visualizer"
+        ? "bars"
+        : CONFIG.display.renderMode;
     const barStyle = CONFIG.display.barStyle;
     const showReadouts = CONFIG.display.showReadouts;
 
@@ -4764,21 +8949,24 @@ function saveAMXPanelGeometry(panel) {
 
     FRAME_GRADIENT_CACHE.clear();
 
-    const visualStateKey = `${layout}|${render}|${barStyle}|${showReadouts}`;
+    const visualStateKey =
+      `${layout}|${render}|${barStyle}|${showReadouts}|${CONFIG.display.hybridMode}|${CONFIG.display.equalizerRenderMode}|${CONFIG.display.oscilloscopeStyle}|${CONFIG.display.visualizerStyle}`;
 
     if (visualStateKey !== _lastVisualStateKey) {
       _lastVisualStateKey = visualStateKey;
+      clearTransientRenderState();
       applyVisualState();
     }
 
     const GaugesRender = (render === "gauges");
+    const AnalogVuRender = (render === "analogVu");
     const BarsRender = (render === "bars");
     const SALayout = (layout === "sa");
     const FullLayout = (layout === "full");
     const useMirrored = (render === "mirrored") && MIRRORED_LAYOUTS.includes(layout);
     const mirrorMetrics = useMirrored ? getMirroredLayoutMetrics() : null;
 
-    const ctx    = STATE.dom.ctx;
+    let ctx    = STATE.dom.ctx;
     const canvas = STATE.dom.canvas;
     if (!ctx || !canvas) return;
 
@@ -4786,8 +8974,25 @@ function saveAMXPanelGeometry(panel) {
     const contentWrapper = STATE.dom.contentWrapper;
     const contentWrapperStyle = contentWrapper ? contentWrapper.style : null;
 
-    const width = canvas.width;
-    if (!width || !canvas.height) return;
+    let width = getCanvasLogicalWidth(canvas);
+    let height = getCanvasLogicalHeight(canvas);
+    if (!width || !height) return;
+
+    // A layout may change the authored CSS width of the shared normal canvas
+    // (Equalizer uses symmetric 5px insets). Synchronize the backing store
+    // before drawing so entry and exit remain geometrically centred.
+    const renderedWidth = getCanvasRenderedWidth(canvas);
+    if (renderedWidth > 40 && Math.abs(renderedWidth - width) > 1) {
+      resizeCanvasIfNeeded(canvas, renderedWidth, height);
+      ctx = canvas.getContext("2d");
+      STATE.dom.ctx = ctx;
+      width = getCanvasLogicalWidth(canvas);
+      height = getCanvasLogicalHeight(canvas);
+    }
+
+    // canvas width/height assignments reset the 2D context state.
+    // Reassert the HiDPI transform before every render pass.
+    applyCanvasHiDpiTransform(canvas);
 
     const leftLevels = STATE.levels.left;
     const rightLevels = STATE.levels.right;
@@ -4797,9 +9002,44 @@ function saveAMXPanelGeometry(panel) {
     const barH  = CONFIG.display.dimensions.barHeight;
     const gap   = CONFIG.display.dimensions.spacing;
 
+    if (MIRRORED_LAYOUTS.includes(layout) && isCircularStyle(render)) {
+      renderCircularMeters(ctx, canvas, layout, render);
+      return;
+    }
+
+    if (layout === "visualizer") {
+      renderVisualizer(ctx, canvas);
+      return;
+    }
+
+    if (layout === "oscilloscope") {
+      renderOscilloscope(ctx, canvas);
+      return;
+    }
+
+    if (layout === "equalizer") {
+      if (CONFIG.display.equalizerRenderMode === "spectrum") {
+        renderEqualizerSpectrum(ctx, canvas);
+      } else {
+        renderEqualizer(ctx, canvas, barStyle);
+      }
+      return;
+    }
+
+    if (layout === "vuHybrid") {
+      renderVuHybrid(ctx, canvas, barStyle);
+      return;
+    }
+
     // GAUGES MODE
     if (GaugesRender) {
       renderGauges(ctx, canvas, layout);
+      return;
+    }
+
+    // ANALOG VU MODE
+    if (AnalogVuRender) {
+      renderAnalogVu(ctx, canvas, layout);
       return;
     }
 
@@ -4811,8 +9051,12 @@ function saveAMXPanelGeometry(panel) {
           ? `translateY(${mirrorMetrics.canvasOffsetY}px)`
           : "";
     
-      if (canvas.height !== mirrorMetrics.singlePanelHeight) {
-        canvas.height = mirrorMetrics.singlePanelHeight;
+      if (getCanvasLogicalHeight(canvas) !== mirrorMetrics.singlePanelHeight) {
+        resizeCanvasIfNeeded(canvas, width, mirrorMetrics.singlePanelHeight);
+        // Intrinsic resize resets all context state. Reassert both the active
+        // context reference and the HiDPI transform before mirrored drawing.
+        STATE.dom.ctx = canvas.getContext("2d");
+        applyCanvasHiDpiTransform(canvas);
       }
       if (canvasStyle.height !== nextHeight) {
         canvasStyle.height = nextHeight;
@@ -4824,7 +9068,7 @@ function saveAMXPanelGeometry(panel) {
         canvasStyle.transform = nextTransform;
       }
 
-      ctx.clearRect(0, 0, width, canvas.height);
+      ctx.clearRect(0, 0, width, getCanvasLogicalHeight(canvas));
 
       const BAR_GAP  = 35;
       const usableW  = Math.floor(width - BAR_GAP);
@@ -4838,6 +9082,9 @@ function saveAMXPanelGeometry(panel) {
 
       if (layout === "full") {
         const qSmoothDb = mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range);
+        const qPeakDb = Number.isFinite(stereoQualityLevels.peakDb)
+          ? stereoQualityLevels.peakDb
+          : qSmoothDb;
         const { audioSmoothDb, audioPeakDb } = mapAudioLevelsToDb(audioLevels, minDb, range);
         const metrics = getFullMirroredMetrics();
         const mirroredBarH = metrics.singleRowHeight;
@@ -4863,7 +9110,7 @@ function saveAMXPanelGeometry(panel) {
         // BOTTOM LEFT (Q mirrored)
         renderMirroredChannel(
           ctx, leftBaseX, true,
-          qSmoothDb, qSmoothDb,
+          qSmoothDb, qPeakDb,
           bottomY, halfW, mirroredBarH, barStyle, 2
         );
 
@@ -4880,11 +9127,15 @@ function saveAMXPanelGeometry(panel) {
       const mirroredBarH = mirrorMetrics.mirroredBarH;
       const mirroredYOffset = mirrorMetrics.mirroredYOffset;
       let qSmoothDb = null;
+      let qPeakDb = null;
       let audioSmoothDb = null;
       let audioPeakDb = null;
 
       if (SALayout) {
         qSmoothDb = mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range);
+        qPeakDb = Number.isFinite(stereoQualityLevels.peakDb)
+          ? stereoQualityLevels.peakDb
+          : qSmoothDb;
 
         const audioMapped = mapAudioLevelsToDb(audioLevels, minDb, range);
         audioSmoothDb = audioMapped.audioSmoothDb;
@@ -4895,7 +9146,7 @@ function saveAMXPanelGeometry(panel) {
       renderMirroredChannel(
         ctx, leftBaseX, true,
         SALayout ? qSmoothDb : leftLevels.smoothDb,
-        SALayout ? qSmoothDb : leftLevels.peakDb,
+        SALayout ? qPeakDb : leftLevels.peakDb,
         mirroredYOffset, halfW, mirroredBarH, barStyle,
         SALayout ? 2 : 0
       );
@@ -4933,7 +9184,7 @@ function saveAMXPanelGeometry(panel) {
         neededHeight
       );
 
-      ctx.clearRect(0, 0, width, canvas.height);
+      ctx.clearRect(0, 0, width, getCanvasLogicalHeight(canvas));
 
       let y = TOP_PAD;
       const fullStep = barH + FULL_GAP;
@@ -4968,9 +9219,12 @@ function saveAMXPanelGeometry(panel) {
 
       // Q — Stereo Quality
       const qSmoothDb = mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range);
+      const qPeakDb = Number.isFinite(stereoQualityLevels.peakDb)
+        ? stereoQualityLevels.peakDb
+        : qSmoothDb;
       renderBarChannelWithMode(
         qSmoothDb,
-        qSmoothDb,
+        qPeakDb,
         y,
         width,
         barH,
@@ -5010,7 +9264,7 @@ function saveAMXPanelGeometry(panel) {
       neededHeight
     );
 
-    ctx.clearRect(0, 0, width, canvas.height);
+    ctx.clearRect(0, 0, width, getCanvasLogicalHeight(canvas));
 
     // L+R channels
     if (layout === "lr") {
@@ -5042,10 +9296,13 @@ function saveAMXPanelGeometry(panel) {
     // Stereo Quality (SA)
     else if (SALayout) {
       const qSmoothDb = mapStereoQualityToDb(stereoQualityLevels.smooth, minDb, range);
+      const qPeakDb = Number.isFinite(stereoQualityLevels.peakDb)
+        ? stereoQualityLevels.peakDb
+        : qSmoothDb;
 
       renderBarChannelWithMode(
         qSmoothDb,
-        qSmoothDb,
+        qPeakDb,
         0,
         width,
         barH,
@@ -5141,19 +9398,34 @@ function saveAMXPanelGeometry(panel) {
   }
 
   function renderGauges(ctx, canvas, layout) {
-    const W = canvas.width;
-    const H = canvas.height;
+    const W = getCanvasLogicalWidth(canvas);
+    const desiredH = Math.max(1, WRAPPER_HEIGHT - 20);
+    if (!W) return;
+
+    if (getCanvasLogicalHeight(canvas) !== desiredH) {
+      resizeCanvasIfNeeded(canvas, W, desiredH);
+      ctx = canvas.getContext("2d");
+    }
+    canvas.style.height = `${desiredH}px`;
+    if (STATE.dom.contentWrapper) {
+      STATE.dom.contentWrapper.style.height = `${WRAPPER_HEIGHT}px`;
+      STATE.dom.contentWrapper.style.minHeight = `${WRAPPER_HEIGHT}px`;
+    }
+
+    const H = desiredH;
+
+    applyCanvasHiDpiTransform(canvas);
 
     const gaugeCount = (layout === "lr" || layout === "sa") ? 2 : (layout === "full") ? 4 : 0;
     if (!gaugeCount) return;
 
     const cellW = W / gaugeCount;
+    const centerFractions = getGaugeCenterFractions(layout);
 
     // Geometry
     const radius = (layout === "full") ? Math.min(W / 2, H) * 0.36 : Math.min(cellW, H) * 0.55;
     const ringWidth = radius * 0.26;
     const centerY   = radius + ringWidth / 2;
-    const gapX = (layout === "full") ? 0 : 10;
 
     // Arc (~241° = visual 120%)
     const startAngle = -Math.PI * 1.17;
@@ -5165,9 +9437,6 @@ function saveAMXPanelGeometry(panel) {
       (startAngle + START_EPS) +
       (arcSpan - START_EPS) * Math.max(0, Math.min(1, f));
 
-    // Shift both gauges as a group (optical centering)
-    const GROUP_SHIFT = -cellW * 0.04;
-
     ctx.clearRect(0, 0, W, H);
 
     for (let i = 0; i < gaugeCount; i++) {
@@ -5175,32 +9444,9 @@ function saveAMXPanelGeometry(panel) {
 
       let cx, cy;
 
-      if (layout === "full" && gaugeCount === 4) {
-
-        // 4 gauges in ONE row
-        const fullCellW = W / 4;
-
-        // optical centering for the whole group
-        const fullGroupShift = -fullCellW * 0.06;
-
-        cx = fullCellW * i + fullCellW / 2 + fullGroupShift;
-        cy = centerY;
-
-        // small spacing like stereo mode
-        if (i === 0 || i === 1) cx -= gapX / 2;
-        if (i === 2 || i === 3) cx += gapX / 2;
-
-      } else {
-
-        cx = cellW * i + cellW / 2 + GROUP_SHIFT;
-
-        if (gaugeCount === 2) {
-          if (i === 0) cx -= gapX / 2;
-          if (i === 1) cx += gapX / 2;
-        }
-
-        cy = centerY;
-      }
+      // Canvas gauges and DOM labels share the exact same normalized centres.
+      cx = centerFractions[i] * W;
+      cy = (layout === "full" && gaugeCount === 4) ? centerY + 8 : centerY;
 
       // EMPTY ARC — GLASS STYLE (always visible)
       ctx.save();
@@ -5241,7 +9487,7 @@ function saveAMXPanelGeometry(panel) {
       if (frac > 0) {
         const valueAngle = fracToAngle(frac);
 
-        const { gradient, glowColor } =
+        const { gradient } =
           buildConicGaugeGradient(
             ctx,
             cx,
@@ -5252,16 +9498,16 @@ function saveAMXPanelGeometry(panel) {
             arcSpan
           );
 
-        // GLOW PASS (shadowBlur, masked)
+        // UNIFIED GRADIENT HALO — active arc only.
         if (CONFIG.display.glowIntensity > 0) {
           ctx.save();
-
-          // Draw blurred arc
           ctx.lineCap = "round";
-          ctx.lineWidth = ringWidth - 5;
+          ctx.lineWidth = ringWidth;
           ctx.strokeStyle = gradient;
-          ctx.shadowBlur  = ringWidth * 1.6 * CONFIG.display.glowIntensity;
-          ctx.shadowColor = glowColor;
+          ctx.globalAlpha =
+            0.52 * CONFIG.display.glowIntensity;
+          ctx.filter =
+            `blur(${Math.max(4, ringWidth * 0.72)}px)`;
 
           ctx.beginPath();
           ctx.arc(
@@ -5272,22 +9518,6 @@ function saveAMXPanelGeometry(panel) {
             valueAngle
           );
           ctx.stroke();
-
-          // Cut inner part so glow doesn't fill the arc
-          ctx.globalCompositeOperation = "destination-out";
-          ctx.shadowBlur = 0;
-          ctx.lineWidth = ringWidth * 0.85;
-
-          ctx.beginPath();
-          ctx.arc(
-            cx,
-            cy,
-            radius,
-            startAngle + START_EPS,
-            valueAngle
-          );
-          ctx.stroke();
-
           ctx.restore();
         }
 
@@ -5326,9 +9556,24 @@ function saveAMXPanelGeometry(panel) {
           peakFrac = Math.max(0, Math.min(1, px / W));
         }
 
+      } else if (mode === 1) {
+        // RMS+Peak uses the same held A peak as bars and mirrored modes.
+        const audioPeakDb = mapAudioLevelsToDb(
+          STATE.levels.audio,
+          CONFIG.audio.minDb,
+          CONFIG.audio.maxDb - CONFIG.audio.minDb
+        ).audioPeakDb;
+        const px = mapDbToX(audioPeakDb, W);
+        peakFrac = Math.max(0, Math.min(1, px / W));
       } else {
-        // Audio Peak (mode 1), Stereo Quality (mode 2) etc
-        peakFrac = frac;
+        // Q uses its own held quality peak in every gauge layout.
+        const qualityPeakDb = STATE.levels.stereoQuality.peakDb;
+        if (Number.isFinite(qualityPeakDb)) {
+          const px = mapDbToX(qualityPeakDb, W);
+          peakFrac = Math.max(0, Math.min(1, px / W));
+        } else {
+          peakFrac = frac;
+        }
       }
 
       drawExternalPeak(
@@ -5348,13 +9593,737 @@ function saveAMXPanelGeometry(panel) {
     }
   }
 
+  function getAnalogVuPeakFrac(key, widthRef, liveFrac) {
+    const minDb = CONFIG.audio.minDb;
+    const range = CONFIG.audio.maxDb - minDb;
+    let peakDb = minDb;
+
+    if (key === "L") {
+      peakDb = STATE.levels.left.peakDb;
+    } else if (key === "R") {
+      peakDb = STATE.levels.right.peakDb;
+    } else if (key === "Q") {
+      peakDb = Number.isFinite(STATE.levels.stereoQuality.peakDb)
+        ? STATE.levels.stereoQuality.peakDb
+        : mapStereoQualityToDb(
+            STATE.levels.stereoQuality.smooth,
+            minDb,
+            range
+          );
+    } else if (key === "A") {
+      peakDb = mapAudioLevelsToDb(
+        STATE.levels.audio,
+        minDb,
+        range
+      ).audioPeakDb;
+    }
+
+    return Math.max(
+      clamp01(liveFrac),
+      fracFromDb(Number.isFinite(peakDb) ? peakDb : minDb, widthRef)
+    );
+  }
+
+  function getAnalogVuReadout(key) {
+    if (key === "L" || key === "R") {
+      const db = key === "L"
+        ? STATE.levels.left.smoothDb
+        : STATE.levels.right.smoothDb;
+      const value = clamp(
+        Number.isFinite(db) ? db : CONFIG.audio.minDb,
+        CONFIG.audio.minDb,
+        CONFIG.audio.maxDb
+      );
+      return `${value.toFixed(1)} dB`;
+    }
+
+    if (key === "Q") {
+      return `${Math.round(clamp(
+        STATE.levels.stereoQuality.smooth,
+        0,
+        120
+      ) || 0)} %`;
+    }
+
+    return `${Math.round(
+      (clamp(STATE.levels.audio.smooth, 0, 255) || 0) /
+        255 * 100
+    )} %`;
+  }
+
+  function getAnalogVuScale(mode) {
+    if (mode === 2) {
+      return ["0", "30", "60", "90", "120"];
+    }
+    if (mode === 1) {
+      return ["0", "25", "50", "75", "100"];
+    }
+    return ["-35", "-25", "-15", "-5", "+5"];
+  }
+
+  function getAnalogCirclePoint(cx, cy, radius, startAngle, endAngle, t) {
+    const angle = startAngle + (endAngle - startAngle) * clamp01(t);
+    return {
+      x: cx + Math.cos(angle) * radius,
+      y: cy + Math.sin(angle) * radius
+    };
+  }
+
+  function getAnalogPeakPathFrac(stateKey, liveFrac, peakFrac, pathLength) {
+    if (!STATE.render) STATE.render = {};
+    const bucket = (STATE.render.analogVuPeak ??= {});
+    const live = clamp01(liveFrac);
+    const held = clamp01(peakFrac);
+
+    if (
+      !CONFIG.display.showPeaks ||
+      STATE.hasStreamObject !== true
+    ) {
+      delete bucket[stateKey];
+      return null;
+    }
+
+    const state = (
+      bucket[stateKey] ??= {
+        pos: live,
+        vel: 0,
+        lastPeak: held
+      }
+    );
+    const pixelFrac = 1 / Math.max(1, pathLength);
+    const isNewPeak = held > state.lastPeak + 0.5 * pixelFrac;
+    const target = isNewPeak
+      ? Math.min(1, held + 8 * pixelFrac)
+      : live;
+    state.lastPeak = held;
+
+    if (target > state.pos) {
+      state.pos = target;
+      state.vel = 0;
+    } else {
+      state.vel += (target - state.pos) * 0.28;
+      state.vel *= 0.78;
+      state.pos += state.vel;
+    }
+
+    state.pos = Math.max(live, Math.min(1, state.pos));
+    return state.pos;
+  }
+
+  function drawAnalogVuInstrument(
+    ctx,
+    frame,
+    key,
+    mode,
+    liveFrac,
+    peakFrac,
+    readoutText,
+    compact,
+    fontFamily
+  ) {
+    const { x, y, w, h } = frame;
+    const colors = ACTIVE_THEME.colors;
+    const peakColor = colors.peak;
+    const accentColor = getFmDxAccentColor();
+    const frameRadius = compact ? 5.2 : 8;
+    const rim = compact ? 3.4 : 5.2;
+    const inner = {
+      x: x + rim,
+      y: y + rim,
+      w: w - rim * 2,
+      h: h - rim * 2
+    };
+    const innerRadius = Math.max(3, frameRadius - 2);
+    const pivotX = inner.x + inner.w / 2;
+    const pivotY = inner.y + inner.h - (compact ? 2.2 : 3.5);
+    const arcInset = compact ? 3 : 5;
+    // The needle length is a true, invariant radius. The ticker is an exact
+    // segment of that same circle; only its visible angular span is clipped
+    // to the horizontal room available in each frame.
+    const arcTopInset = compact ? 2.5 : 4;
+    const needleRadius = Math.max(8, pivotY - (inner.y + arcTopInset));
+    const availableHalfWidth = Math.max(4, inner.w / 2 - arcInset);
+    const maxHalfSpan = compact ? 1.22 : 1.20;
+    const widthHalfSpan = Math.asin(Math.min(1, availableHalfWidth / needleRadius));
+    const halfSpan = Math.min(maxHalfSpan, widthHalfSpan);
+    const arcStartAngle = -Math.PI / 2 - halfSpan;
+    const arcEndAngle = -Math.PI / 2 + halfSpan;
+    const approximatePathLength = Math.max(
+      1,
+      needleRadius * (arcEndAngle - arcStartAngle)
+    );
+    // Fixed FM-DX accent with light and shadow passes for a cylindrical,
+    // three-dimensional metal rim. It is intentionally independent of the
+    // AudioMetrix low/mid/high palette.
+    const frameGradient = ctx.createLinearGradient(x, y, x + w, y + h);
+    frameGradient.addColorStop(0.00, accentColor);
+    frameGradient.addColorStop(0.18, "rgba(255,255,255,0.88)");
+    frameGradient.addColorStop(0.38, accentColor);
+    frameGradient.addColorStop(0.76, "rgba(0,0,0,0.78)");
+    frameGradient.addColorStop(1.00, accentColor);
+    // Gauge-like theme halo around the frame.
+    if (CONFIG.display.glowIntensity > 0) {
+      ctx.save();
+      ctx.globalAlpha = 0.48 * CONFIG.display.glowIntensity;
+      ctx.filter = `blur(${compact ? 3.5 : 6}px)`;
+      ctx.strokeStyle = frameGradient;
+      ctx.lineWidth = compact ? 4.7 : 7;
+      ctx.beginPath();
+      ctx.roundRect(x + rim / 2, y + rim / 2, w - rim, h - rim, frameRadius);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // Dark support plus thick, clean gauge-style gradient frame.
+    ctx.save();
+    ctx.fillStyle = "rgba(2,4,7,0.94)";
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, frameRadius);
+    ctx.fill();
+    ctx.strokeStyle = frameGradient;
+    ctx.lineWidth = rim;
+    ctx.beginPath();
+    ctx.roundRect(
+      x + rim / 2,
+      y + rim / 2,
+      w - rim,
+      h - rim,
+      Math.max(2, frameRadius - rim / 3)
+    );
+    ctx.stroke();
+    ctx.restore();
+
+    // Recessed inner glass without the former white/black pillow emboss.
+    ctx.save();
+    ctx.shadowColor = "rgba(0,0,0,0.72)";
+    ctx.shadowBlur = compact ? 3 : 5;
+    ctx.fillStyle = "rgba(2,5,8,0.88)";
+    ctx.beginPath();
+    ctx.roundRect(inner.x, inner.y, inner.w, inner.h, innerRadius);
+    ctx.fill();
+    ctx.restore();
+
+    ctx.save();
+    ctx.globalAlpha = 0.42;
+    ctx.strokeStyle = frameGradient;
+    ctx.lineWidth = compact ? 0.8 : 1.15;
+    ctx.beginPath();
+    ctx.roundRect(
+      inner.x + 0.5,
+      inner.y + 0.5,
+      inner.w - 1,
+      inner.h - 1,
+      innerRadius
+    );
+    ctx.stroke();
+    ctx.restore();
+
+    // Recessed glass face.
+    ctx.save();
+    ctx.beginPath();
+    ctx.roundRect(inner.x, inner.y, inner.w, inner.h, innerRadius);
+    ctx.clip();
+    const face = ctx.createLinearGradient(0, inner.y, 0, inner.y + inner.h);
+    face.addColorStop(0, "rgba(12,16,21,0.78)");
+    face.addColorStop(0.58, "rgba(4,7,11,0.88)");
+    face.addColorStop(1, "rgba(0,1,3,0.94)");
+    ctx.fillStyle = face;
+    ctx.fillRect(inner.x, inner.y, inner.w, inner.h);
+
+    // Theme-coloured instrument face: low/mid/high are softly blended into
+    // the dark recessed base, beneath the glass and every readable element.
+    const themeFace = ctx.createLinearGradient(
+      inner.x,
+      inner.y + inner.h,
+      inner.x + inner.w,
+      inner.y
+    );
+    themeFace.addColorStop(0.00, colors.low);
+    themeFace.addColorStop(0.50, colors.mid);
+    themeFace.addColorStop(1.00, colors.high);
+    ctx.save();
+    ctx.globalAlpha = compact ? 0.30 : 0.34;
+    ctx.filter = `blur(${compact ? 3 : 5}px)`;
+    ctx.fillStyle = themeFace;
+    ctx.fillRect(inner.x - 4, inner.y - 4, inner.w + 8, inner.h + 8);
+    ctx.restore();
+
+    // Dark edge vignette preserves depth and ticker/readout contrast.
+    const retroFace = ctx.createRadialGradient(
+      pivotX,
+      inner.y + inner.h * 0.34,
+      0,
+      pivotX,
+      inner.y + inner.h * 0.40,
+      Math.max(inner.w * 0.62, inner.h)
+    );
+    retroFace.addColorStop(0.00, "rgba(255,255,255,0.025)");
+    retroFace.addColorStop(0.50, "rgba(0,0,0,0.08)");
+    retroFace.addColorStop(1.00, "rgba(0,0,0,0.46)");
+    ctx.fillStyle = retroFace;
+    ctx.fillRect(inner.x, inner.y, inner.w, inner.h);
+
+    ctx.save();
+    ctx.globalAlpha = 0.38;
+    ctx.strokeStyle = "rgba(255,225,178,0.08)";
+    ctx.lineWidth = 0.45;
+    for (let textureY = inner.y + 2.5; textureY < inner.y + inner.h; textureY += 4) {
+      ctx.beginPath();
+      ctx.moveTo(inner.x + 2, textureY);
+      ctx.lineTo(inner.x + inner.w - 2, textureY);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // Stronger broad reflection beneath the readable graphics.
+    const underGlass = ctx.createLinearGradient(
+      inner.x,
+      inner.y,
+      inner.x + inner.w,
+      inner.y + inner.h
+    );
+    underGlass.addColorStop(0.00, "rgba(255,255,255,0.13)");
+    underGlass.addColorStop(0.18, "rgba(255,255,255,0.055)");
+    underGlass.addColorStop(0.42, "rgba(255,255,255,0.02)");
+    underGlass.addColorStop(0.72, "rgba(0,0,0,0.10)");
+    underGlass.addColorStop(1.00, "rgba(255,255,255,0.025)");
+    ctx.globalAlpha = 1;
+    ctx.filter = `blur(${compact ? 2.5 : 4}px)`;
+    ctx.fillStyle = underGlass;
+    ctx.fillRect(inner.x, inner.y, inner.w, inner.h);
+    ctx.restore();
+
+    // Double concentric ticker arc. The outer/upper arc is the stronger
+    // instrument rim; the inner/lower arc retains the former fine line.
+    const innerTickerRadius = Math.max(
+      4,
+      needleRadius - (compact ? 3.2 : 5)
+    );
+    const warningStartFrac =
+      mode === 1 ? 70 / 100 :
+      mode === 2 ? 100 / 120 :
+      null;
+    const warningColor =
+      mode === 1 ? "#ff3131" :
+      mode === 2 ? "#ffd400" :
+      null;
+    const warningStartAngle = warningStartFrac === null
+      ? null
+      : arcStartAngle + (arcEndAngle - arcStartAngle) * warningStartFrac;
+
+    // Glow pass for the complete double arc, followed by a stronger coloured
+    // warning-zone halo for Q and A.
+    if (CONFIG.display.glowIntensity > 0) {
+      ctx.save();
+      ctx.lineCap = "round";
+      ctx.filter = `blur(${compact ? 2.4 : 3.8}px)`;
+      ctx.globalAlpha = 0.36 * CONFIG.display.glowIntensity;
+      ctx.strokeStyle = "rgba(255,255,255,0.72)";
+
+      [
+        [needleRadius, compact ? 1.8 : 2.6],
+        [innerTickerRadius, compact ? 1.1 : 1.55]
+      ].forEach(([radius, lineWidth]) => {
+        ctx.lineWidth = lineWidth;
+        ctx.beginPath();
+        ctx.arc(pivotX, pivotY, radius, arcStartAngle, arcEndAngle);
+        ctx.stroke();
+      });
+
+      if (warningColor && warningStartAngle !== null) {
+        ctx.globalAlpha = 0.72 * CONFIG.display.glowIntensity;
+        ctx.strokeStyle = warningColor;
+        [
+          [needleRadius, compact ? 2.0 : 3.0],
+          [innerTickerRadius, compact ? 1.25 : 1.8]
+        ].forEach(([radius, lineWidth]) => {
+          ctx.lineWidth = lineWidth;
+          ctx.beginPath();
+          ctx.arc(pivotX, pivotY, radius, warningStartAngle, arcEndAngle);
+          ctx.stroke();
+        });
+      }
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.strokeStyle = "rgba(255,255,255,0.54)";
+    ctx.lineWidth = compact ? 1.35 : 2.0;
+    ctx.beginPath();
+    ctx.arc(
+      pivotX,
+      pivotY,
+      needleRadius,
+      arcStartAngle,
+      arcEndAngle
+    );
+    ctx.stroke();
+
+    ctx.strokeStyle = "rgba(255,255,255,0.34)";
+    ctx.lineWidth = compact ? 0.8 : 1.1;
+    ctx.beginPath();
+    ctx.arc(
+      pivotX,
+      pivotY,
+      innerTickerRadius,
+      arcStartAngle,
+      arcEndAngle
+    );
+    ctx.stroke();
+
+    // Both concentric lines adopt the exact Q/A warning colour beyond the
+    // corresponding 100/70 threshold.
+    if (warningColor && warningStartAngle !== null) {
+      ctx.strokeStyle = warningColor;
+      ctx.lineWidth = compact ? 1.35 : 2.0;
+      ctx.beginPath();
+      ctx.arc(
+        pivotX,
+        pivotY,
+        needleRadius,
+        warningStartAngle,
+        arcEndAngle
+      );
+      ctx.stroke();
+
+      ctx.lineWidth = compact ? 0.8 : 1.1;
+      ctx.beginPath();
+      ctx.arc(
+        pivotX,
+        pivotY,
+        innerTickerRadius,
+        warningStartAngle,
+        arcEndAngle
+      );
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    const tickCount = 20;
+    const scaleLabels = getAnalogVuScale(mode);
+    for (let i = 0; i <= tickCount; i++) {
+      const f = i / tickCount;
+      const point = getAnalogCirclePoint(
+        pivotX,
+        pivotY,
+        needleRadius,
+        arcStartAngle,
+        arcEndAngle,
+        f
+      );
+      const dx = pivotX - point.x;
+      const dy = pivotY - point.y;
+      const distance = Math.max(1, Math.hypot(dx, dy));
+      const nx = dx / distance;
+      const ny = dy / distance;
+      const major = i % 5 === 0;
+      const tickLength = major
+        ? (compact ? 5.5 : 9)
+        : (compact ? 3.2 : 5.5);
+      const zoneColor =
+        warningColor && warningStartFrac !== null && f >= warningStartFrac
+          ? warningColor
+          : "rgba(255,255,255,0.76)";
+
+      ctx.save();
+      ctx.strokeStyle = zoneColor;
+      ctx.lineWidth = major ? (compact ? 1 : 1.3) : 0.65;
+      if (CONFIG.display.glowIntensity > 0) {
+        ctx.shadowColor = zoneColor;
+        ctx.shadowBlur = (compact ? 2.2 : 3.4) * CONFIG.display.glowIntensity;
+      }
+      ctx.beginPath();
+      ctx.moveTo(point.x, point.y);
+      ctx.lineTo(
+        point.x + nx * tickLength,
+        point.y + ny * tickLength
+      );
+      ctx.stroke();
+      ctx.restore();
+
+      if (major) {
+        const labelDistance = tickLength + (compact ? 4 : 7.5);
+        ctx.save();
+        ctx.fillStyle = zoneColor;
+        ctx.font = `600 ${compact ? 5.2 : 7}px ${fontFamily}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        if (CONFIG.display.glowIntensity > 0) {
+          ctx.shadowColor = zoneColor;
+          ctx.shadowBlur = (compact ? 1.8 : 2.8) * CONFIG.display.glowIntensity;
+        }
+        ctx.fillText(
+          scaleLabels[i / 5],
+          point.x + nx * labelDistance,
+          point.y + ny * labelDistance
+        );
+        ctx.restore();
+      }
+    }
+
+    // Channel label bottom-left; readout bottom-right.
+    ctx.save();
+    ctx.fillStyle = "rgba(255,255,255,0.92)";
+    ctx.font = `700 13px ${fontFamily}`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "bottom";
+    ctx.fillText(
+      key,
+      inner.x + (compact ? 4 : 7),
+      inner.y + inner.h - (compact ? 2 : 4)
+    );
+    ctx.restore();
+
+    if (
+      CONFIG.display.showReadouts &&
+      STATE.hasStreamObject === true
+    ) {
+      ctx.save();
+      ctx.fillStyle = "#ffffff";
+      ctx.font = `600 ${compact ? 10 : 13}px ${fontFamily}`;
+      ctx.textAlign = "right";
+      ctx.textBaseline = "bottom";
+      ctx.shadowColor = "rgba(0,0,0,0.95)";
+      ctx.shadowBlur = 3;
+      ctx.fillText(
+        readoutText,
+        inner.x + inner.w - (compact ? 4 : 7),
+        inner.y + inner.h - (compact ? 2 : 4)
+      );
+      ctx.restore();
+    }
+
+    // Longer, thicker 3D theme-high needle ending exactly on the ticker arc.
+    const needleTip = getAnalogCirclePoint(
+      pivotX,
+      pivotY,
+      needleRadius,
+      arcStartAngle,
+      arcEndAngle,
+      liveFrac
+    );
+    if (CONFIG.display.glowIntensity > 0 && liveFrac > 0) {
+      ctx.save();
+      ctx.globalAlpha = 0.76 * CONFIG.display.glowIntensity;
+      ctx.filter = `blur(${compact ? 3 : 5}px)`;
+      ctx.strokeStyle = colors.high;
+      ctx.lineWidth = compact ? 3.6 : 5.4;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(pivotX, pivotY);
+      ctx.lineTo(needleTip.x, needleTip.y);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.strokeStyle = "rgba(0,0,0,0.82)";
+    ctx.lineWidth = compact ? 2.8 : 4.0;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(pivotX, pivotY);
+    ctx.lineTo(needleTip.x, needleTip.y);
+    ctx.stroke();
+    ctx.strokeStyle = colors.high;
+    ctx.lineWidth = compact ? 2.1 : 3.1;
+    ctx.stroke();
+    ctx.globalAlpha = 0.42;
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = compact ? 0.55 : 0.8;
+    ctx.stroke();
+    ctx.restore();
+
+    // Slightly larger peak bead moving directly on the ticker path.
+    const peakPathFrac = getAnalogPeakPathFrac(
+      `${key}:${Math.round(x)}:${Math.round(y)}:${Math.round(w)}:${Math.round(h)}`,
+      liveFrac,
+      peakFrac,
+      approximatePathLength
+    );
+    if (peakPathFrac !== null) {
+      const peakPoint = getAnalogCirclePoint(
+        pivotX,
+        pivotY,
+        needleRadius,
+        arcStartAngle,
+        arcEndAngle,
+        peakPathFrac
+      );
+      ctx.save();
+      ctx.fillStyle = peakColor;
+      ctx.beginPath();
+      ctx.arc(
+        peakPoint.x,
+        peakPoint.y,
+        compact ? 3.1 : 4.1,
+        0,
+        Math.PI * 2
+      );
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // Metallic lower hub remains unchanged in character.
+    ctx.save();
+    const hubRadius = compact ? 3.6 : 4.7;
+    const hub = ctx.createRadialGradient(
+      pivotX - 1,
+      pivotY - 1,
+      0,
+      pivotX,
+      pivotY,
+      hubRadius + 1
+    );
+    hub.addColorStop(0, "rgba(255,255,255,0.92)");
+    hub.addColorStop(0.34, colors.high);
+    hub.addColorStop(1, "rgba(0,0,0,0.92)");
+    ctx.fillStyle = hub;
+    ctx.beginPath();
+    ctx.arc(pivotX, pivotY, hubRadius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    // Clear but stronger final glass reflections.
+    ctx.save();
+    ctx.beginPath();
+    ctx.roundRect(inner.x, inner.y, inner.w, inner.h, innerRadius);
+    ctx.clip();
+    const topGloss = ctx.createLinearGradient(
+      0,
+      inner.y,
+      0,
+      inner.y + inner.h * 0.55
+    );
+    topGloss.addColorStop(0, "rgba(255,255,255,0.13)");
+    topGloss.addColorStop(0.30, "rgba(255,255,255,0.04)");
+    topGloss.addColorStop(1, "rgba(255,255,255,0.00)");
+    ctx.filter = `blur(${compact ? 3 : 5}px)`;
+    ctx.fillStyle = topGloss;
+    ctx.fillRect(inner.x, inner.y, inner.w, inner.h * 0.55);
+    ctx.globalAlpha = 0.055;
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath();
+    ctx.moveTo(inner.x + inner.w * 0.08, inner.y);
+    ctx.lineTo(inner.x + inner.w * 0.32, inner.y);
+    ctx.lineTo(inner.x + inner.w * 0.56, inner.y + inner.h);
+    ctx.lineTo(inner.x + inner.w * 0.42, inner.y + inner.h);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+
+    // Crisp, coloured frame edge matching the visual language of gauges.
+    ctx.save();
+    ctx.globalAlpha = 0.72;
+    ctx.strokeStyle = frameGradient;
+    ctx.lineWidth = compact ? 1.2 : 1.8;
+    ctx.beginPath();
+    ctx.roundRect(x + 0.8, y + 0.8, w - 1.6, h - 1.6, frameRadius);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function renderAnalogVu(ctx, canvas, layout) {
+    const renderedWidth = getCanvasRenderedWidth(canvas);
+    const width = renderedWidth > 40
+      ? renderedWidth
+      : getCanvasLogicalWidth(canvas);
+    if (!width) return;
+
+    const full = layout === "full";
+    const desiredHeight = 100;
+    if (
+      getCanvasLogicalWidth(canvas) !== width ||
+      getCanvasLogicalHeight(canvas) !== desiredHeight
+    ) {
+      resizeCanvasIfNeeded(canvas, width, desiredHeight);
+      ctx = canvas.getContext("2d");
+    }
+    applyCanvasHiDpiTransform(canvas);
+    canvas.style.height = `${desiredHeight}px`;
+
+    const wrapperHeight = desiredHeight;
+    if (STATE.dom.contentWrapper) {
+      STATE.dom.contentWrapper.style.height = `${wrapperHeight}px`;
+      STATE.dom.contentWrapper.style.minHeight = `${wrapperHeight}px`;
+    }
+
+    ctx.clearRect(0, 0, width, desiredHeight);
+
+    const keys = full
+      ? ["L", "R", "Q", "A"]
+      : layout === "sa"
+        ? ["Q", "A"]
+        : ["L", "R"];
+    const pad = 3;
+    const gapX = 5;
+    const gapY = full ? 3 : 0;
+    const columns = 2;
+    const rows = full ? 2 : 1;
+    const frameW = (width - pad * 2 - gapX) / columns;
+    const frameH =
+      (desiredHeight - pad * 2 - gapY * (rows - 1)) / rows;
+    const inheritedFont = STATE.dom.title
+      ? getCanvasFontStyle(STATE.dom.title)
+      : null;
+    const analogFontFamily =
+      inheritedFont?.fontFamily || "sans-serif";
+
+    keys.forEach((key, index) => {
+      const column = index % 2;
+      const row = Math.floor(index / 2);
+      const frame = {
+        x: pad + column * (frameW + gapX),
+        y: pad + row * (frameH + gapY),
+        w: frameW,
+        h: frameH
+      };
+      const meter = computeFracAndMode(layout, index, width);
+      const peakFrac = getAnalogVuPeakFrac(
+        key,
+        width,
+        meter.frac
+      );
+      const readoutText = getThrottledCanvasReadout(
+        `analogVu:${layout}`,
+        index,
+        getAnalogVuReadout(key)
+      );
+      drawAnalogVuInstrument(
+        ctx,
+        frame,
+        key,
+        meter.mode,
+        meter.frac,
+        peakFrac,
+        readoutText,
+        full,
+        analogFontFamily
+      );
+    });
+  }
+
   // Tile title helper
   function getTileTitle(layout, render, useMirrored) {
+    if (layout === "equalizer") {
+      return CONFIG.display.equalizerRenderMode === "spectrum"
+        ? "SPECTRUM"
+        : "16-BAND EQ";
+    }
+    if (layout === "vuHybrid") {
+      return CONFIG.display.hybridMode === "audio10"
+        ? "AUDIO LEVELS & 10B EQ"
+        : "STEREO LEVELS & 12B EQ";
+    }
+
+    if (layout === "visualizer") return VISUALIZER_NAMES[CONFIG.display.visualizerStyle].toUpperCase();
+    if (layout === "oscilloscope") return "STEREO OSCILLOSCOPE";
+
     if (layout === "full") return "AUDIO LEVELS";
 
-    if (layout === "sa") return "ST. QUALITY / AUDIO PEAK";
+    if (layout === "sa") return "ST. QUALITY / RMS+PEAK";
 
-    if (render === "gauges" || useMirrored) {
+    if (render === "gauges" || render === "analogVu" || useMirrored) {
       return "STEREO LEVELS";
     }
 
@@ -5454,7 +10423,10 @@ function saveAMXPanelGeometry(panel) {
     const gaugeLabelA     = STATE.dom.gaugeLabelA;
 
     const layout = CONFIG.display.layoutMode;
-    const render = CONFIG.display.renderMode;
+    const render =
+      layout === "equalizer" || layout === "vuHybrid" || layout === "oscilloscope" || layout === "visualizer"
+        ? "bars"
+        : CONFIG.display.renderMode;
 
     const useMirrored =
       render === "mirrored" &&
@@ -5473,6 +10445,8 @@ function saveAMXPanelGeometry(panel) {
     // SELECT ACTIVE CANVAS
     if (render === "gauges") {
       setCanvasActive("gauges");
+    } else if (render === "analogVu") {
+      setCanvasActive("analogVu");
     } else if (useMirrored) {
       setCanvasActive("mirrored");
     } else {
@@ -5484,11 +10458,20 @@ function saveAMXPanelGeometry(panel) {
     // canvas position
     if (STATE.dom.canvasNormal && STATE._canvasNormalBaseTop != null) {
       STATE.dom.canvasNormal.style.top = STATE._canvasNormalBaseTop;
+      STATE.dom.canvasNormal.style.left = STATE._canvasNormalBaseLeft;
+      STATE.dom.canvasNormal.style.width = STATE._canvasNormalBaseWidth;
+    }
+
+    if (STATE.dom.canvasGauges) {
+      STATE.dom.canvasGauges.style.top = "5px";
+      STATE.dom.canvasGauges.style.left = "5px";
+      STATE.dom.canvasGauges.style.width = "calc(100% - 10px)";
     }
 
     // wrapper height
     if (STATE.dom.contentWrapper) {
       STATE.dom.contentWrapper.style.height = "";
+      STATE.dom.contentWrapper.style.minHeight = `${WRAPPER_HEIGHT}px`;
     }
 
     // hide gauge overlay by default
@@ -5550,8 +10533,193 @@ function saveAMXPanelGeometry(panel) {
         (INNER_BASE_TOP + barH + gap + barH / 2 - 12) + "px";
     }
 
+    if (layout === "visualizer" || (MIRRORED_LAYOUTS.includes(layout) && isCircularStyle(render))) {
+      for (const el of Object.values(STATE.dom.labels || {})) {
+        if (el) el.style.display = "none";
+      }
+      for (const el of Object.values(STATE.dom.scales || {})) {
+        if (el) el.style.display = "none";
+      }
+      for (const el of Object.values(STATE.dom.readouts || {})) {
+        if (el) el.style.display = "none";
+      }
+      if (STATE.dom.canvasNormal) {
+        STATE.dom.canvasNormal.style.top = "-2px";
+        STATE.dom.canvasNormal.style.left = "5px";
+        STATE.dom.canvasNormal.style.width = "calc(100% - 10px)";
+        STATE.dom.canvasNormal.style.transform = "";
+      }
+      if (STATE.dom.contentWrapper) {
+        STATE.dom.contentWrapper.style.height = WRAPPER_HEIGHT + "px";
+        STATE.dom.contentWrapper.style.minHeight = WRAPPER_HEIGHT + "px";
+      }
+      setTitleText(layout === "visualizer"
+        ? VISUALIZER_NAMES[CONFIG.display.visualizerStyle].toUpperCase()
+        : layout === "full" ? "AUDIO LEVELS" : layout === "sa" ? "ST. QUALITY / RMS+PEAK" : "STEREO LEVELS");
+      return;
+    }
+
+    // OSCILLOSCOPE — stereo Float32 waveform using the native LR overlay.
+    if (layout === "oscilloscope") {
+      // Reuse the real Bar-mode L/R labels. Same DOM, font, coordinates.
+      if (STATE.dom.labels.left) {
+        STATE.dom.labels.left.style.display = "";
+        setTextIfChanged(STATE.dom.labels.left, "L");
+      }
+      if (STATE.dom.labels.right) {
+        STATE.dom.labels.right.style.display = "";
+        setTextIfChanged(STATE.dom.labels.right, "R");
+      }
+
+      if (STATE.dom.labels.q) STATE.dom.labels.q.style.display = "none";
+      if (STATE.dom.labels.a) STATE.dom.labels.a.style.display = "none";
+
+      // Numeric dB scales are not meaningful on a raw waveform.
+      if (STATE.dom.scales.left)  STATE.dom.scales.left.style.display  = "none";
+      if (STATE.dom.scales.right) STATE.dom.scales.right.style.display = "none";
+
+      // Scope uses the full wrapper height. The normal Bars canvas normally
+      // starts ~20px lower; keeping that top offset with a 100px scope canvas
+      // caused the bottom overflow seen on mobile/desktop.
+      if (STATE.dom.canvasNormal) {
+        STATE.dom.canvasNormal.style.top = "-2px";
+        STATE.dom.canvasNormal.style.left = STATE._canvasNormalBaseLeft;
+        STATE.dom.canvasNormal.style.width = STATE._canvasNormalBaseWidth;
+        STATE.dom.canvasNormal.style.transform = "";
+      }
+
+      if (STATE.dom.contentWrapper) {
+        STATE.dom.contentWrapper.style.height = WRAPPER_HEIGHT + "px";
+        STATE.dom.contentWrapper.style.minHeight = WRAPPER_HEIGHT + "px";
+      }
+
+      // Native L/R labels, centered on the real 94px scope waveform lanes.
+      const scopeHeight = 94;
+      const laneGap = 6;
+      const laneH = (scopeHeight - laneGap) / 2;
+      const labelTopCenter = laneH * 0.58 - 2;
+      const labelBottomCenter =
+        laneH + laneGap + laneH * 0.58 - 2;
+
+      if (STATE.dom.labels.left) {
+        STATE.dom.labels.left.style.left = "7px";
+        STATE.dom.labels.left.style.top =
+          (labelTopCenter - 12) + "px";
+      }
+
+      if (STATE.dom.labels.right) {
+        STATE.dom.labels.right.style.left = "7px";
+        STATE.dom.labels.right.style.top =
+          (labelBottomCenter - 12) + "px";
+      }
+
+      // Respect the existing Show Real Time Values setting.
+      positionReadouts("oscilloscope", "bars");
+
+      setTitleText("STEREO OSCILLOSCOPE");
+      return;
+    }
+
+    // EQUALIZER — isolated vertical-bars layout
+    if (layout === "equalizer") {
+      if (STATE.dom.labels.left)  STATE.dom.labels.left.style.display  = "none";
+      if (STATE.dom.labels.right) STATE.dom.labels.right.style.display = "none";
+      if (STATE.dom.labels.q)     STATE.dom.labels.q.style.display     = "none";
+      if (STATE.dom.labels.a)     STATE.dom.labels.a.style.display     = "none";
+      if (STATE.dom.scales.left)  STATE.dom.scales.left.style.display  = "none";
+      if (STATE.dom.scales.right) STATE.dom.scales.right.style.display = "none";
+
+      if (STATE.dom.readouts) {
+        Object.values(STATE.dom.readouts).forEach(el => {
+          if (el) el.style.display = "none";
+        });
+      }
+
+      if (STATE.dom.canvasNormal) {
+        STATE.dom.canvasNormal.style.top = "-2px";
+        STATE.dom.canvasNormal.style.left = "5px";
+        STATE.dom.canvasNormal.style.width = "calc(100% - 10px)";
+      }
+
+      setTitleText(
+        CONFIG.display.equalizerRenderMode === "spectrum"
+          ? "SPECTRUM"
+          : "16-BAND EQ"
+      );
+      return;
+    }
+
+    // VU HYBRID — isolated vertical meters + spectrum layout
+    if (layout === "vuHybrid") {
+      if (STATE.dom.labels.left)  STATE.dom.labels.left.style.display  = "none";
+      if (STATE.dom.labels.right) STATE.dom.labels.right.style.display = "none";
+      if (STATE.dom.labels.q)     STATE.dom.labels.q.style.display     = "none";
+      if (STATE.dom.labels.a)     STATE.dom.labels.a.style.display     = "none";
+      if (STATE.dom.scales.left)  STATE.dom.scales.left.style.display  = "none";
+      if (STATE.dom.scales.right) STATE.dom.scales.right.style.display = "none";
+
+      if (STATE.dom.readouts) {
+        Object.values(STATE.dom.readouts).forEach(el => {
+          if (el) el.style.display = "none";
+        });
+      }
+
+      if (STATE.dom.canvasNormal) {
+        STATE.dom.canvasNormal.style.top = "-2px";
+        STATE.dom.canvasNormal.style.left = "5px";
+        STATE.dom.canvasNormal.style.width = "calc(100% - 10px)";
+      }
+
+      setTitleText(
+        CONFIG.display.hybridMode === "audio10"
+          ? "AUDIO LEVELS & 10B EQ"
+          : "STEREO LEVELS & 12B EQ"
+      );
+      return;
+    }
+
+    // ANALOG VU — all labels, scales and values are painted inside the glass.
+    if (render === "analogVu") {
+      if (STATE.dom.labels.left)  STATE.dom.labels.left.style.display  = "none";
+      if (STATE.dom.labels.right) STATE.dom.labels.right.style.display = "none";
+      if (STATE.dom.labels.q)     STATE.dom.labels.q.style.display     = "none";
+      if (STATE.dom.labels.a)     STATE.dom.labels.a.style.display     = "none";
+      if (STATE.dom.scales.left)  STATE.dom.scales.left.style.display  = "none";
+      if (STATE.dom.scales.right) STATE.dom.scales.right.style.display = "none";
+
+      if (STATE.dom.readouts) {
+        Object.values(STATE.dom.readouts).forEach(el => {
+          if (el) el.style.display = "none";
+        });
+      }
+
+      if (STATE.dom.gaugeOverlay) {
+        STATE.dom.gaugeOverlay.style.display = "none";
+      }
+
+      if (STATE.dom.canvasGauges) {
+        STATE.dom.canvasGauges.style.top = "0px";
+        STATE.dom.canvasGauges.style.left = "5px";
+        STATE.dom.canvasGauges.style.width = "calc(100% - 10px)";
+      }
+
+      setTitleText(getTileTitle(layout, render, useMirrored));
+      return;
+    }
+
     // GAUGES MODE
     if (render === "gauges") {
+
+      // Full 4-gauge layout needs every available horizontal pixel at the
+      // mobile landscape floor. Keep normal gauge margins elsewhere.
+      if (STATE.dom.canvasGauges) {
+        {
+          const inset = getGaugeHorizontalInset(layout);
+          STATE.dom.canvasGauges.style.left = inset + "px";
+          STATE.dom.canvasGauges.style.width = `calc(100% - ${inset * 2}px)`;
+          syncGaugeOverlayGeometry(layout);
+        }
+      }
 
       // reset numeric labels
       [
@@ -5578,8 +10746,10 @@ function saveAMXPanelGeometry(panel) {
       if (STATE.dom.scales.left)  STATE.dom.scales.left.style.display  = "none";
       if (STATE.dom.scales.right) STATE.dom.scales.right.style.display = "none";
 
-      // show gauge overlay
+      // show gauge overlay and keep its coordinate system identical
+      // to the active gauges canvas.
       if (STATE.dom.gaugeOverlay) {
+        syncGaugeOverlayGeometry(layout);
         STATE.dom.gaugeOverlay.style.display = "";
       }
       positionReadouts(layout, render);
@@ -5588,12 +10758,12 @@ function saveAMXPanelGeometry(panel) {
       if (layout === "full") {
 
         // FULL MODE — 4 gauges in ONE ROW
-        const TOP = "40%";
+        const TOP = "50%";
         const TRANSFORM = "translate(-50%, 30%)";
 
         if (gaugeLabelLeft) {
           setTextIfChanged(gaugeLabelLeft, "L");
-          gaugeLabelLeft.style.left = "11.5%";
+          gaugeLabelLeft.style.left = `${getGaugeCenterFractions(layout)[0] * 100}%`;
           gaugeLabelLeft.style.top = TOP;
           gaugeLabelLeft.style.transform = TRANSFORM;
           gaugeLabelLeft.style.display = "";
@@ -5601,7 +10771,7 @@ function saveAMXPanelGeometry(panel) {
 
         if (gaugeLabelRight) {
           setTextIfChanged(gaugeLabelRight, "R");
-          gaugeLabelRight.style.left = "38.5%";
+          gaugeLabelRight.style.left = `${getGaugeCenterFractions(layout)[1] * 100}%`;
           gaugeLabelRight.style.top = TOP;
           gaugeLabelRight.style.transform = TRANSFORM;
           gaugeLabelRight.style.display = "";
@@ -5609,7 +10779,7 @@ function saveAMXPanelGeometry(panel) {
 
         if (gaugeLabelQ) {
           setTextIfChanged(gaugeLabelQ, "Q");
-          gaugeLabelQ.style.left = "65.5%";
+          gaugeLabelQ.style.left = `${getGaugeCenterFractions(layout)[2] * 100}%`;
           gaugeLabelQ.style.top = TOP;
           gaugeLabelQ.style.transform = TRANSFORM;
           gaugeLabelQ.style.display = "";
@@ -5617,7 +10787,7 @@ function saveAMXPanelGeometry(panel) {
 
         if (gaugeLabelA) {
           setTextIfChanged(gaugeLabelA, "A");
-          gaugeLabelA.style.left = "92%";
+          gaugeLabelA.style.left = `${getGaugeCenterFractions(layout)[3] * 100}%`;
           gaugeLabelA.style.top = TOP;
           gaugeLabelA.style.transform = TRANSFORM;
           gaugeLabelA.style.display = "";
@@ -5628,7 +10798,7 @@ function saveAMXPanelGeometry(panel) {
       } else {
 
         // STEREO / SA — 2 gauges (restore baseline)
-        const TOP = "50%";
+        const TOP = "60%";
         const TRANSFORM = "translate(-50%, 60%)";
 
         // hide FULL-only labels
@@ -5637,14 +10807,14 @@ function saveAMXPanelGeometry(panel) {
 
         // restore correct 2-gauge positions
         if (gaugeLabelLeft) {
-          gaugeLabelLeft.style.left = "calc(25% - 6px)";
+          gaugeLabelLeft.style.left = `${getGaugeCenterFractions(layout)[0] * 100}%`;
           gaugeLabelLeft.style.top = TOP;
           gaugeLabelLeft.style.transform = TRANSFORM;
           gaugeLabelLeft.style.display = "";
         }
 
         if (gaugeLabelRight) {
-          gaugeLabelRight.style.left = "calc(75% + 16px)";
+          gaugeLabelRight.style.left = `${getGaugeCenterFractions(layout)[1] * 100}%`;
           gaugeLabelRight.style.top = TOP;
           gaugeLabelRight.style.transform = TRANSFORM;
           gaugeLabelRight.style.display = "";
@@ -5664,9 +10834,11 @@ function saveAMXPanelGeometry(panel) {
         }
       }
 
-      // NUMERIC LABELS
-      if (layout === "lr") {
+      // NUMERIC LABELS — same geometry source as gauges, centre labels and outputs
+      syncGaugeOverlayGeometry(layout);
+      applyGaugeNumericGeometry(layout);
 
+      if (layout === "lr") {
         ["Left", "Right"].forEach(side => {
           const g = STATE.dom["gaugeNums" + side];
           setGaugeNumericLabels(g, "-35", "-25", "-15", "+5");
@@ -5674,13 +10846,13 @@ function saveAMXPanelGeometry(panel) {
       }
 
       if (layout === "sa") {
-
-        ["Left", "Right"].forEach(side => {
-          const g = STATE.dom["gaugeNums" + side];
-          setGaugeNumericLabels(g, "0", "30", "70", "120%");
-        });
+        const gLeft  = STATE.dom.gaugeNumsLeft;
+        const gRight = STATE.dom.gaugeNumsRight;
+        // Stereo Quality
+        setGaugeNumericLabels(gLeft, "0", "50", "90", "120%");
+        // RMS+Peak
+        setGaugeNumericLabels(gRight, "0", "30", "70", "120%");
       }
-
       return;
     }
 
@@ -5906,14 +11078,65 @@ function saveAMXPanelGeometry(panel) {
     try {
       // Build settings UI
       addAudioMetrixToggle();
+
+      if (window.location.pathname === "/setup") return;
       if (!isStereoEnabled()) return;
 
       // CONTAINER TILE
+      // RESPONSIVE TILE SIZING
+      // Normal desktop: 32.9% flexible width with a comfortable 350px floor.
+      // Narrow desktop: allow the floor to drop to 335px.
+      // Touch/mobile landscape: 32.9% with a 305px floor for Full Gauges clearance.
+      // Mobile portrait: occupy the full row.
+      if (!document.getElementById("amx-responsive-tile-css")) {
+        const responsiveCss = document.createElement("style");
+        responsiveCss.id = "amx-responsive-tile-css";
+        responsiveCss.textContent = `
+          #audiometrix-container {
+            width: 32.9% !important;
+            min-width: 350px !important;
+            max-width: none !important;
+            flex: 0 1 32.9% !important;
+            box-sizing: border-box !important;
+          }
+
+          /* Smaller desktop / laptop resolution. */
+          @media (min-width: 768px) and (max-width: 1199px) and (hover: hover) and (pointer: fine) {
+            #audiometrix-container {
+              min-width: 335px !important;
+            }
+          }
+
+          /* Keep the already-good mobile/tablet landscape behaviour unchanged. */
+          @media (orientation: landscape) and (hover: none) and (pointer: coarse) {
+            #audiometrix-container {
+              width: 32.9% !important;
+              min-width: 305px !important;
+              max-width: none !important;
+              flex: 0 1 32.9% !important;
+            }
+          }
+
+          @media (max-width: 767px) and (orientation: portrait) {
+            #audiometrix-container {
+              width: 100% !important;
+              min-width: 0 !important;
+              max-width: 100% !important;
+              flex: 0 0 100% !important;
+            }
+          }
+        `;
+        document.head.appendChild(responsiveCss);
+      }
+
       STATE.dom.container = document.createElement("div");
       STATE.dom.container.className = "panel-33 hover-brighten tooltip";
       STATE.dom.container.id = "audiometrix-container";
       STATE.dom.container.style.width = CONFIG.display.dimensions.tileWidthPercent + "%";
       STATE.dom.container.style.minWidth = CONFIG.display.dimensions.minTileWidth + "px";
+      STATE.dom.container.style.maxWidth = "none";
+      STATE.dom.container.style.flex = `0 1 ${CONFIG.display.dimensions.tileWidthPercent}%`;
+      STATE.dom.container.style.boxSizing = "border-box";
       STATE.dom.container.style.borderRadius = CONFIG.display.dimensions.borderRadius;
       STATE.dom.container.setAttribute("data-tooltip","Stereo modulation L/R & Q | Audio Peaks");
 
@@ -5955,6 +11178,8 @@ function saveAMXPanelGeometry(panel) {
 
       // SAVE BASE TOP OF NORMAL CANVAS (for restoring after full mode)
       STATE._canvasNormalBaseTop = STATE.dom.canvasNormal.style.top;
+      STATE._canvasNormalBaseLeft = STATE.dom.canvasNormal.style.left;
+      STATE._canvasNormalBaseWidth = STATE.dom.canvasNormal.style.width;
 
       // MIRRORED MODE CANVAS
       STATE.dom.canvasMirror = document.createElement("canvas");
@@ -5972,8 +11197,8 @@ function saveAMXPanelGeometry(panel) {
       STATE.dom.canvasGauges.style.cssText = `
         position:absolute;
         top:5px;
-        left:${CONFIG.display.dimensions.canvasLeft}px;
-        width:calc(100% - ${CONFIG.display.dimensions.canvasLeft + 5}px);
+        left:5px;
+        width:calc(100% - 10px);
         display:none;
       `;
       STATE.dom.contentWrapper.appendChild(STATE.dom.canvasGauges);
@@ -5983,20 +11208,36 @@ function saveAMXPanelGeometry(panel) {
       STATE.dom.canvas = STATE.dom.canvasNormal;
 
       readLayoutOnce();
+      STATE.layout.dpr = getAMXRenderDpr();
 
       const w = STATE.layout.width;
       const barH = CONFIG.display.dimensions.barHeight;
       const gap = CONFIG.display.dimensions.spacing;
 
       const safeWidth = w && w > 40 ? w : 300;
+      const trackWidth = Math.max(1, safeWidth - CONFIG.display.dimensions.canvasLeft - 5);
+      const gaugesWidth = Math.max(1, safeWidth - 10);
+      const mirrorWidth = Math.max(
+        1,
+        safeWidth
+          - Math.max(4, CONFIG.display.dimensions.canvasLeft - 20)
+          - Math.max(8, CONFIG.display.dimensions.canvasLeft - 15)
+      );
       const normalHeight = barH * 2 + gap;
 
 
       // NORMAL canvas always gets size
       resizeCanvasIfNeeded(
         STATE.dom.canvasNormal,
-        safeWidth,
+        trackWidth,
         normalHeight
+      );
+
+      // MIRRORED canvas uses its own wider left/right offsets.
+      resizeCanvasIfNeeded(
+        STATE.dom.canvasMirror,
+        mirrorWidth,
+        getMirroredLayoutMetrics().singlePanelHeight
       );
       requestRender();
 
@@ -6006,13 +11247,13 @@ function saveAMXPanelGeometry(panel) {
 
         resizeCanvasIfNeeded(
           STATE.dom.canvasGauges,
-          safeWidth,
+          gaugesWidth,
           gaugesHeight
         );
       }
 
       // FLOATING PANEL REPOSITION ON RESIZE
-      window.addEventListener("resize", () => {
+      const handleAMXWindowResize = () => {
         const panel = document.getElementById("amx-floating-panel");
         const container = STATE.dom.container;
 
@@ -6021,15 +11262,67 @@ function saveAMXPanelGeometry(panel) {
         if (panel && panel.style.display !== "none") {
           positionAMXFloatingPanel(panel, container);
         }
-      });
+      };
 
+      window.addEventListener("resize", handleAMXWindowResize);
       window.addEventListener("orientationchange", refreshLayoutAndCanvas);
+      AMX_RUNTIME.windowHandlers.push(
+        ["resize", handleAMXWindowResize, undefined],
+        ["orientationchange", refreshLayoutAndCanvas, undefined]
+      );
 
       if (typeof ResizeObserver === "function" && STATE.dom.contentWrapper) {
-        const ro = new ResizeObserver(() => {
+        let lastObservedW = -1;
+        let lastObservedH = -1;
+
+        const ro = new ResizeObserver((entries) => {
+          const entry = entries && entries[0];
+          const rect = entry?.contentRect;
+          const nextW = Math.round(rect?.width || 0);
+          const nextH = Math.round(rect?.height || 0);
+
           refreshLayoutAndCanvas();
+
+          // Bars numeric scales are DOM-positioned from their measured width.
+          // On page refresh the FM-DX flex layout may settle AFTER the first
+          // applyVisualState(), so the numbers can retain positions calculated
+          // for the provisional width. Settings changes happened to fix this
+          // because they call applyVisualState() again.
+          //
+          // Re-run the visual layout once the observed size has actually
+          // changed. RAF coalescing prevents ResizeObserver feedback loops.
+          if (nextW !== lastObservedW || nextH !== lastObservedH) {
+            lastObservedW = nextW;
+            lastObservedH = nextH;
+
+            if (AMX_RUNTIME.barsResizeRaf !== null) {
+              cancelAnimationFrame(AMX_RUNTIME.barsResizeRaf);
+            }
+
+            AMX_RUNTIME.barsResizeRaf = requestAnimationFrame(() => {
+              AMX_RUNTIME.barsResizeRaf = null;
+
+              const layout = CONFIG.display.layoutMode;
+              const render =
+                layout === "equalizer" || layout === "vuHybrid"
+                  ? "bars"
+                  : CONFIG.display.renderMode;
+
+              // Only the normal bar layouts need DOM numeric-scale
+              // remeasurement. Other modes already resize correctly.
+              if (
+                render === "bars" &&
+                (layout === "lr" || layout === "sa" || layout === "full")
+              ) {
+                applyVisualState();
+                requestRender();
+              }
+            });
+          }
         });
+
         ro.observe(STATE.dom.contentWrapper);
+        AMX_RUNTIME.contentResizeObserver = ro;
       }
 
       // NATIVE LABELS L/R (normal mode only)
@@ -6269,12 +11562,9 @@ function saveAMXPanelGeometry(panel) {
       STATE.dom.gaugeLabelQ = createGaugeCenterLabel();
       STATE.dom.gaugeLabelA = createGaugeCenterLabel();
 
-      // Overlay anchoring (same as canvasGauges)
-      const GAUGE_OVERLAY_LEFT  = CONFIG.display.dimensions.canvasLeft;
-      const GAUGE_OVERLAY_W_SUB = (CONFIG.display.dimensions.canvasLeft + 5);
-
-      STATE.dom.gaugeOverlay.style.left  = GAUGE_OVERLAY_LEFT + "px";
-      STATE.dom.gaugeOverlay.style.right = GAUGE_OVERLAY_W_SUB + "px";
+      // Overlay anchoring follows the same shared inset as the gauges canvas.
+      STATE.dom.gaugeOverlay.style.left  = getGaugeHorizontalInset("lr") + "px";
+      STATE.dom.gaugeOverlay.style.right = getGaugeHorizontalInset("lr") + "px";
 
       // Append overlay above canvases
       STATE.dom.contentWrapper.appendChild(STATE.dom.gaugeOverlay);
@@ -6326,31 +11616,8 @@ function saveAMXPanelGeometry(panel) {
         end:   createGaugeNumber()
       };
 
-      // LEFT GAUGE
-      STATE.dom.gaugeNumsLeft.start.style.left = "2%";
-      STATE.dom.gaugeNumsLeft.start.style.top  = "75%";
-
-      STATE.dom.gaugeNumsLeft.mid.style.left   = "7%";
-      STATE.dom.gaugeNumsLeft.mid.style.top    = "10%";
-
-      STATE.dom.gaugeNumsLeft.high.style.left  = "38%";
-      STATE.dom.gaugeNumsLeft.high.style.top   = "10%";
-
-      STATE.dom.gaugeNumsLeft.end.style.left   = "45%";
-      STATE.dom.gaugeNumsLeft.end.style.top    = "75%";
-
-      // RIGHT GAUGE
-      STATE.dom.gaugeNumsRight.start.style.left = "59%";
-      STATE.dom.gaugeNumsRight.start.style.top  = "75%";
-
-      STATE.dom.gaugeNumsRight.mid.style.left   = "64%";
-      STATE.dom.gaugeNumsRight.mid.style.top    = "10%";
-
-      STATE.dom.gaugeNumsRight.high.style.left  = "95%";
-      STATE.dom.gaugeNumsRight.high.style.top   = "10%";
-
-      STATE.dom.gaugeNumsRight.end.style.left   = "102%";
-      STATE.dom.gaugeNumsRight.end.style.top    = "75%";
+      // Positions are assigned dynamically by applyGaugeNumericGeometry()
+      // from the same geometry model used by the canvas, centre labels and outputs.
 
       function createReadoutEl() {
         const el = document.createElement("div");
@@ -6371,11 +11638,12 @@ function saveAMXPanelGeometry(panel) {
         return el;
       }
 
-      // FINAL INITIAL VISUAL SYNC (AFTER ALL DOM EXISTS)
-      applyVisualState();
-      renderMeters();
-
       // Insert tile after freq panel
+      const path = window.location.pathname;
+      const isExcludedPage =
+        path.startsWith("/setup") || path.startsWith("/wizard");
+      if (isExcludedPage) return;
+      
       const freq = document.querySelector("#freq-container");
       const next = freq?.nextElementSibling;
       if (next?.parentNode) {
@@ -6383,8 +11651,18 @@ function saveAMXPanelGeometry(panel) {
       } else if (freq?.parentNode) {
         freq.parentNode.appendChild(STATE.dom.container);
       } else {
-        document.body.appendChild(STATE.dom.container);
+        return;
       }
+
+      // Resolve Automatic only after the tile is connected and inherits the
+      // live FM-DX CSS palette. The first canvas paint must never use the
+      // pre-DOM fallback.
+      refreshFmDxCssPalette(true);
+      refreshAutomaticTheme(true);
+
+      // FINAL INITIAL VISUAL SYNC (AFTER ALL DOM EXISTS AND THEME IS LIVE)
+      applyVisualState();
+      renderMeters();
 
       // Skin inheritance (sync fonts/colors)
       function inheritTextStyles() {
@@ -6543,19 +11821,23 @@ function saveAMXPanelGeometry(panel) {
       };
 
       // Apply skin after DOM builds
-      setTimeout(applySkin, 50);
-      setTimeout(applySkin, 300);
+      [50, 300].forEach(delay => {
+        const timer = setTimeout(() => {
+          AMX_RUNTIME.pendingTimeouts.delete(timer);
+          if (!AMX_RUNTIME.destroyed) applySkin();
+        }, delay);
+        AMX_RUNTIME.pendingTimeouts.add(timer);
+      });
 
       // Skin observer — visual sync only (fonts / alignment)
-      let skinObserverRaf = 0;
-      const skinObserver = new MutationObserver(() => {
-        if (skinObserverRaf) return;
-        skinObserverRaf = requestAnimationFrame(() => {
-          skinObserverRaf = 0;
-          applySkin();
+      AMX_RUNTIME.skinObserver = new MutationObserver(() => {
+        if (AMX_RUNTIME.skinObserverRaf) return;
+        AMX_RUNTIME.skinObserverRaf = requestAnimationFrame(() => {
+          AMX_RUNTIME.skinObserverRaf = 0;
+          if (!AMX_RUNTIME.destroyed) applySkin();
         });
       });
-      skinObserver.observe(document.body, {
+      AMX_RUNTIME.skinObserver.observe(document.body, {
         attributes: true,
         subtree: true,
         attributeFilter: ["class", "style"]
@@ -6575,12 +11857,35 @@ function saveAMXPanelGeometry(panel) {
       function cleanupAudioGraph() {
         const a = STATE.audio || {};
 
+        // Remove only AudioMetrix's own source connection. This leaves any
+        // unrelated FM-DX / plugin routes from the same source untouched.
+        try {
+          if (a.source && a.splitter && typeof a.source.disconnect === "function") {
+            a.source.disconnect(a.splitter);
+          }
+        } catch (e) {}
+
+        try {
+          if (a.splitter && a.analyserEqualizerLeft) {
+            a.splitter.disconnect(a.analyserEqualizerLeft);
+          }
+          if (a.splitter && a.analyserEqualizerRight) {
+            a.splitter.disconnect(a.analyserEqualizerRight);
+          }
+        } catch (e) {}
+
         [
           a.splitter,
           a.analyserLeft,
           a.analyserRight,
+          a.analyserEqualizerLeft,
+          a.analyserEqualizerRight,
           a.analyserMid,
           a.analyserSide,
+          a.midSideGainLToM,
+          a.midSideGainRToM,
+          a.midSideGainLToS,
+          a.midSideGainRToS,
           a.analyserPeak,
           a.bassFilter,
           a.highPassFilter,
@@ -6588,7 +11893,7 @@ function saveAMXPanelGeometry(panel) {
           a.mergerMS
         ].forEach(safeDisconnect);
 
-        ["left", "right", "audio"].forEach(k => {
+        ["left", "right", "audio", "quality"].forEach(k => {
           STATE.peakHoldUntil[k] = 0;
         });
       }
@@ -6604,19 +11909,70 @@ function saveAMXPanelGeometry(panel) {
 
       function resetAudioState() {
         cleanupAudioGraph();
+        STATE.hasStreamObject = false;
+        clearTransientRenderState();
+        resetSamplePeakMemory();
+
+        STATE.audioCadence.frame = 0;
+        STATE.audioCadence.interval = 1;
+        STATE.audioCadence.lastEnergy = 0;
+        STATE.spectrumCadence.frame = 0;
+
+        if (STATE.oscilloscope) {
+          STATE.oscilloscope.peakHistoryLeft.length = 0;
+          STATE.oscilloscope.peakHistoryRight.length = 0;
+          STATE.oscilloscope.peakDisplayLeft = 0;
+          STATE.oscilloscope.peakDisplayRight = 0;
+          STATE.oscilloscope.peakHoldUntilLeft = 0;
+          STATE.oscilloscope.peakHoldUntilRight = 0;
+          STATE.oscilloscope.persistenceLeft.length = 0;
+          STATE.oscilloscope.persistenceRight.length = 0;
+          STATE.oscilloscope.persistenceFrame = 0;
+          STATE.oscilloscope.lastTs = 0;
+        }
+
+        if (STATE.levels && STATE.levels.equalizer) {
+          STATE.levels.equalizer.values.fill(0);
+          STATE.levels.equalizer.targetValues.fill(0);
+          STATE.levels.equalizer.peaks.fill(0);
+          STATE.levels.equalizer.dbValues.fill(-100);
+          STATE.levels.equalizer.peakHoldUntil.fill(0);
+          STATE.levels.equalizer.lastUpdateTs = 0;
+          STATE.levels.equalizer.detail = null;
+          resetVisualizerState();
+        }
+        [
+          STATE.levels?.hybridStereo12,
+          STATE.levels?.hybridAudio10
+        ].filter(Boolean).forEach(spectrum => {
+          spectrum.values.fill(0);
+          spectrum.targetValues.fill(0);
+          spectrum.peaks.fill(0);
+          spectrum.dbValues.fill(-100);
+          spectrum.peakHoldUntil.fill(0);
+          spectrum.lastUpdateTs = 0;
+        });
 
         STATE.audio = {
           context: null,
           splitter: null,
           analyserLeft: null,
           analyserRight: null,
+          analyserEqualizerLeft: null,
+          analyserEqualizerRight: null,
           dataLeft: null,
           dataRight: null,
+          dataEqualizerLeft: null,
+          dataEqualizerRight: null,
           timeLeft: null,
           timeRight: null,
           mergerMS: null,
           analyserMid: null,
           analyserSide: null,
+          midSideGainLToM: null,
+          midSideGainRToM: null,
+          midSideGainLToS: null,
+          midSideGainRToS: null,
           dataMid: null,
           dataSide: null,
           analyserPeak: null,
@@ -6624,7 +11980,10 @@ function saveAMXPanelGeometry(panel) {
           highPassFilter: null,
           lowPassFilter: null,
           dataPeak: null,
-          source: null
+          source: null,
+          sourceMode: null,
+          sourceLabel: null,
+          sourceSignature: null
         };
       }
 
@@ -6633,18 +11992,76 @@ function saveAMXPanelGeometry(panel) {
         return 20 * Math.log10(x);
       }
 
+      function resetSamplePeakMemory() {
+        const m = STATE.monitoring;
+        if (!m) return;
+
+        m.maxSamplePeak.left = 0;
+        m.maxSamplePeak.right = 0;
+        m.maxSamplePeakDb.left = -120;
+        m.maxSamplePeakDb.right = -120;
+        m.clipUntil.left = 0;
+        m.clipUntil.right = 0;
+        m.clipped.left = false;
+        m.clipped.right = false;
+        m.clipCount.left = 0;
+        m.clipCount.right = 0;
+        m.lastResetTs = Date.now();
+
+        updateDiagnosticsOverlay();
+      }
+
+      function updateSamplePeakMemory(channel, samplePeak, now) {
+        const m = STATE.monitoring;
+        if (!m || (channel !== "left" && channel !== "right")) return;
+
+        const peak = Math.max(0, Math.min(1, Number(samplePeak) || 0));
+
+        if (peak > m.maxSamplePeak[channel]) {
+          m.maxSamplePeak[channel] = peak;
+          m.maxSamplePeakDb[channel] = linearToDb(peak);
+        }
+
+        if (peak >= SAMPLE_CLIP_THRESHOLD) {
+          m.clipUntil[channel] = now + SAMPLE_CLIP_HOLD_MS;
+
+          // Count only a new clip event, not every analysis frame while the
+          // signal remains continuously clipped.
+          if (!m.clipped[channel]) {
+            m.clipCount[channel]++;
+          }
+          m.clipped[channel] = true;
+        } else if (now >= m.clipUntil[channel]) {
+          m.clipped[channel] = false;
+        }
+      }
+
+      // Admin/debug convenience. Monitoring also resets automatically whenever
+      // AudioMetrix rebuilds its audio source/graph.
+      window.AudioMetrixResetMax = resetSamplePeakMemory;
+
       function processChannel(timeData, prevSmoothDb) {
-        // RMS from time-domain samples (0..255 → -1..+1)
+        // RMS + raw sample peak from the same Float32 time-domain pass.
+        // Samples are already normalized to -1..+1, so MAX/CLIP avoids
+        // the quantization of the former 8-bit analyser path.
         let sumSq = 0;
+        let samplePeak = 0;
+
         for (let i = 0; i < timeData.length; i++) {
-          const v = (timeData[i] - 128) / 128;
+          const v = timeData[i];
+          const absV = Math.abs(v);
           sumSq += v * v;
+          if (absV > samplePeak) samplePeak = absV;
         }
 
         const rms = Math.sqrt(sumSq / timeData.length);
 
         if (rms < CONFIG.audio.minThreshold) {
-          return { instantDb: -120, smoothDb: -120 };
+          return {
+            instantDb: -120,
+            smoothDb: -120,
+            samplePeak
+          };
         }
 
         // RMS → dBFS + user gain + calibration
@@ -6664,7 +12081,169 @@ function saveAMXPanelGeometry(panel) {
           smoothDb = prevSmoothDb + (instantDb - prevSmoothDb) * CONFIG.audio.releaseSpeed;
         }
 
-        return { instantDb, smoothDb };
+        return {
+          instantDb,
+          smoothDb,
+          samplePeak
+        };
+      }
+
+      const spectrumCalibrationCache = new Map();
+
+      function getSpectrumCalibration(frequency) {
+        const cached = spectrumCalibrationCache.get(frequency);
+        if (cached) return cached;
+
+        let nearestIndex = 0;
+        let nearestDistance = Infinity;
+        for (let i = 0; i < EQ_CENTER_FREQUENCIES.length; i++) {
+          const distance = Math.abs(
+            Math.log2(frequency / EQ_CENTER_FREQUENCIES[i])
+          );
+          if (distance < nearestDistance) {
+            nearestDistance = distance;
+            nearestIndex = i;
+          }
+        }
+        const calibration = {
+          gain: EQ_PREAMP_GAINS[nearestIndex],
+          floor: EQ_FLOOR_LEVELS[nearestIndex]
+        };
+        spectrumCalibrationCache.set(frequency, calibration);
+        return calibration;
+      }
+
+      function updateEqualizerLevels(
+        now,
+        spectrumState = STATE.levels.equalizer,
+        frequencies = EQ_CENTER_FREQUENCIES,
+        readSpectrum = true
+      ) {
+        const a = STATE.audio;
+        const eq = spectrumState;
+        const analyserLeft = a.analyserEqualizerLeft;
+        const analyserRight = a.analyserEqualizerRight;
+        const spectrumLeft = a.dataEqualizerLeft;
+        const spectrumRight = a.dataEqualizerRight;
+        if (!analyserLeft || !analyserRight || !spectrumLeft || !spectrumRight) return;
+
+        const sampleRate = (a.context && a.context.sampleRate) || 48000;
+        const nyquist = sampleRate / 2;
+        const binCount = Math.min(spectrumLeft.length, spectrumRight.length);
+        const deltaSeconds = eq.lastUpdateTs > 0
+          ? Math.min(0.1, Math.max(0, (now - eq.lastUpdateTs) / 1000))
+          : 1 / 60;
+        eq.lastUpdateTs = now;
+
+        // The expensive 4096-point spectrum data copy runs at ~30Hz.
+        // Targets are retained and interpolated below at the 60Hz visual cadence.
+        if (readSpectrum) {
+          analyserLeft.getByteFrequencyData(spectrumLeft);
+          analyserRight.getByteFrequencyData(spectrumRight);
+
+          for (let band = 0; band < frequencies.length; band++) {
+            const targetBin = Math.min(
+              binCount - 1,
+              Math.max(
+                0,
+                Math.floor((frequencies[band] / nyquist) * binCount)
+              )
+            );
+            const startBin = Math.max(0, targetBin - 2);
+            const endBin = Math.min(binCount - 1, targetBin + 2);
+
+            let peakValue = 0;
+            for (let bin = startBin; bin <= endBin; bin++) {
+              const combined = (spectrumLeft[bin] + spectrumRight[bin]) / 2;
+              if (combined > peakValue) peakValue = combined;
+            }
+
+            const analyserMinDb = analyserLeft.minDecibels;
+            const analyserMaxDb = analyserLeft.maxDecibels;
+            const rawDb =
+              analyserMinDb +
+              (peakValue / 255) * (analyserMaxDb - analyserMinDb);
+            const gainedDb = clamp(
+              rawDb + CONFIG.audio.dbGain,
+              analyserMinDb,
+              analyserMaxDb
+            );
+            const visualCeilingDb = -30;
+            const visualDb = clamp(
+              gainedDb,
+              analyserMinDb,
+              visualCeilingDb
+            );
+            const gainedByte =
+              ((visualDb - analyserMinDb) /
+                (visualCeilingDb - analyserMinDb)) *
+              255;
+            const calibration = getSpectrumCalibration(
+              frequencies[band]
+            );
+            const balancedPeak = gainedByte * calibration.gain;
+            const floor = calibration.floor;
+            eq.dbValues[band] =
+              balancedPeak > floor ? gainedDb : -100;
+            const normalized =
+              balancedPeak > floor
+                ? (balancedPeak - floor) / (255 - floor)
+                : 0;
+
+            let target = clamp(
+              Math.pow(normalized, 1 / EQ_SENSITIVITY),
+              0,
+              1
+            );
+
+            const previousTarget = eq.targetValues[band] || 0;
+            if (Math.abs(target - previousTarget) < EQ_HYSTERESIS) {
+              target = previousTarget;
+            }
+            eq.targetValues[band] = target;
+          }
+        }
+
+        if (eq === STATE.levels.equalizer && (CONFIG.display.equalizerRenderMode === "spectrum" || CONFIG.display.layoutMode === "visualizer")) {
+          updateSpectrumDetail(eq, a, now, deltaSeconds, readSpectrum);
+        }
+
+        // 60Hz visual interpolation toward the most recent FFT targets.
+        // Time-corrected alpha keeps the same response if frame timing varies.
+
+        const attackBase =
+          0.08 + CONFIG.audio.attackSpeed * 0.42;
+        const releaseBase =
+          0.015 + CONFIG.audio.releaseSpeed * 0.12;
+        const frameScale = Math.max(0.01, deltaSeconds * 60);
+        const attackAlpha =
+          1 - Math.pow(1 - attackBase, frameScale);
+        const releaseAlpha =
+          1 - Math.pow(1 - releaseBase, frameScale);
+
+        for (let band = 0; band < frequencies.length; band++) {
+          const target = eq.targetValues[band] || 0;
+          const previous = eq.values[band] || 0;
+
+          const next =
+            target > previous
+              ? previous + (target - previous) * attackAlpha
+              : previous + (target - previous) * releaseAlpha;
+
+          eq.values[band] = next < 0.008 ? 0 : next;
+
+          if (next >= (eq.peaks[band] || 0)) {
+            eq.peaks[band] = next;
+            eq.peakHoldUntil[band] = now + CONFIG.audio.peakHoldMs;
+          } else if (now >= (eq.peakHoldUntil[band] || 0)) {
+            eq.peaks[band] = Math.max(
+              next,
+              (eq.peaks[band] || 0) -
+                (0.15 + CONFIG.audio.releaseSpeed * 0.55) *
+                  deltaSeconds
+            );
+          }
+        }
       }
 
       function updatePeak(instDb, peakDb, side, now) {
@@ -6686,17 +12265,127 @@ function saveAMXPanelGeometry(panel) {
         return Math.max(minDb, peakDb - CONFIG.audio.peakDecayDbPerFrame);
       }
 
-      function initAudioSystem() {
+      function resolveAudioSource() {
+        // AudioMetrix must not be tied to one specific FM-DX audio path.
+        // Prefer an active HD Radio WebAudio tap when available, then fall back
+        // to the standard FM-DX analogue stream node.
+        try {
+          const hdNode = window.hdRadioAnalyserNode || window.hdRadioAudioNode || null;
+          const hdCtx = hdNode && hdNode.context ? hdNode.context : null;
+
+          if (hdNode && hdCtx && hdCtx.state !== "closed") {
+            return {
+              mode: "hdradio",
+              label: "HD Radio",
+              context: hdCtx,
+              source: hdNode,
+              signature: `hdradio:${hdCtx.sampleRate || 0}:${hdNode.constructor?.name || "AudioNode"}`
+            };
+          }
+        } catch (e) {}
+
         try {
           if (
             typeof Stream !== "undefined" &&
             Stream?.Fallback?.Player?.Amplification &&
             Stream?.Fallback?.Audio
           ) {
-            if (!STATE.audio.context) {
-              STATE.audio.context = Stream.Fallback.Audio;
-              STATE.audio.source = Stream.Fallback.Player.Amplification;
+            const ctx = Stream.Fallback.Audio;
+            const src = Stream.Fallback.Player.Amplification;
+
+            if (ctx && src && ctx.state !== "closed") {
+              return {
+                mode: "analog",
+                label: "FM-DX Analog",
+                context: ctx,
+                source: src,
+                signature: `analog:${ctx.sampleRate || 0}:${src.constructor?.name || "AudioNode"}`
+              };
             }
+          }
+        } catch (e) {}
+
+        return null;
+      }
+
+      function isAudioTransportPlaying() {
+        // FM-DX keeps its WebAudio graph/node alive after Stop. The transport
+        // button is the authoritative state: fa-stop means audio is playing,
+        // fa-play means it is stopped. This also changes synchronously on each
+        // Play/Stop click, unlike the retained analyser source.
+        const transportIcon = document.querySelector(
+          ".playbutton .fa-solid"
+        );
+        if (transportIcon) {
+          return transportIcon.classList.contains("fa-stop");
+        }
+
+        // Compatibility fallback for installations without the standard
+        // FM-DX transport button.
+        try {
+          if (STATE.audio?.sourceMode === "analog") {
+            return typeof Stream !== "undefined" && Stream !== null;
+          }
+        } catch (e) {}
+
+        // Optional explicit HD Radio transport flags, when supplied by the
+        // host/plugin. A boolean false is meaningful and must not be skipped.
+        const hdFlags = [
+          window.hdRadioIsPlaying,
+          window.isHDRadioPlaying,
+          window.hdRadioPlaying
+        ];
+        const explicitHdFlag = hdFlags.find(
+          value => typeof value === "boolean"
+        );
+        if (typeof explicitHdFlag === "boolean") {
+          return explicitHdFlag;
+        }
+
+        const hdMedia =
+          window.hdRadioAudioElement ||
+          window.hdRadioAudio ||
+          null;
+        if (hdMedia && typeof hdMedia.paused === "boolean") {
+          return !hdMedia.paused && !hdMedia.ended;
+        }
+
+        // Last-resort compatibility for an HD analyser node that exists only
+        // while its transport is active.
+        return STATE.audio?.sourceMode === "hdradio" &&
+          !!STATE.audio?.source;
+      }
+
+      function scheduleInitAudioRetry(delay) {
+        if (AMX_RUNTIME.destroyed) return;
+
+        if (AMX_RUNTIME.initRetryTimer) {
+          clearTimeout(AMX_RUNTIME.initRetryTimer);
+        }
+
+        AMX_RUNTIME.initRetryTimer = setTimeout(() => {
+          AMX_RUNTIME.initRetryTimer = null;
+          if (!AMX_RUNTIME.destroyed) initAudioSystem();
+        }, delay);
+      }
+
+      function initAudioSystem() {
+        if (AMX_RUNTIME.destroyed) return;
+
+        if (AMX_RUNTIME.initRetryTimer) {
+          clearTimeout(AMX_RUNTIME.initRetryTimer);
+          AMX_RUNTIME.initRetryTimer = null;
+        }
+
+        try {
+          const resolved = resolveAudioSource();
+
+          if (resolved && resolved.context && resolved.source) {
+            STATE.audio.context = resolved.context;
+            STATE.audio.source = resolved.source;
+            STATE.audio.sourceMode = resolved.mode;
+            STATE.audio.sourceLabel = resolved.label;
+            STATE.audio.sourceSignature = resolved.signature;
 
             const ctx = STATE.audio.context;
             const src = STATE.audio.source;
@@ -6721,10 +12410,10 @@ function saveAMXPanelGeometry(panel) {
             );
 
             // TIME-DOMAIN BUFFERS L / R
-            STATE.audio.timeLeft = new Uint8Array(
+            STATE.audio.timeLeft = new Float32Array(
               STATE.audio.analyserLeft.fftSize
             );
-            STATE.audio.timeRight = new Uint8Array(
+            STATE.audio.timeRight = new Float32Array(
               STATE.audio.analyserRight.fftSize
             );
 
@@ -6733,6 +12422,29 @@ function saveAMXPanelGeometry(panel) {
             src.connect(STATE.audio.splitter);
             STATE.audio.splitter.connect(STATE.audio.analyserLeft,  0);
             STATE.audio.splitter.connect(STATE.audio.analyserRight, 1);
+
+            // EQUALIZER — dedicated high-resolution, display-only spectrum tap.
+            // It is never connected back into the playback path.
+            STATE.audio.analyserEqualizerLeft = ctx.createAnalyser();
+            STATE.audio.analyserEqualizerRight = ctx.createAnalyser();
+
+            STATE.audio.analyserEqualizerLeft.fftSize = 4096;
+            STATE.audio.analyserEqualizerRight.fftSize = 4096;
+            STATE.audio.analyserEqualizerLeft.minDecibels = -100;
+            STATE.audio.analyserEqualizerRight.minDecibels = -100;
+            STATE.audio.analyserEqualizerLeft.maxDecibels = -10;
+            STATE.audio.analyserEqualizerRight.maxDecibels = -10;
+            STATE.audio.analyserEqualizerLeft.smoothingTimeConstant = 0.85;
+            STATE.audio.analyserEqualizerRight.smoothingTimeConstant = 0.85;
+
+            STATE.audio.dataEqualizerLeft = new Uint8Array(
+              STATE.audio.analyserEqualizerLeft.frequencyBinCount
+            );
+            STATE.audio.dataEqualizerRight = new Uint8Array(
+              STATE.audio.analyserEqualizerRight.frequencyBinCount
+            );
+            STATE.audio.splitter.connect(STATE.audio.analyserEqualizerLeft, 0);
+            STATE.audio.splitter.connect(STATE.audio.analyserEqualizerRight, 1);
 
             // MID / SIDE ENGINE (SAFE VERSION)
             // derived from splitter, NO ChannelMerger
@@ -6751,37 +12463,36 @@ function saveAMXPanelGeometry(panel) {
               STATE.audio.analyserSide.frequencyBinCount
             );
 
-            // Gains for Mid
-            const gL_to_M = ctx.createGain();
-            const gR_to_M = ctx.createGain();
-            gL_to_M.gain.value = 0.5;
-            gR_to_M.gain.value = 0.5;
+            // Gains for Mid / Side are kept in STATE so rebind cleanup can
+            // explicitly disconnect every node created by AudioMetrix.
+            STATE.audio.midSideGainLToM = ctx.createGain();
+            STATE.audio.midSideGainRToM = ctx.createGain();
+            STATE.audio.midSideGainLToS = ctx.createGain();
+            STATE.audio.midSideGainRToS = ctx.createGain();
 
-            // Gains for Side
-            const gL_to_S = ctx.createGain();
-            const gR_to_S = ctx.createGain();
-            gL_to_S.gain.value = 0.5;
-            gR_to_S.gain.value = -0.5;
+            STATE.audio.midSideGainLToM.gain.value = 0.5;
+            STATE.audio.midSideGainRToM.gain.value = 0.5;
+            STATE.audio.midSideGainLToS.gain.value = 0.5;
+            STATE.audio.midSideGainRToS.gain.value = -0.5;
 
             // Routing from splitter
-            STATE.audio.splitter.connect(gL_to_M, 0); // L
-            STATE.audio.splitter.connect(gR_to_M, 1); // R
-            STATE.audio.splitter.connect(gL_to_S, 0); // L
-            STATE.audio.splitter.connect(gR_to_S, 1); // R (inverted)
+            STATE.audio.splitter.connect(STATE.audio.midSideGainLToM, 0); // L
+            STATE.audio.splitter.connect(STATE.audio.midSideGainRToM, 1); // R
+            STATE.audio.splitter.connect(STATE.audio.midSideGainLToS, 0); // L
+            STATE.audio.splitter.connect(STATE.audio.midSideGainRToS, 1); // R inverted
 
             // Feed analysers directly (SAFE)
-            gL_to_M.connect(STATE.audio.analyserMid);
-            gR_to_M.connect(STATE.audio.analyserMid);
+            STATE.audio.midSideGainLToM.connect(STATE.audio.analyserMid);
+            STATE.audio.midSideGainRToM.connect(STATE.audio.analyserMid);
+            STATE.audio.midSideGainLToS.connect(STATE.audio.analyserSide);
+            STATE.audio.midSideGainRToS.connect(STATE.audio.analyserSide);
 
-            gL_to_S.connect(STATE.audio.analyserSide);
-            gR_to_S.connect(STATE.audio.analyserSide);
-
-            // AUDIO PEAK (A) — independent mono branch
+            // AUDIO RMS+PEAK (A) — independent filtered mono branch
             // source → lowshelf → highpass → lowpass → analyserPeak
             STATE.audio.analyserPeak = ctx.createAnalyser();
             STATE.audio.analyserPeak.fftSize = CONFIG.audio.peakFftSize;
 
-            STATE.audio.dataPeak = new Uint8Array(
+            STATE.audio.dataPeak = new Float32Array(
               STATE.audio.analyserPeak.fftSize
             );
 
@@ -6814,24 +12525,52 @@ function saveAMXPanelGeometry(panel) {
 
             if (AMX_DEBUG) {
               console.log(
-                "%c[Stereo INIT] True stereo split engaged (L/R + safe Mid/Side).",
+                `%c[AudioMetrix INIT] Source: ${STATE.audio.sourceLabel || STATE.audio.sourceMode || "unknown"} — true stereo split engaged (L/R + safe Mid/Side).`,
                 "color: cyan; font-weight: bold;"
               );
             }
 
             startRendering();
           } else {
-            setTimeout(initAudioSystem, 500);
+            scheduleInitAudioRetry(500);
           }
         } catch (e) {
           console.error("[AudioMetrix] initAudioSystem failed:", e);
-          setTimeout(initAudioSystem, 1000);
+          scheduleInitAudioRetry(1000);
         }
+      }
+
+      function encodeSpectrumValues(values, multiplier, fallback) {
+        let encoded = "";
+        for (let i = 0; i < values.length; i++) {
+          if (i > 0) encoded += ",";
+          encoded += Math.round(
+            (values[i] || fallback) * multiplier
+          );
+        }
+        return encoded;
+      }
+
+      function buildSpectrumStateSignature(spectrumState) {
+        if (!spectrumState) return "";
+
+        return (
+          encodeSpectrumValues(spectrumState.values, 200, 0) +
+          "|" +
+          encodeSpectrumValues(spectrumState.peaks, 200, 0) +
+          "|" +
+          encodeSpectrumValues(spectrumState.dbValues, 1, -100)
+        );
       }
 
       // RENDER LOOP HOOK
       function startRendering() {
-        if (!STATE.dom.contentWrapper || RENDER_GATE.rafId != null) return;
+        if (
+          AMX_RUNTIME.destroyed ||
+          document.visibilityState === "hidden" ||
+          !STATE.dom.contentWrapper ||
+          RENDER_GATE.rafId != null
+        ) return;
 
         // --- layout read (gated) ---
         readLayoutOnce();
@@ -6843,8 +12582,8 @@ function saveAMXPanelGeometry(panel) {
         // Keep existing width; only ensure the normal canvas has a valid height.
         if (STATE.dom.canvasNormal) {
           const currentWidth =
-            STATE.dom.canvasNormal.width && STATE.dom.canvasNormal.width > 40
-              ? STATE.dom.canvasNormal.width
+            getCanvasLogicalWidth(STATE.dom.canvasNormal) > 40
+              ? getCanvasLogicalWidth(STATE.dom.canvasNormal)
               : 300;
 
           resizeCanvasIfNeeded(
@@ -6861,6 +12600,15 @@ function saveAMXPanelGeometry(panel) {
 
       // UPDATE METERS
       function updateMetersFrame() {
+        if (AMX_RUNTIME.destroyed || document.visibilityState === "hidden") {
+          RENDER_GATE.rafId = null;
+          return;
+        }
+
+        // Also runs while the audio analysers are not ready, allowing the
+        // Automatic theme to replace its startup fallback after a refresh.
+        refreshAutomaticTheme();
+
         if (
           !STATE.audio ||
           !STATE.audio.analyserLeft ||
@@ -6872,12 +12620,31 @@ function saveAMXPanelGeometry(panel) {
         }
 
         try {
+          // Playback state, not mere WebAudio-node existence, controls every
+          // peak/readout visibility transition.
+          STATE.hasStreamObject = isAudioTransportPlaying();
+
           // Adaptive audio cadence (single decision point)
-          const runAudio = shouldRunAudio();
+          const highCadenceVisual =
+            CONFIG.display.layoutMode === "equalizer" ||
+            CONFIG.display.layoutMode === "vuHybrid" ||
+            CONFIG.display.layoutMode === "oscilloscope" ||
+            CONFIG.display.layoutMode === "visualizer" ||
+            isCircularStyle(CONFIG.display.renderMode);
+          const runAudio =
+            highCadenceVisual ? true : shouldRunAudio();
 
           if (runAudio) {
             const layoutMode = CONFIG.display.layoutMode;
-            const nonLRLayout = (layoutMode !== "lr");
+            const nonLRLayout =
+              layoutMode !== "lr" &&
+              layoutMode !== "equalizer" &&
+              layoutMode !== "oscilloscope" &&
+              layoutMode !== "visualizer" &&
+              !(
+                layoutMode === "vuHybrid" &&
+                CONFIG.display.hybridMode === "stereo12"
+              );
             
             const audioCfg = CONFIG.audio;
             const minDb = audioCfg.minDb;
@@ -6886,8 +12653,8 @@ function saveAMXPanelGeometry(panel) {
             const rel = audioCfg.releaseSpeed;
 
             // READ TIME DOMAIN FOR L / R
-            STATE.audio.analyserLeft.getByteTimeDomainData(STATE.audio.timeLeft);
-            STATE.audio.analyserRight.getByteTimeDomainData(STATE.audio.timeRight);
+            STATE.audio.analyserLeft.getFloatTimeDomainData(STATE.audio.timeLeft);
+            STATE.audio.analyserRight.getFloatTimeDomainData(STATE.audio.timeRight);
 
             // READ MID / SIDE DATA
             if (nonLRLayout) {
@@ -6917,6 +12684,49 @@ function saveAMXPanelGeometry(panel) {
               (typeof performance !== "undefined" && performance.now)
                 ? performance.now()
                 : Date.now();
+
+            updateSamplePeakMemory("left", L.samplePeak, nowTs);
+            updateSamplePeakMemory("right", R.samplePeak, nowTs);
+
+            const readSpectrumSnapshot =
+              (layoutMode === "equalizer" || layoutMode === "vuHybrid" || layoutMode === "visualizer" ||
+                (CONFIG.display.renderMode === "radial" && MIRRORED_LAYOUTS.includes(layoutMode) && layoutMode !== "sa"))
+                ? shouldReadSpectrumSnapshot()
+                : false;
+
+            if (CONFIG.display.renderMode === "radial" && MIRRORED_LAYOUTS.includes(layoutMode) && readSpectrumSnapshot) {
+              const a = STATE.audio;
+              if (a.analyserEqualizerLeft && a.analyserEqualizerRight && a.dataEqualizerLeft && a.dataEqualizerRight) {
+                a.analyserEqualizerLeft.getByteFrequencyData(a.dataEqualizerLeft);
+                a.analyserEqualizerRight.getByteFrequencyData(a.dataEqualizerRight);
+                updateCircularSpectra(nowTs);
+              }
+            }
+
+            if (layoutMode === "equalizer" || layoutMode === "visualizer") {
+              updateEqualizerLevels(
+                nowTs,
+                STATE.levels.equalizer,
+                EQ_CENTER_FREQUENCIES,
+                readSpectrumSnapshot
+              );
+            } else if (layoutMode === "vuHybrid") {
+              if (CONFIG.display.hybridMode === "audio10") {
+                updateEqualizerLevels(
+                  nowTs,
+                  STATE.levels.hybridAudio10,
+                  HYBRID_AUDIO_10_FREQUENCIES,
+                  readSpectrumSnapshot
+                );
+              } else {
+                updateEqualizerLevels(
+                  nowTs,
+                  STATE.levels.hybridStereo12,
+                  HYBRID_STEREO_12_FREQUENCIES,
+                  readSpectrumSnapshot
+                );
+              }
+            }
 
             // PEAKS (hold + decay)
             STATE.levels.left.peakDb = updatePeak(
@@ -6960,20 +12770,17 @@ function saveAMXPanelGeometry(panel) {
                 const buf = STATE.audio.dataPeak;
                 if (!buf) return;
 
-                peakAnalyser.getByteTimeDomainData(buf);
+                peakAnalyser.getFloatTimeDomainData(buf);
 
-                // RMS + TRUE PEAK
+                // RMS + SAMPLE PEAK (not inter-sample True Peak).
+                // Float32 samples are already normalized to -1..+1.
                 let sumSq = 0;
                 let instPeak = 0;
 
                 const len = buf.length;
 
                 for (let i = 0; i < len; i++) {
-                  let v = buf[i] - 128;
-
-                  if (v < 0) v = -v;
-
-                  const n = v / 128;
+                  const n = Math.abs(buf[i]);
 
                   sumSq += n * n;
 
@@ -6998,7 +12805,7 @@ function saveAMXPanelGeometry(panel) {
 
                 audioLevels.smooth = peakState.bar;
 
-                // AUDIO PEAK LINE — use the same hold/decay logic as L/R
+                // A SAMPLE-PEAK LINE — use the same hold/decay logic as L/R
                 const targetPeak = Math.min(255, instPeak * 255 * SCALE);
 
                 const rangeA = maxDb - minDb;
@@ -7132,6 +12939,17 @@ function saveAMXPanelGeometry(panel) {
 
               STATE.levels.stereoQuality.instant = qInstant;
               STATE.levels.stereoQuality.smooth  = qSmooth;
+              const qSmoothDb = mapStereoQualityToDb(
+                qSmooth,
+                minDb,
+                maxDb - minDb
+              );
+              STATE.levels.stereoQuality.peakDb = updatePeak(
+                qSmoothDb,
+                STATE.levels.stereoQuality.peakDb,
+                "quality",
+                nowTs
+              );
 
               // DEBUG (richer)
               if (AMX_DEBUG) {
@@ -7211,7 +13029,15 @@ function saveAMXPanelGeometry(panel) {
 
           // FRAME THROTTLING
           const __now = performance.now();
-          if (__now - _lastRenderTime < FRAME_INTERVAL) {
+          const activeFrameInterval =
+            CONFIG.display.layoutMode === "equalizer" ||
+            CONFIG.display.layoutMode === "vuHybrid" ||
+            CONFIG.display.layoutMode === "oscilloscope" ||
+            CONFIG.display.layoutMode === "visualizer" ||
+            isCircularStyle(CONFIG.display.renderMode)
+              ? 1000 / 60
+              : FRAME_INTERVAL;
+          if (__now - _lastRenderTime < activeFrameInterval) {
             RENDER_GATE.rafId = requestAnimationFrame(updateMetersFrame);
             return;
           }
@@ -7221,16 +13047,43 @@ function saveAMXPanelGeometry(panel) {
           const Rs = STATE.levels.right.smoothDb;
           const Qs = STATE.levels.stereoQuality.smooth;
           const As = STATE.levels.audio.smooth;
+          const spectrumState =
+            CONFIG.display.layoutMode === "equalizer"
+              ? STATE.levels.equalizer
+              : CONFIG.display.layoutMode === "vuHybrid"
+                ? (
+                    CONFIG.display.hybridMode === "audio10"
+                      ? STATE.levels.hybridAudio10
+                      : STATE.levels.hybridStereo12
+                  )
+                : null;
+          const eqSignature =
+            buildSpectrumStateSignature(spectrumState);
 
           const EPS_DB = 0.05;
           const EPS_PCT = 0.5;
 
+          const streamState = STATE.hasStreamObject === true;
+          const streamChanged = streamState !== _lastDrawn.Stream;
+          if (
+            streamChanged &&
+            !streamState &&
+            STATE.render?.canvasReadouts
+          ) {
+            STATE.render.canvasReadouts = {};
+          }
           const dirtyValues =
+            (MIRRORED_LAYOUTS.includes(CONFIG.display.layoutMode) && isCircularStyle(CONFIG.display.renderMode)) ||
+            CONFIG.display.layoutMode === "visualizer" ||
+            (CONFIG.display.layoutMode === "equalizer" && CONFIG.display.equalizerRenderMode === "spectrum") ||
+            CONFIG.display.layoutMode === "oscilloscope" ||
             _lastDrawn.L === null ||
             Math.abs(Ls - _lastDrawn.L) > EPS_DB ||
             Math.abs(Rs - _lastDrawn.R) > EPS_DB ||
             Math.abs(Qs - _lastDrawn.Q) > EPS_PCT ||
-            Math.abs(As - _lastDrawn.A) > EPS_PCT;
+            Math.abs(As - _lastDrawn.A) > EPS_PCT ||
+            (spectrumState && eqSignature !== _lastDrawn.EQ) ||
+            streamChanged;
 
           const manualDirty = (RENDER_GATE.dirty === true);
 
@@ -7239,12 +13092,27 @@ function saveAMXPanelGeometry(panel) {
             _lastDrawn.R = Rs;
             _lastDrawn.Q = Qs;
             _lastDrawn.A = As;
+            _lastDrawn.EQ = eqSignature;
+            _lastDrawn.Stream = streamState;
           }
 
           // DRAW EVERYTHING (GATED)
           if (manualDirty || dirtyValues) {
             renderMeters();
             RENDER_GATE.dirty = false;
+          }
+
+          // STOP must blank DOM readouts immediately, independently of the
+          // user-selected readout refresh cadence.
+          if (
+            STATE.hasStreamObject !== true &&
+            STATE.dom.readouts
+          ) {
+            Object.values(STATE.dom.readouts).forEach((el) => {
+              if (el && el.textContent !== "") {
+                el.textContent = "";
+              }
+            });
           }
 
           // READOUTS — REAL-TIME UPDATE (THROTTLED)
@@ -7278,11 +13146,9 @@ function saveAMXPanelGeometry(panel) {
                 ? STATE.levels.stereoQuality.smooth
                 : 0;
 
-              // Real transport state from FM-DX 3LAS frontend
+              // Compatible transport state (analogue Stream or HD Radio tap).
               const hasStreamObject =
-                (typeof Stream !== "undefined" && Stream !== null);
-
-              STATE.hasStreamObject = hasStreamObject;
+                STATE.hasStreamObject === true;
 
               // Helper for dB formatting on minDb
               const formatDb =
@@ -7296,7 +13162,7 @@ function saveAMXPanelGeometry(panel) {
               // ─────────────────────────
               // LR — Stereo Levels layout
               // ─────────────────────────
-              if (layout === "lr") {
+              if (layout === "lr" || layout === "oscilloscope") {
 
                 if (!hasStreamObject) {
                   setReadoutText(STATE.dom.readouts.L, "");
@@ -7355,54 +13221,208 @@ function saveAMXPanelGeometry(panel) {
         } catch (e) {
           console.error("[AudioMetrix] updateMetersFrame failed:", e);
         }
-        RENDER_GATE.rafId = requestAnimationFrame(updateMetersFrame);
+        if (!AMX_RUNTIME.destroyed && document.visibilityState !== "hidden") {
+          RENDER_GATE.rafId = requestAnimationFrame(updateMetersFrame);
+        } else {
+          RENDER_GATE.rafId = null;
+        }
       }
 
-      // AUTO REBIND WHEN FM-DX RECREATES AUDIO NODES
-      const AUTO_REBIND_INTERVAL_MS = 1000;
-      let last = null;
+      // AUTO REBIND WHEN FM-DX OR COMPATIBLE PLUGINS RECREATE AUDIO NODES
+      // Adaptive scheduler: fast while recovering, relaxed while stable,
+      // very light while the page is hidden.
+      const AUTO_REBIND_FAST_MS   = 1000;
+      const AUTO_REBIND_STABLE_MS = 5000;
+      const AUTO_REBIND_HIDDEN_MS = 15000;
+      let lastSourceSignature = null;
+      let lastSourceNode = null;
 
-      setInterval(() => {
+      function scheduleAutoRebind(delay) {
+        if (AMX_RUNTIME.destroyed) return;
+        if (AMX_RUNTIME.autoRebindTimer) {
+          clearTimeout(AMX_RUNTIME.autoRebindTimer);
+        }
+        AMX_RUNTIME.autoRebindTimer = setTimeout(runAutoRebindCheck, delay);
+      }
+
+      function runAutoRebindCheck() {
+        if (AMX_RUNTIME.destroyed) return;
+
+        AMX_RUNTIME.autoRebindLastCheck = Date.now();
+
+        if (document.visibilityState === "hidden") {
+          AMX_RUNTIME.autoRebindState = "hidden";
+          scheduleAutoRebind(AUTO_REBIND_HIDDEN_MS);
+          return;
+        }
+
+        let nextDelay = AUTO_REBIND_STABLE_MS;
+
         try {
-          const hasStream =
-            typeof Stream !== "undefined" &&
-            Stream?.Fallback?.Player?.Amplification &&
-            Stream?.Fallback?.Audio;
+          const resolved = resolveAudioSource();
 
-          if (!hasStream) {
-            last = null;
-            return;
+          if (!resolved || !resolved.context || !resolved.source) {
+            lastSourceSignature = null;
+            lastSourceNode = null;
+            AMX_RUNTIME.autoRebindState = "waiting-source";
+            nextDelay = AUTO_REBIND_FAST_MS;
+          } else {
+            if (!lastSourceNode && !lastSourceSignature) {
+              lastSourceNode = resolved.source;
+              lastSourceSignature = resolved.signature;
+            }
+
+            const changed =
+              resolved.source !== lastSourceNode ||
+              resolved.signature !== lastSourceSignature ||
+              !STATE.audio ||
+              STATE.audio.source !== resolved.source ||
+              STATE.audio.context !== resolved.context ||
+              STATE.audio.sourceMode !== resolved.mode;
+
+            const incomplete =
+              !STATE.audio ||
+              !STATE.audio.context ||
+              !STATE.audio.source ||
+              !STATE.audio.analyserLeft ||
+              !STATE.audio.analyserRight ||
+              !STATE.audio.analyserEqualizerLeft ||
+              !STATE.audio.analyserEqualizerRight;
+
+            if (changed || incomplete) {
+              lastSourceNode = resolved.source;
+              lastSourceSignature = resolved.signature;
+              AMX_RUNTIME.autoRebindState = changed ? "rebind" : "repair";
+              stopRenderingLoop();
+              resetAudioState();
+              initAudioSystem();
+              nextDelay = AUTO_REBIND_FAST_MS;
+            } else {
+              AMX_RUNTIME.autoRebindState = "stable";
+              nextDelay = AUTO_REBIND_STABLE_MS;
+            }
           }
-
-          const node = Stream.Fallback.Player.Amplification;
-          const ctx  = Stream.Fallback.Audio;
-
-          if (!node || !ctx) {
-            last = null;
-            return;
+        } catch (e) {
+          AMX_RUNTIME.autoRebindState = "error";
+          nextDelay = AUTO_REBIND_FAST_MS;
+          if (AMX_DEBUG) {
+            console.warn("[AudioMetrix] auto-rebind check failed:", e);
           }
+        }
 
-          if (node !== last) {
-            last = node;
-            stopRenderingLoop();
-            resetAudioState();
-            initAudioSystem();
-            return;
-          }
+        scheduleAutoRebind(nextDelay);
+      }
 
-          if (
-            !STATE.audio ||
-            !STATE.audio.context ||
-            !STATE.audio.source ||
-            !STATE.audio.analyserLeft ||
-            !STATE.audio.analyserRight
-          ) {
-            stopRenderingLoop();
-            resetAudioState();
-            initAudioSystem();
+      function handleAMXVisibilityChange() {
+        AMX_RUNTIME.pageVisible = document.visibilityState !== "hidden";
+
+        if (!AMX_RUNTIME.pageVisible) {
+          resetVisualizerState();
+          stopRenderingLoop();
+          AMX_RUNTIME.autoRebindState = "hidden";
+          scheduleAutoRebind(AUTO_REBIND_HIDDEN_MS);
+          return;
+        }
+
+        // Resume immediately with the current graph, then verify the source.
+        startRendering();
+        scheduleAutoRebind(0);
+        requestRender();
+      }
+
+      AMX_RUNTIME.visibilityHandler = handleAMXVisibilityChange;
+      document.addEventListener("visibilitychange", AMX_RUNTIME.visibilityHandler);
+
+      function destroyAudioMetrix() {
+        if (AMX_RUNTIME.destroyed) return;
+        AMX_RUNTIME.destroyed = true;
+        resetVisualizerState();
+
+        stopRenderingLoop();
+
+        if (AMX_RUNTIME.autoRebindTimer) {
+          clearTimeout(AMX_RUNTIME.autoRebindTimer);
+          AMX_RUNTIME.autoRebindTimer = null;
+        }
+
+        if (AMX_RUNTIME.initRetryTimer) {
+          clearTimeout(AMX_RUNTIME.initRetryTimer);
+          AMX_RUNTIME.initRetryTimer = null;
+        }
+
+        if (AMX_RUNTIME.diagnosticsTimer) {
+          clearInterval(AMX_RUNTIME.diagnosticsTimer);
+          AMX_RUNTIME.diagnosticsTimer = null;
+        }
+
+        if (AMX_RUNTIME.visibilityHandler) {
+          document.removeEventListener("visibilitychange", AMX_RUNTIME.visibilityHandler);
+          AMX_RUNTIME.visibilityHandler = null;
+        }
+
+        if (AMX_RUNTIME.themeObserver) {
+          AMX_RUNTIME.themeObserver.disconnect();
+          AMX_RUNTIME.themeObserver = null;
+        }
+
+        if (AMX_RUNTIME.skinObserver) {
+          AMX_RUNTIME.skinObserver.disconnect();
+          AMX_RUNTIME.skinObserver = null;
+        }
+
+        if (AMX_RUNTIME.skinObserverRaf) {
+          cancelAnimationFrame(AMX_RUNTIME.skinObserverRaf);
+          AMX_RUNTIME.skinObserverRaf = 0;
+        }
+
+        if (AMX_RUNTIME.contentResizeObserver) {
+          AMX_RUNTIME.contentResizeObserver.disconnect();
+          AMX_RUNTIME.contentResizeObserver = null;
+        }
+
+        if (AMX_RUNTIME.barsResizeRaf !== null) {
+          cancelAnimationFrame(AMX_RUNTIME.barsResizeRaf);
+          AMX_RUNTIME.barsResizeRaf = null;
+        }
+
+        if (
+          STATE.dom &&
+          STATE.dom.settingsPanel &&
+          STATE.dom.settingsPanel._amxOverflowObserver
+        ) {
+          STATE.dom.settingsPanel._amxOverflowObserver.disconnect();
+          STATE.dom.settingsPanel._amxOverflowObserver = null;
+        }
+
+        for (const [type, handler, options] of AMX_RUNTIME.windowHandlers) {
+          window.removeEventListener(type, handler, options);
+        }
+        AMX_RUNTIME.windowHandlers.length = 0;
+
+        for (const timer of AMX_RUNTIME.pendingTimeouts) {
+          clearTimeout(timer);
+        }
+        AMX_RUNTIME.pendingTimeouts.clear();
+
+        cleanupAudioGraph();
+
+        try {
+          if (window.AudioMetrixResetMax === resetSamplePeakMemory) {
+            delete window.AudioMetrixResetMax;
           }
-        } catch (e) {}
-      }, AUTO_REBIND_INTERVAL_MS);
+        } catch (_) {}
+
+        if (AMX_RUNTIME.diagnosticsEl) {
+          AMX_RUNTIME.diagnosticsEl.remove();
+          AMX_RUNTIME.diagnosticsEl = null;
+        }
+      }
+
+      // Useful for admin/debug reloads and future plugin lifecycle integration.
+      window.AudioMetrixDestroy = destroyAudioMetrix;
+
+      scheduleAutoRebind(AUTO_REBIND_FAST_MS);
+      startDiagnosticsLoop();
 
       // Log + internal update check (panel + console)
       console.log(`[AudioMetrix] Loaded v${AMX_VERSION}`);
@@ -7412,7 +13432,7 @@ function saveAMXPanelGeometry(panel) {
       initAudioSystem();
 
       // Keep floating settings panel inside viewport on window resize
-      window.addEventListener("resize", () => {
+      const handleAMXPanelViewportClamp = () => {
         if (
           STATE.dom &&
           STATE.dom.settingsPanel &&
@@ -7420,7 +13440,11 @@ function saveAMXPanelGeometry(panel) {
         ) {
           clampAMXPanelToViewport(STATE.dom.settingsPanel);
         }
-      });
+      };
+      window.addEventListener("resize", handleAMXPanelViewportClamp);
+      AMX_RUNTIME.windowHandlers.push(
+        ["resize", handleAMXPanelViewportClamp, undefined]
+      );
 
     } catch (e) {
       console.error("[AudioMetrix] DOMContentLoaded init failed:", e);

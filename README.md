@@ -5,6 +5,7 @@ Audiometrix plugin for FMDX Webservers
 
 AudioMetrix is a real-time audio visualization plugin for the FM-DX Webserver.
 
+
 It transforms raw audio data into smooth, responsive, and visually rich meters — combining accurate signal feedback with high-quality eye candy.
 
 It is designed as a hybrid metering system, offering both technical insight and aesthetic presentation.
@@ -21,32 +22,63 @@ It is designed as a hybrid metering system, offering both technical insight and 
 
 🔹 Layouts
 - LR (Stereo Levels)
-- Classic left/right metering
+  
+![amx1](https://github.com/user-attachments/assets/c49b8dd5-2f16-410a-bfd7-095c31172c23)
+  
+  Classic left/right metering
+  
 - SA (Stereo Quality + Audio Peak)
-- Advanced signal analysis
+  
+![amx2](https://github.com/user-attachments/assets/9f5d6241-f2e6-4515-b885-28043c55a946)
+  
+  Advanced signal analysis
+  
 - FULL
-- Combined multi-row view (L/R + Q/A)
+  
+![amx3](https://github.com/user-attachments/assets/b2be283e-8a6e-4cfa-b952-2194bfabd010)
+  
+  Combined multi-row view (L/R + Q/A)
   
 🔹 Render Modes
 - Bars — clean, linear meters
+  
+![amx4](https://github.com/user-attachments/assets/055cbd26-acab-4369-ba32-f8309835d648)
+
 - Gauges — analog-style circular meters
+  
+![amx5](https://github.com/user-attachments/assets/0cb44e01-9e22-46d8-b1e0-c9758dfbf7bd)
+
 - Mirrored — symmetrical dual-channel display
+  
+![amx6](https://github.com/user-attachments/assets/8f42ac97-0657-477b-8647-6c893f6473f3)
+
 
 All modes share the same underlying data — only the presentation changes.
 
-🎛️ Styles
+🎛️ Styles and themes
 
 AudioMetrix supports multiple visual styles:
 
-- Simple
-- Segment
+- Simple bars
+- Segmented bars
+
+![amx7](https://github.com/user-attachments/assets/10454827-a96d-46d1-9dda-381b89777bee)
+
 - Circle Dots
 - Matrix Dots
 - Pillars
+
+![amx8](https://github.com/user-attachments/assets/1d7ef944-ae69-43b8-93f2-7bd451a13421)
+  
 - Beveled 3D
 - Glass Tube
 
 Each style represents the same signal with a different visual interpretation.
+Audiometrix features 22 pure eye-candy colorful gradient themes for the bars and gauges. 
+The default theme scheme is Automatic which reads the colors of your FMDX Webserver theme automatically.
+
+![amx10](https://github.com/user-attachments/assets/b3a8df08-0e77-4055-aed9-b0644e115002)
+
 
 🌈 Features
 - Real-time RMS + peak metering
@@ -76,7 +108,11 @@ All changes apply instantly in real time.
 - Locate the AudioMetrix panel in the FM-DX interface
 - Click the settings icon / panel trigger
 - The floating panel will appear
+
+![amx9](https://github.com/user-attachments/assets/d53ef1e0-0624-4286-ab81-52d29828f07b)
+
 - Adjust settings live
+- You can move the panel wherever you like or/and change its size by dragging on its corners. The changes will stick.
 
 ⚡ Performance
 AudioMetrix is optimized for efficiency:
@@ -104,7 +140,13 @@ AudioMetrix is optimized for efficiency:
 - Enable Glow for depth and contrast
 - Use SA layout to monitor stereo quality live
 - Adjust gain carefully to avoid constant peak saturation
-- 
-🧩 Version
+- Enable audio peaks and real time values for a more detailed view of info (default off).
+  
+🧩 Version and updates
 
-AudioMetrix 4.0
+AudioMetrix displays on the settings panel the current version.
+Whenever there is an update, a prompt will appear below the version number.
+- Click on the update banner and you'll be redirected to the Github page
+- Download the update and apply it on your webserver
+- The update will also notify the settings panel of your webserver as an alternative method.
+- Feel free for suggestions and improvements.

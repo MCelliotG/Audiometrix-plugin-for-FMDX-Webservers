@@ -1,16 +1,17 @@
 /*
- * AudioMetrix v5.5
+ * AudioMetrix v5.6
  * FM-DX Webserver audio metering / visualization plugin
+ */
 
 (() => {
   // ─────────────────────────────────────────────────────────
-  // AUDIO METRIX 5.5.0 — RELEASE
+  // AUDIO METRIX 5.6 — RELEASE
   // THEME ENGINE • SETTINGS UI • RENDER ENGINE • AUDIO ENGINE
   // ─────────────────────────────────────────────────────────
 
   // PLUGIN METADATA
   const AMX_PLUGIN_NAME        = "AudioMetrix";
-  const AMX_VERSION            = "5.5";
+  const AMX_VERSION            = "5.6";
   const AMX_CHECK_FOR_UPDATES  = true;
   const AMX_UPDATE_URL         =
     "https://raw.githubusercontent.com/MCelliotG/Audiometrix-plugin-for-FMDX-Webservers/main/AudioMetrix/audiometrix.js";
@@ -98,6 +99,9 @@
 
   const FRAME_INTERVAL = 1000 / 30;
   let _lastRenderTime = 0;
+  let _lastAudioTickTime = -Infinity;
+  let _lastSpectrumReadTime = -Infinity;
+  let _lastModeKey = null;
   let _lastDrawn = {
     L: null,
     R: null,
@@ -160,6 +164,7 @@
   const STORAGE_PANEL_WIDTH   = "AMX_PANEL_WIDTH";
   const STORAGE_PANEL_HEIGHT  = "AMX_PANEL_HEIGHT";
   const STORAGE_DIAGNOSTICS   = "AMX_ADMIN_DIAGNOSTICS";
+  const STORAGE_READOUT_SKIP  = "AMX_ADMIN_READOUT_FRAME_SKIP";
 
   const AMX_RUNTIME = {
     destroyed: false,
@@ -177,7 +182,14 @@
     barsResizeRaf: null,
     windowHandlers: [],
     pendingTimeouts: new Set(),
-    initRetryTimer: null
+    initRetryTimer: null,
+    idleRenderTimer: null,
+    transportObserver: null,
+    transportElement: null,
+    transportClickHandler: null,
+    lastTransportPlaying: null,
+    panelOutsideHandler: null,
+    panelOutsideEvents: []
   };
   const MIRRORED_LAYOUTS = ["lr", "sa", "full"];
   const EQ_CENTER_FREQUENCIES = [
@@ -1619,6 +1631,20 @@
     return CIRCULAR_WARNING_ZONES[node.metric] || null;
   }
 
+  const CIRCULAR_TRIG_CACHE = new Map();
+  function circularTrig(points) {
+    let table = CIRCULAR_TRIG_CACHE.get(points);
+    if (!table) {
+      table = { angle: new Float64Array(points + 1), cos: new Float64Array(points + 1), sin: new Float64Array(points + 1) };
+      for (let i = 0; i <= points; i++) {
+        const angle = i / points * Math.PI * 2 - Math.PI / 2;
+        table.angle[i] = angle;table.cos[i] = Math.cos(angle);table.sin[i] = Math.sin(angle);
+      }
+      CIRCULAR_TRIG_CACHE.set(points, table);
+    }
+    return table;
+  }
+
   function drawCircularStyle(ctx, style, cx, cy, radius, node, now) {
     refreshVisualizerPalette(CIRCULAR_PALETTE);
     const palette = CIRCULAR_PALETTE.palette;
@@ -1627,14 +1653,17 @@
     const level = clamp(node.level || 0, 0, 1);
     const zone = circularWarningZone(node);
     const warning = zone && level >= zone.threshold ? zone.color : null;
-    const points = radius < 35 ? 96 : 160;
+    // Retain full waveform detail; decorative contours need fewer vertices
+    // at these small pixel radii. This bounds work in three/four-circle modes.
+    const points = style === "circular" ? (radius < 35 ? 128 : 160) : (radius < 35 ? 64 : 96);
+    const trig = circularTrig(points);
     const tau = Math.PI * 2;
     const sampleAt = fraction => samples[Math.floor(fraction * samples.length) % samples.length] || 0;
     const colour = fraction => palette[Math.round(clamp(fraction, 0, 1) * 63)];
-    const line = (alpha, color, width = 0.7) => {
+    const line = (alpha, color, width = 0.7, glow = true) => {
       ctx.globalAlpha = alpha; ctx.strokeStyle = color;
       ctx.shadowColor = color;
-      ctx.shadowBlur = CONFIG.display.glowIntensity > 0 ? 3 : 0;
+      ctx.shadowBlur = glow && CONFIG.display.glowIntensity > 0 ? 3 : 0;
       ctx.lineWidth = width; ctx.stroke();
     };
     ctx.save();
@@ -1646,6 +1675,9 @@
       ctx.beginPath(); ctx.arc(cx, cy, base, 0, tau);
       line(0.45, colors.mid);
       ctx.shadowBlur = 0;
+      const glowPath = CONFIG.display.glowIntensity > 0 ? new Path2D() : null;
+      const warningPath = glowPath && warning ? new Path2D() : null;
+      let hasWarningRays = false;
       for (let i = 0; i < node.spectrum.length; i++) {
         const value = clamp(node.spectrum[i], 0, 1);
         const angle = i / node.spectrum.length * tau - Math.PI / 2;
@@ -1656,7 +1688,18 @@
         const position = i / (node.spectrum.length - 1);
         const rayColor = zone && position >= zone.threshold && position <= level && value > 0
           ? zone.color : colour(value);
-        line(0.25 + value * 0.75, rayColor, Math.max(0.6, radius / 55));
+        line(0.25 + value * 0.75, rayColor, Math.max(0.6, radius / 55), false);
+        const path = zone && rayColor === zone.color ? warningPath : glowPath;
+        if (path && value > 0.008) {
+          if (path === warningPath) hasWarningRays = true;
+          path.moveTo(cx + Math.cos(angle) * base, cy + Math.sin(angle) * base);
+          path.lineTo(cx + Math.cos(angle) * outer, cy + Math.sin(angle) * outer);
+        }
+      }
+      if (glowPath) {
+        ctx.globalAlpha = 0.20;ctx.shadowBlur = 3;ctx.lineWidth = Math.max(0.6, radius / 55);
+        ctx.strokeStyle = colors.high;ctx.shadowColor = colors.high;ctx.stroke(glowPath);
+        if (hasWarningRays) {ctx.strokeStyle = zone.color;ctx.shadowColor = zone.color;ctx.stroke(warningPath);}
       }
     } else if (style === "halo") {
       ctx.beginPath(); ctx.arc(cx, cy, radius * 0.93, 0, tau);
@@ -1676,7 +1719,7 @@
         ctx.lineTo(cx + Math.cos(angle) * (r + radius * 0.05), cy + Math.sin(angle) * (r + radius * 0.05));
         const position = i / 48;
         line(0.15 + Math.max(amount, level) * 0.70,
-          zone && position >= zone.threshold && position <= level ? zone.color : colour(position));
+          zone && position >= zone.threshold && position <= level ? zone.color : colour(position), 0.7, false);
       }
     } else if (style === "ripple") {
       if (level > 0.01 && (
@@ -1719,11 +1762,11 @@
           const x = cx + Math.cos(angle) * r, y = cy + Math.sin(angle) * r;
           if (!i) ctx.moveTo(x, y); else ctx.lineTo(x, y);
         }
-        line(0.40 + turn / turns * 0.5, warning || colour((turn + 1) / turns));
+        line(0.40 + turn / turns * 0.5, warning || colour((turn + 1) / turns), 0.7, turn >= turns - 2);
       }
     } else {
       const simple = style === "circular";
-      const count = simple ? 1 : (radius < 35 ? 10 : 18);
+      const count = simple ? 1 : (radius < 35 ? 8 : 12);
       const size = count * (points + 1) * 2;
       if (!node.outline || node.outline.length !== size) node.outline = new Float32Array(size);
       const outline = node.outline;
@@ -1731,7 +1774,7 @@
       for (let curve = 0; curve < count; curve++) {
         const t = count > 1 ? curve / (count - 1) : 1;
         for (let i = 0; i <= points; i++) {
-          const fraction = i / points, angle = fraction * tau - Math.PI / 2;
+          const fraction = i / points, angle = trig.angle[i];
           const wave = sampleAt(fraction);
           let r;
           if (simple) {
@@ -1752,7 +1795,7 @@
               Math.sin(angle * 3 + wave * 3.4 + t * 0.7) * (t - 0.5) * 0.085;
           }
           r = clamp(r, 0.12, 0.985) * radius;
-          const x = Math.cos(angle) * r, y = Math.sin(angle) * r;
+          const x = trig.cos[i] * r, y = trig.sin[i] * r;
           const offset = (curve * (points + 1) + i) * 2;
           outline[offset] = x;outline[offset + 1] = y;
           minX = Math.min(minX, x);maxX = Math.max(maxX, x);
@@ -1776,7 +1819,8 @@
         }
         ctx.closePath();
         line(simple ? 0.95 : 0.38 + t * 0.40,
-          warning || (simple ? colors.high : colour(0.25 + t * 0.75)), (simple ? 1.1 : 0.55) / fit);
+          warning || (simple ? colors.high : colour(0.25 + t * 0.75)), (simple ? 1.1 : 0.55) / fit,
+          simple || curve === count - 1 || curve === Math.floor(count / 2));
       }
     }
     ctx.restore();
@@ -1832,11 +1876,73 @@
     }
   }
 
+  // Static names/scales are independent of transport and never require audio
+  // snapshots, history buffers or animated shapes while stopped.
+  function drawStaticCanvasLabels(ctx, canvas, layout, render) {
+    const width = getCanvasLogicalWidth(canvas), height = getCanvasLogicalHeight(canvas);
+    const source = layout === "equalizer" || layout === "vuHybrid"
+      ? STATE.dom.labels?.left || STATE.dom.title : STATE.dom.title;
+    const inherited = getCanvasFontStyle(source);
+    const family = inherited?.fontFamily || "sans-serif";
+    const weight = inherited?.fontWeight || "600";
+    ctx.save();ctx.shadowBlur = 0;ctx.globalAlpha = 1;
+    ctx.fillStyle = "#ffffff";ctx.textAlign = "center";ctx.textBaseline = "middle";
+    if (MIRRORED_LAYOUTS.includes(layout) && isCircularStyle(render)) {
+      const keys = layout === "full" ? ["L", "R", "Q", "A"] : layout === "sa" ? ["Q", "A"] : ["L", "R"];
+      const slot = width / keys.length;
+      const radius = Math.max(1, Math.min(slot / 2 - 3, height / 2 - 2));
+      ctx.font = `600 ${radius < 34 ? 8 : 10}px ${family}`;
+      const y = height / 2 - (CONFIG.display.showReadouts ? 5 : 0);
+      keys.forEach((key, index) => ctx.fillText(key, slot * (index + 0.5), y));
+    } else if (layout === "visualizer") {
+      const style = CONFIG.display.visualizerStyle;
+      const h = Math.max(1, height - (CONFIG.display.showReadouts ? 12 : 0) - (style === "goniometer" ? 7 : 0) - 2);
+      if (isCircularStyle(style)) {
+        const slot = width / 3, radius = Math.max(1, Math.min(slot / 2 - 3, h / 2 - 1));
+        ctx.font = `600 ${Math.min(9, Math.max(7, radius * 0.21))}px ${family}`;
+        ctx.strokeStyle = "rgba(0,0,0,0.70)";ctx.lineWidth = 3;
+        ["Low", "Medium", "High"].forEach((label, index) => {
+          const x = slot * (index + 0.5), y = 1 + h / 2;
+          ctx.strokeText(label, x, y, slot - 8);ctx.fillText(label, x, y, slot - 8);
+        });
+      } else if (style === "spectrogram") {
+        ctx.font = `9px ${family}`;ctx.textAlign = "left";ctx.textBaseline = "bottom";
+        ctx.fillText("20k", 8, 14);ctx.fillText("30Hz", 8, h + 2);
+      }
+      if (CONFIG.display.showReadouts && STATE.hasStreamObject !== true) {
+        ctx.font = `9px ${family}`;ctx.textBaseline = "bottom";ctx.textAlign = "left";
+        ctx.fillText("L", 7, height - 1);ctx.textAlign = "right";
+        ctx.fillText(style === "goniometer" ? "Corr · Side" : "R", width - 7, height - 1);
+      }
+    } else if (layout === "equalizer" || layout === "vuHybrid") {
+      const gap = 3, bandW = Math.max(6, (Math.max(1, width - 10) - gap * (EQ_BAND_COUNT - 1)) / EQ_BAND_COUNT);
+      const startX = (width - (bandW * EQ_BAND_COUNT + gap * (EQ_BAND_COUNT - 1))) / 2;
+      const center = index => startX + index * (bandW + gap) + bandW / 2;
+      ctx.font = `${weight} 7px ${family}`;ctx.textBaseline = "bottom";
+      if (layout === "equalizer") {
+        if (CONFIG.display.equalizerRenderMode === "spectrum") {
+          ctx.font = `${weight} 8px ${family}`;
+          EQ_LABEL_ANCHORS.forEach(anchor => ctx.fillText(anchor.text, center(anchor.index), height - 1));
+        } else EQ_BAND_LABELS.forEach((label, index) => ctx.fillText(label, center(index), height - 1));
+      } else {
+        const audio = CONFIG.display.hybridMode === "audio10";
+        const keys = audio ? ["L", "R", "Q", "A"] : ["L", "R"];
+        const frequencies = audio ? HYBRID_AUDIO_10_FREQUENCIES : HYBRID_STEREO_12_FREQUENCIES;
+        keys.forEach((key, index) => ctx.fillText(key, center(index), height - 1));
+        frequencies.forEach((frequency, index) => ctx.fillText(formatSpectrumFrequencyLabel(frequency), center((audio ? 6 : 4) + index), height - 1));
+      }
+    }
+    ctx.restore();
+  }
+
   function renderCircularMeters(ctx, canvas, layout, style) {
     const width = getCanvasLogicalWidth(canvas), height = WRAPPER_HEIGHT;
     resizeCanvasIfNeeded(canvas, width, height);
     applyCanvasHiDpiTransform(canvas);
     ctx.clearRect(0, 0, width, height);
+    if (STATE.hasStreamObject !== true) {
+      drawStaticCanvasLabels(ctx, canvas, layout, style);return;
+    }
     const state = getCircularMeterState();
     const keys = layout === "full" ? ["L", "R", "Q", "A"] : layout === "sa" ? ["Q", "A"] : ["L", "R"];
     const slot = width / keys.length;
@@ -1911,17 +2017,73 @@
       ctx.font = `600 ${size}px ${font?.fontFamily || "sans-serif"}`;
       ctx.textAlign = "center";ctx.textBaseline = "middle";
       const values = CONFIG.display.showReadouts && playing;
-      ctx.fillText(key, cx, cy - (values ? 5 : 0));
       if (values) {
         ctx.font = `${Math.max(7, size - 1)}px ${font?.fontFamily || "sans-serif"}`;
-        const value = isQ ? `${Math.round(STATE.levels.stereoQuality.smooth)}%` : Number.isFinite(db) ? `${db.toFixed(1)}` : "–";
-        const zone = circularWarningZone(node);
-        ctx.fillStyle = zone && node.level >= zone.threshold ? zone.color : colors.high;
-        ctx.fillText(value, cx, cy + 7);
+        const value = isQ ? `${Math.round(STATE.levels.stereoQuality.smooth)}%`
+          : key === "A" ? `${Math.round((clamp(STATE.levels.audio.smooth || 0, 0, 255) / 255) * 100)}%`
+          : Number.isFinite(db) ? `${db.toFixed(1)}` : "–";
+        ctx.fillStyle = "#ffffff";
+        ctx.fillText(getThrottledCanvasReadout("circular:meters", key, value), cx, cy + 7);
       }
       ctx.restore();
     }
     ctx.restore();
+    drawStaticCanvasLabels(ctx, canvas, layout, style);
+  }
+
+  function resetPlaybackHistory() {
+    resetVisualizerState();
+    clearTransientRenderState();
+    _readoutFrame = 0;
+    _readoutRevision++;
+    const scope = STATE.oscilloscope;
+    if (scope) {
+      for (const key of ["peakHistoryLeft", "peakHistoryRight", "persistenceLeft", "persistenceRight"]) scope[key].length = 0;
+      for (const key of ["peakDisplayLeft", "peakDisplayRight", "peakHoldUntilLeft", "peakHoldUntilRight", "persistenceFrame", "lastTs"]) scope[key] = 0;
+    }
+  }
+
+  function syncPlaybackState() {
+    const playing = isAudioTransportPlaying();
+    const changed = playing !== AMX_RUNTIME.lastTransportPlaying;
+    STATE.hasStreamObject = playing;
+    if (changed) {
+      AMX_RUNTIME.lastTransportPlaying = playing;
+      resetPlaybackHistory();
+      _lastAudioTickTime = -Infinity;
+      _lastSpectrumReadTime = -Infinity;
+      _lastRenderTime = -Infinity;
+      if (!playing) {
+        for (const channel of [STATE.levels.left, STATE.levels.right]) {
+          channel.smoothDb = -120;channel.peakDb = -120;
+        }
+        STATE.levels.audio.smooth = 0;STATE.levels.audio.peak = 0;
+        STATE.audioPeak = null;
+        STATE.audioCadence.frame = 0;STATE.audioCadence.interval = 1;STATE.audioCadence.lastEnergy = 0;
+        STATE.levels.stereoQuality.instant = 0;STATE.levels.stereoQuality.smooth = 0;
+        STATE.levels.stereoQuality.peakDb = -120;
+        for (const key of Object.keys(STATE.peakHoldUntil)) STATE.peakHoldUntil[key] = 0;
+        for (const spectrum of [STATE.levels.equalizer, STATE.levels.hybridStereo12, STATE.levels.hybridAudio10]) {
+          if (!spectrum) continue;
+          for (const key of ["values", "targetValues", "peaks", "peakHoldUntil"]) spectrum[key].fill(0);
+          spectrum.dbValues.fill(-100);spectrum.lastUpdateTs = 0;
+          spectrum.detail = null;
+        }
+        for (const key of ["timeLeft", "timeRight", "dataPeak", "dataMid", "dataSide", "dataEqualizerLeft", "dataEqualizerRight"]) STATE.audio?.[key]?.fill(0);
+        for (const el of Object.values(STATE.dom.readouts || {})) if (el) el.textContent = "";
+      }
+      RENDER_GATE.dirty = true;
+    }
+    return changed;
+  }
+
+  function visualizerNeedsSpectrum(style) {
+    return ["radial", "waterfall", "spectrogram", "ribbon", "shower"].includes(style);
+  }
+
+  function visualizerFrameDue(now) {
+    if (["ripple", "shower"].includes(CONFIG.display.visualizerStyle)) return true;
+    return !VISUALIZER_STATE || now - VISUALIZER_STATE.lastCapture >= 1000 / 30 - 0.5;
   }
 
   let VISUALIZER_STATE = null;
@@ -1952,12 +2114,12 @@
   }
 
   function captureVisualizerFrame(v, now) {
-    if (now - v.lastCapture < 1000 / 30) return false;
+    if (now - v.lastCapture < 1000 / 30 - 0.5) return false;
     v.lastCapture = now;
     v.head = (v.head + 1) % v.frames.length;
     v.count = Math.min(v.frames.length, v.count + 1);
     const frame = v.frames[v.head];
-    const detail = STATE.levels.equalizer.detail?.values;
+    const detail = visualizerNeedsSpectrum(v.style) ? STATE.levels.equalizer.detail?.values : null;
     frame.spectrum.fill(0);
     if (detail) frame.spectrum.set(detail.subarray(0, 121));
     const left = STATE.audio.timeLeft;
@@ -2025,6 +2187,9 @@
     resizeCanvasIfNeeded(canvas, width, height);
     applyCanvasHiDpiTransform(canvas);
     ctx.clearRect(0, 0, width, height);
+    if (STATE.hasStreamObject !== true) {
+      drawStaticCanvasLabels(ctx, canvas, "visualizer", "bars");return;
+    }
     const now = performance.now();
     const v = getVisualizerState(style, now);
     const captured = captureVisualizerFrame(v, now);
@@ -2032,8 +2197,7 @@
     if (v.head < 0) return;
     const current = visualizerFrame(v, 0);
     const colors = ACTIVE_THEME.colors;
-    const showValues = CONFIG.display.showReadouts && STATE.hasStreamObject === true;
-    const reserve = (showValues ? 12 : 0) + (style === "goniometer" ? 7 : 0);
+    const reserve = (CONFIG.display.showReadouts ? 12 : 0) + (style === "goniometer" ? 7 : 0);
     const w = Math.max(1, width - 12), h = Math.max(1, height - reserve - 2);
     const cx = width / 2, cy = 1 + h / 2;
     const radius = Math.max(1, Math.min(w / 2 - 1, h / 2 - 1));
@@ -2072,23 +2236,13 @@
           const y = baseline - samples[i] * amplitude * scale;
           if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
         }
-        stroke((1 - depth * 0.82) * 0.85, palette(1 - depth * 0.8), age === 0 ? 1.3 : 0.7);
+        stroke((1 - depth * 0.82) * 0.85, palette(1 - depth * 0.8), age === 0 ? 1.3 : 0.7, age < 2);
       }
     } else if (isCircularStyle(style)) {
-      const names = ["Low", "Medium", "High"];
       const slot = width / 3;
       const bandRadius = Math.max(1, Math.min(slot / 2 - 3, h / 2 - 1));
-      const font = getCanvasFontStyle(STATE.dom.title);
       for (let band = 0; band < 3; band++) {
-        const bandX = slot * (band + 0.5);
-        drawCircularStyle(ctx, style, bandX, cy, bandRadius, v.circles[band], now);
-        ctx.save();ctx.shadowBlur = 0;
-        ctx.textAlign = "center";ctx.textBaseline = "middle";
-        ctx.font = `600 ${Math.min(9, Math.max(7, bandRadius * 0.21))}px ${font?.fontFamily || "sans-serif"}`;
-        ctx.strokeStyle = colors.low;ctx.lineWidth = 3;ctx.globalAlpha = 0.95;
-        ctx.strokeText(names[band], bandX, cy, slot - 8);
-        ctx.fillStyle = colors.high;ctx.fillText(names[band], bandX, cy, slot - 8);
-        ctx.restore();
+        drawCircularStyle(ctx, style, slot * (band + 0.5), cy, bandRadius, v.circles[band], now);
       }
     } else if (style === "ribbon") {
       const samples = current.wave;
@@ -2135,7 +2289,7 @@
           const y = cy - xy[i * 2 + 1] * sizeY;
           if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
         }
-        stroke(age === 0 ? 0.85 : (1 - age / count) * 0.11, age === 0 ? colors.high : colors.mid, 0.75);
+        stroke(age === 0 ? 0.85 : (1 - age / count) * 0.11, age === 0 ? colors.high : colors.mid, 0.75, age < 2);
       }
       ctx.restore();
       if (style === "goniometer") {
@@ -2151,6 +2305,7 @@
     } else if (style === "tide") {
       ctx.shadowBlur = 0;
       const columns = Math.max(1, historyCount * 4);
+      const glowPath = CONFIG.display.glowIntensity > 0 ? new Path2D() : null;
       const dx = w / columns;
       for (let column = 0; column < columns; column++) {
         const age = historyCount - 1 - Math.floor(column / 4);
@@ -2161,7 +2316,12 @@
         const level = clamp(Math.sqrt(power / 32) * 2, 0, 1);
         const amp = level * h * 0.49;
         ctx.beginPath();ctx.moveTo(6 + column * dx, cy - amp);ctx.lineTo(6 + column * dx, cy + amp);
-        stroke(0.35 + level * 0.65, palette(level), Math.max(0.6, dx * 0.64));
+        stroke(0.35 + level * 0.65, palette(level), Math.max(0.6, dx * 0.64), false);
+        if (glowPath && level > 0.008) {glowPath.moveTo(6 + column * dx, cy - amp);glowPath.lineTo(6 + column * dx, cy + amp);}
+      }
+      if (glowPath) {
+        ctx.globalAlpha = 0.20;ctx.strokeStyle = colors.high;ctx.shadowColor = colors.high;ctx.shadowBlur = 3;
+        ctx.lineWidth = Math.max(0.6, dx * 0.64);ctx.stroke(glowPath);
       }
     } else if (style === "layers") {
       ctx.shadowBlur = 0;
@@ -2177,6 +2337,7 @@
           if (!i) ctx.moveTo(x, y); else ctx.lineTo(x, y);
         }
         ctx.lineTo(6 + w, h + 1);ctx.lineTo(6, h + 1);ctx.closePath();
+        ctx.shadowBlur = 0;
         ctx.globalAlpha = 0.10;ctx.fillStyle = palette((layer + 1) / count);ctx.fill();
         // The upper boundary alone is the illuminated layer edge.
         ctx.beginPath();
@@ -2185,7 +2346,7 @@
           const y = clamp(base - wave[i] * h * 0.14, 1, h);
           if (!i) ctx.moveTo(x, y); else ctx.lineTo(x, y);
         }
-        stroke(0.45 + layer / Math.max(1, count - 1) * 0.4, palette((layer + 1) / count), 0.8);
+        stroke(0.45 + layer / Math.max(1, count - 1) * 0.4, palette((layer + 1) / count), 0.8, layer >= count - 2);
       }
     } else if (style === "shower") {
       if (captured && STATE.hasStreamObject === true) {
@@ -2203,6 +2364,7 @@
         }
       }
       const duration = CONFIG.display.visualizerTrail / 30 * 1000;
+      const glowPath = CONFIG.display.glowIntensity > 0 ? new Path2D() : null;
       for (const particle of v.particles) {
         const age = (now - particle.born) / duration;
         if (age < 0 || age >= 1) continue;
@@ -2210,7 +2372,12 @@
         const length = Math.min(5 + particle.strength * 20, h + 1 - y);
         ctx.beginPath();ctx.moveTo(particle.x, y);ctx.lineTo(particle.x, y + length);
         stroke(Math.pow(1 - age, 0.65) * (0.35 + particle.strength * 0.65),
-          palette(Math.max(0.35, particle.strength)), 1 + particle.strength * 0.9);
+          palette(Math.max(0.35, particle.strength)), 1 + particle.strength * 0.9, false);
+        if (glowPath) {glowPath.moveTo(particle.x, y);glowPath.lineTo(particle.x, y + length);}
+      }
+      if (glowPath) {
+        ctx.globalAlpha = 0.18;ctx.strokeStyle = colors.high;ctx.shadowColor = colors.high;ctx.shadowBlur = 3;
+        ctx.lineWidth = 1.2;ctx.stroke(glowPath);
       }
     } else if (style === "spectrogram") {
       if (!v.image) {
@@ -2243,22 +2410,21 @@
     ctx.globalAlpha = 0.85;
     const font = getCanvasFontStyle(STATE.dom.title);
     ctx.font = `9px ${font?.fontFamily || "sans-serif"}`;
-    ctx.fillStyle = colors.high;
+    ctx.fillStyle = "#ffffff";
     ctx.textBaseline = "bottom";
-    if (style === "spectrogram") {
-      ctx.fillText("20k", 8, 14); ctx.fillText("30Hz", 8, h + 2);
-    }
     if (CONFIG.display.showReadouts && STATE.hasStreamObject === true) {
       const format = value => Number.isFinite(value) ? value.toFixed(1) : "–";
       ctx.textAlign = "left";
-      ctx.fillText(`L ${format(STATE.levels.left.smoothDb)} dB`, 7, height - 1);
+      ctx.fillText(getThrottledCanvasReadout(`visualizer:${style}`, "L",
+        `L ${format(STATE.levels.left.smoothDb)} dB`), 7, height - 1);
       ctx.textAlign = "right";
       const label = style === "goniometer"
         ? `Corr ${v.correlationValid ? v.correlation.toFixed(2) : "–"} · Side ${(v.width * 100).toFixed(0)}%`
         : `R ${format(STATE.levels.right.smoothDb)} dB`;
-      ctx.fillText(label, width - 7, height - 1);
+      ctx.fillText(getThrottledCanvasReadout(`visualizer:${style}`, "R", label), width - 7, height - 1);
     }
     ctx.restore();
+    drawStaticCanvasLabels(ctx, canvas, "visualizer", "bars");
   }
 
   const CONFIG = {
@@ -3348,6 +3514,8 @@ function saveAMXPanelGeometry(panel) {
   function createAMXSettingsButton(container, panel) {
     const btn = document.createElement("div");
 
+    btn.dataset.amxSettingsToggle = "1";
+
     // FontAwesome gear
     btn.innerHTML = `<i class="fa-solid fa-gear"></i>`;
 
@@ -3420,8 +3588,20 @@ function saveAMXPanelGeometry(panel) {
       }
     };
 
-    // attach button
+    // Attach button and one capture listener for outside dismissal.
     container.appendChild(btn);
+    if (AMX_RUNTIME.panelOutsideHandler) {
+      for (const type of AMX_RUNTIME.panelOutsideEvents) document.removeEventListener(type, AMX_RUNTIME.panelOutsideHandler, true);
+    }
+    AMX_RUNTIME.panelOutsideEvents = typeof PointerEvent === "function"
+      ? ["pointerdown"] : ["mousedown", "touchstart"];
+    AMX_RUNTIME.panelOutsideHandler = event => {
+      if (panel.style.display === "none" || panel.contains(event.target) || btn.contains(event.target)) return;
+      panel.style.display = "none";
+    };
+    for (const type of AMX_RUNTIME.panelOutsideEvents) {
+      document.addEventListener(type, AMX_RUNTIME.panelOutsideHandler, { capture: true, passive: true });
+    }
 
     // SHOW / HIDE logic (hover + touch)
     // Desktop: show on hover
@@ -3662,6 +3842,18 @@ function saveAMXPanelGeometry(panel) {
     };
   }
 
+  function isAMXScrollbarPoint(panel, point) {
+    const content = panel?._amxContentArea;
+    if (!content || !point || content.scrollHeight <= content.clientHeight + 1) return false;
+    const rect = content.getBoundingClientRect();
+    if (point.clientY < rect.top || point.clientY > rect.bottom) return false;
+    const gutter = Math.max(8, content.offsetWidth - content.clientWidth) + 2;
+    const rtl = getComputedStyle(content).direction === "rtl";
+    return rtl
+      ? point.clientX >= rect.left && point.clientX <= rect.left + gutter
+      : point.clientX <= rect.right && point.clientX >= rect.right - gutter;
+  }
+
   function enableAMXPanelDragging(panel, handle) {
     if (!panel || !handle || panel._amxDragEnabled) return;
     panel._amxDragEnabled = true;
@@ -3679,7 +3871,7 @@ function saveAMXPanelGeometry(panel) {
       if (!target) return false;
   
       return !!target.closest(
-        'input, select, textarea, button, a, label, option, [data-amx-no-drag], .amx-resize-handle, .dropdown, .options, .option, .form-control'
+        'input, select, textarea, button, a, label, option, [data-amx-no-drag], .amx-resize-handle, .switch, .dropdown, .options, .option, .form-control'
       );
     }
   
@@ -3763,6 +3955,7 @@ function saveAMXPanelGeometry(panel) {
       if (shouldIgnoreDragTarget(e.target)) return;
   
       const pt = pointer.getPoint(e);
+      if (isAMXScrollbarPoint(panel, pt)) return;
       if (e.cancelable) e.preventDefault();
   
       isDragging = true;
@@ -3782,6 +3975,15 @@ function saveAMXPanelGeometry(panel) {
   
     panel.addEventListener("mousedown", onDown);
     panel.addEventListener("touchstart", onDown, { passive: false });
+    const content = panel._amxContentArea;
+    if (content) {
+      content.addEventListener("mousemove", event => {
+        if (isDragging) return;
+        const cursor = shouldIgnoreDragTarget(event.target) || isAMXScrollbarPoint(panel, event)
+          ? "auto" : "move";
+        if (content.style.cursor !== cursor) content.style.cursor = cursor;
+      });
+    }
   }
 
   function enableAMXPanelResize(panel) {
@@ -3810,19 +4012,19 @@ function saveAMXPanelGeometry(panel) {
       grip.style.touchAction = "none";
       grip.style.background = "transparent";
 
-      // Keep resize hit-zones INSIDE the panel. Because the panel uses
-      // overflow:hidden, external hit-zones are clipped and hard to grab.
+      // Keep grips inside the 12px panel padding, outside the content's
+      // scrollbar. The content also sits above grips for overlay scrollbars.
       if (cfg.type === "corner") {
-        grip.style.width = "32px";
-        grip.style.height = "32px";
+        grip.style.width = "12px";
+        grip.style.height = "12px";
       } else if (cfg.dir === "n" || cfg.dir === "s") {
         grip.style.left = "24px";
         grip.style.right = "24px";
-        grip.style.height = "18px";
+        grip.style.height = "6px";
       } else {
         grip.style.top = "24px";
         grip.style.bottom = "24px";
-        grip.style.width = "18px";
+        grip.style.width = "6px";
       }
 
       if (cfg.dir.includes("n")) grip.style.top = "0";
@@ -4048,6 +4250,11 @@ function saveAMXPanelGeometry(panel) {
       content.style.overflowX = "hidden";
       content.style.maxHeight = "none";
       content.style.webkitOverflowScrolling = "touch";
+      content.style.cursor = "move";
+      content.style.touchAction = "pan-y";
+      content.style.position = "relative";
+      content.style.zIndex = "31";
+      content.style.scrollbarGutter = "stable";
 
       // UPDATE BANNER
       const updateBanner = document.createElement("div");
@@ -4123,7 +4330,6 @@ function saveAMXPanelGeometry(panel) {
       function appendSettingsSectionTitle(label) {
         const title = document.createElement("div");
         title.className = "amx-settings-section amx-settings-section-title";
-        title.dataset.amxNoDrag = "1";
         title.textContent = label;
         content.appendChild(title);
         return title;
@@ -4674,6 +4880,27 @@ function saveAMXPanelGeometry(panel) {
       // ADMIN-ONLY DIAGNOSTICS
       // This section is not created at all for normal users.
       if (isFMdxAdmin()) {
+        appendSettingsSectionTitle("ADMIN SETTINGS");
+        READOUT_FRAME_SKIP = loadLSInt(STORAGE_READOUT_SKIP, 5, 1, 60);
+        const readoutSkipDiv = document.createElement("div");
+        readoutSkipDiv.className = "form-group";
+        readoutSkipDiv.innerHTML = `
+          <label class="form-label" for="amx-readout-frame-skip">READOUT FRAME SKIP</label>
+          <input id="amx-readout-frame-skip" class="form-control" type="number" min="1" max="60" step="1">
+          <div class="text-small" style="opacity:.68;margin-top:4px">Readout refresh interval in frames. Default: 5.</div>`;
+        content.appendChild(readoutSkipDiv);
+        const readoutSkipInput = document.getElementById("amx-readout-frame-skip");
+        readoutSkipInput.value = String(READOUT_FRAME_SKIP);
+        readoutSkipInput.addEventListener("change", () => {
+          const value = Number(readoutSkipInput.value);
+          READOUT_FRAME_SKIP = Number.isFinite(value) && readoutSkipInput.value.trim() !== ""
+            ? Math.max(1, Math.min(60, Math.round(value))) : 5;
+          readoutSkipInput.value = String(READOUT_FRAME_SKIP);
+          safeLSSet(STORAGE_READOUT_SKIP, String(READOUT_FRAME_SKIP));
+          _readoutFrame = 0;_readoutRevision++;
+          requestRender();
+        });
+
         appendSettingsSectionTitle("DIAGNOSTICS");
 
         const diagnosticsDiv = document.createElement("div");
@@ -4834,6 +5061,14 @@ function saveAMXPanelGeometry(panel) {
 
   let READOUT_FRAME_SKIP = 5;
   let _readoutFrame = 0;
+  let _readoutRevision = 0;
+
+  function advanceReadoutCadence() {
+    if (++_readoutFrame < READOUT_FRAME_SKIP) return false;
+    _readoutFrame = 0;
+    _readoutRevision++;
+    return true;
+  }
   let _lastVisualStateKey = null;
 
   const RENDER_GATE = {
@@ -4845,17 +5080,68 @@ function saveAMXPanelGeometry(panel) {
   // END FLOATING SETTINGS PANEL MODULE
   // ================================================================
 
+  function isAudioTransportPlaying() {
+    // FM-DX keeps its WebAudio graph/node alive after Stop. The transport
+    // button is the authoritative state: fa-stop means audio is playing,
+    // fa-play means it is stopped. This also changes synchronously on each
+    // Play/Stop click, unlike the retained analyser source.
+    const transportIcon = document.querySelector(
+      ".playbutton .fa-solid"
+    );
+    if (transportIcon) {
+      return transportIcon.classList.contains("fa-stop");
+    }
+
+    // Compatibility fallback for installations without the standard
+    // FM-DX transport button.
+    try {
+      if (STATE.audio?.sourceMode === "analog") {
+        return typeof Stream !== "undefined" && Stream !== null;
+      }
+    } catch (e) {}
+
+    // Optional explicit HD Radio transport flags, when supplied by the
+    // host/plugin. A boolean false is meaningful and must not be skipped.
+    const hdFlags = [
+      window.hdRadioIsPlaying,
+      window.isHDRadioPlaying,
+      window.hdRadioPlaying
+    ];
+    const explicitHdFlag = hdFlags.find(
+      value => typeof value === "boolean"
+    );
+    if (typeof explicitHdFlag === "boolean") {
+      return explicitHdFlag;
+    }
+
+    const hdMedia =
+      window.hdRadioAudioElement ||
+      window.hdRadioAudio ||
+      null;
+    if (hdMedia && typeof hdMedia.paused === "boolean") {
+      return !hdMedia.paused && !hdMedia.ended;
+    }
+
+    // Last-resort compatibility for an HD analyser node that exists only
+    // while its transport is active.
+    return STATE.audio?.sourceMode === "hdradio" &&
+      !!STATE.audio?.source;
+  }
+
+
   function requestRender() {
     RENDER_GATE.dirty = true;
 
     // If audio RAF isn't running yet (idle/stop state), redraw immediately
     if (
+      !isAudioTransportPlaying() ||
       !STATE.audio ||
       !STATE.audio.analyserLeft ||
       !STATE.audio.analyserRight ||
       !STATE.audio.analyserPeak
     ) {
       renderMeters();
+      RENDER_GATE.dirty = false;
     }
   }
 
@@ -4870,12 +5156,10 @@ function saveAMXPanelGeometry(panel) {
   }
 
   function shouldReadSpectrumSnapshot() {
-    const c = STATE.spectrumCadence;
-    c.frame++;
-
-    if (c.frame < c.interval) return false;
-
-    c.frame = 0;
+    const now = performance.now();
+    if (now - _lastSpectrumReadTime < 1000 / 30 - 0.5) return false;
+    _lastSpectrumReadTime = now;
+    STATE.spectrumCadence.frame = 0;
     return true;
   }
 
@@ -7898,12 +8182,10 @@ function saveAMXPanelGeometry(panel) {
     const group = (
       STATE.render.canvasReadouts[groupKey] ??= []
     );
-    if (
-      group[index] === undefined ||
-      _readoutFrame === 0
-    ) {
-      group[index] =
-        nextValue == null ? "" : String(nextValue);
+    const revisions = group._amxRevisions ??= [];
+    if (group[index] === undefined || revisions[index] !== _readoutRevision) {
+      group[index] = nextValue == null ? "" : String(nextValue);
+      revisions[index] = _readoutRevision;
     }
     return group[index];
   }
@@ -8934,6 +9216,7 @@ function saveAMXPanelGeometry(panel) {
 
 
   function renderMeters() {
+    syncPlaybackState();
     refreshAutomaticTheme();
 
     const layout = CONFIG.display.layoutMode;
@@ -8951,6 +9234,12 @@ function saveAMXPanelGeometry(panel) {
 
     const visualStateKey =
       `${layout}|${render}|${barStyle}|${showReadouts}|${CONFIG.display.hybridMode}|${CONFIG.display.equalizerRenderMode}|${CONFIG.display.oscilloscopeStyle}|${CONFIG.display.visualizerStyle}`;
+
+    const modeKey = `${layout}|${render}|${barStyle}|${CONFIG.display.hybridMode}|${CONFIG.display.equalizerRenderMode}|${CONFIG.display.oscilloscopeStyle}|${CONFIG.display.visualizerStyle}`;
+    if (modeKey !== _lastModeKey) {
+      _lastModeKey = modeKey;
+      resetPlaybackHistory();
+    }
 
     if (visualStateKey !== _lastVisualStateKey) {
       _lastVisualStateKey = visualStateKey;
@@ -9001,6 +9290,17 @@ function saveAMXPanelGeometry(panel) {
 
     const barH  = CONFIG.display.dimensions.barHeight;
     const gap   = CONFIG.display.dimensions.spacing;
+
+    const animatedLayout = ["equalizer", "vuHybrid", "oscilloscope", "visualizer"].includes(layout) ||
+      (MIRRORED_LAYOUTS.includes(layout) && isCircularStyle(render));
+    if (STATE.hasStreamObject !== true && animatedLayout) {
+      const idleHeight = layout === "oscilloscope" ? 94 : WRAPPER_HEIGHT;
+      resizeCanvasIfNeeded(canvas, width, idleHeight);
+      applyCanvasHiDpiTransform(canvas);
+      ctx.clearRect(0, 0, width, idleHeight);
+      drawStaticCanvasLabels(ctx, canvas, layout, render);
+      return;
+    }
 
     if (MIRRORED_LAYOUTS.includes(layout) && isCircularStyle(render)) {
       renderCircularMeters(ctx, canvas, layout, render);
@@ -12308,54 +12608,6 @@ function saveAMXPanelGeometry(panel) {
         return null;
       }
 
-      function isAudioTransportPlaying() {
-        // FM-DX keeps its WebAudio graph/node alive after Stop. The transport
-        // button is the authoritative state: fa-stop means audio is playing,
-        // fa-play means it is stopped. This also changes synchronously on each
-        // Play/Stop click, unlike the retained analyser source.
-        const transportIcon = document.querySelector(
-          ".playbutton .fa-solid"
-        );
-        if (transportIcon) {
-          return transportIcon.classList.contains("fa-stop");
-        }
-
-        // Compatibility fallback for installations without the standard
-        // FM-DX transport button.
-        try {
-          if (STATE.audio?.sourceMode === "analog") {
-            return typeof Stream !== "undefined" && Stream !== null;
-          }
-        } catch (e) {}
-
-        // Optional explicit HD Radio transport flags, when supplied by the
-        // host/plugin. A boolean false is meaningful and must not be skipped.
-        const hdFlags = [
-          window.hdRadioIsPlaying,
-          window.isHDRadioPlaying,
-          window.hdRadioPlaying
-        ];
-        const explicitHdFlag = hdFlags.find(
-          value => typeof value === "boolean"
-        );
-        if (typeof explicitHdFlag === "boolean") {
-          return explicitHdFlag;
-        }
-
-        const hdMedia =
-          window.hdRadioAudioElement ||
-          window.hdRadioAudio ||
-          null;
-        if (hdMedia && typeof hdMedia.paused === "boolean") {
-          return !hdMedia.paused && !hdMedia.ended;
-        }
-
-        // Last-resort compatibility for an HD analyser node that exists only
-        // while its transport is active.
-        return STATE.audio?.sourceMode === "hdradio" &&
-          !!STATE.audio?.source;
-      }
-
       function scheduleInitAudioRetry(delay) {
         if (AMX_RUNTIME.destroyed) return;
 
@@ -12563,6 +12815,47 @@ function saveAMXPanelGeometry(panel) {
         );
       }
 
+      function scheduleIdleRenderCheck() {
+        if (AMX_RUNTIME.destroyed || document.visibilityState === "hidden" || AMX_RUNTIME.idleRenderTimer != null) return;
+        AMX_RUNTIME.idleRenderTimer = setTimeout(() => {
+          AMX_RUNTIME.idleRenderTimer = null;
+          attachTransportObserver();
+          refreshAutomaticTheme();
+          if (isAudioTransportPlaying()) startRendering();
+          else handleTransportChange();
+        }, 250);
+      }
+
+      function handleTransportChange() {
+        if (AMX_RUNTIME.destroyed) return;
+        const changed = syncPlaybackState();
+        if (STATE.hasStreamObject) {
+          startRendering();
+          return;
+        }
+        const hadLoop = RENDER_GATE.rafId != null;
+        const dirty = RENDER_GATE.dirty;
+        stopRenderingLoop();
+        if (changed || hadLoop || dirty || _lastDrawn.Stream !== false) {
+          renderMeters();
+          RENDER_GATE.dirty = false;
+          _lastDrawn.Stream = false;
+        }
+        scheduleIdleRenderCheck();
+      }
+
+      function attachTransportObserver() {
+        const element = document.querySelector(".playbutton");
+        if (element === AMX_RUNTIME.transportElement) return;
+        AMX_RUNTIME.transportObserver?.disconnect();
+        AMX_RUNTIME.transportObserver = null;
+        AMX_RUNTIME.transportElement = element;
+        if (element) {
+          AMX_RUNTIME.transportObserver = new MutationObserver(handleTransportChange);
+          AMX_RUNTIME.transportObserver.observe(element, { attributes: true, attributeFilter: ["class"], childList: true, subtree: true });
+        }
+      }
+
       // RENDER LOOP HOOK
       function startRendering() {
         if (
@@ -12572,30 +12865,18 @@ function saveAMXPanelGeometry(panel) {
           RENDER_GATE.rafId != null
         ) return;
 
-        // --- layout read (gated) ---
-        readLayoutOnce();
-
-        const barH = CONFIG.display.dimensions.barHeight;
-        const gap  = CONFIG.display.dimensions.spacing;
-        const safeHeight = barH * 2 + gap;
-
-        // Keep existing width; only ensure the normal canvas has a valid height.
-        if (STATE.dom.canvasNormal) {
-          const currentWidth =
-            getCanvasLogicalWidth(STATE.dom.canvasNormal) > 40
-              ? getCanvasLogicalWidth(STATE.dom.canvasNormal)
-              : 300;
-
-          resizeCanvasIfNeeded(
-            STATE.dom.canvasNormal,
-            currentWidth,
-            safeHeight
-          );
+        if (AMX_RUNTIME.idleRenderTimer != null) {
+          clearTimeout(AMX_RUNTIME.idleRenderTimer);
+          AMX_RUNTIME.idleRenderTimer = null;
         }
+        syncPlaybackState();
+        readLayoutOnce();
 
         // ctx is set by renderMeters()
         renderMeters();
-        RENDER_GATE.rafId = requestAnimationFrame(updateMetersFrame);
+        RENDER_GATE.dirty = false;
+        if (STATE.hasStreamObject) RENDER_GATE.rafId = requestAnimationFrame(updateMetersFrame);
+        else scheduleIdleRenderCheck();
       }
 
       // UPDATE METERS
@@ -12605,24 +12886,30 @@ function saveAMXPanelGeometry(panel) {
           return;
         }
 
-        // Also runs while the audio analysers are not ready, allowing the
-        // Automatic theme to replace its startup fallback after a refresh.
-        refreshAutomaticTheme();
-
-        if (
-          !STATE.audio ||
-          !STATE.audio.analyserLeft ||
-          !STATE.audio.analyserRight ||
-          !STATE.audio.analyserPeak
-        ) {
+        // Stop is observed before any analyser read or frame throttle.
+        syncPlaybackState();
+        if (STATE.hasStreamObject !== true) {
+          handleTransportChange();
+          return;
+        }
+        // Bound analysis itself, including on 120/144/240Hz displays.
+        const tickNow = performance.now();
+        if (tickNow - _lastAudioTickTime < 1000 / 60 - 0.5) {
           RENDER_GATE.rafId = requestAnimationFrame(updateMetersFrame);
+          return;
+        }
+        _lastAudioTickTime = tickNow;
+        refreshAutomaticTheme();
+        if (!STATE.audio?.analyserLeft || !STATE.audio?.analyserRight || !STATE.audio?.analyserPeak) {
+          RENDER_GATE.rafId = null;
+          scheduleIdleRenderCheck();
           return;
         }
 
         try {
           // Playback state, not mere WebAudio-node existence, controls every
           // peak/readout visibility transition.
-          STATE.hasStreamObject = isAudioTransportPlaying();
+          // Already synchronized before the analysis cadence gate.
 
           // Adaptive audio cadence (single decision point)
           const highCadenceVisual =
@@ -12689,7 +12976,7 @@ function saveAMXPanelGeometry(panel) {
             updateSamplePeakMemory("right", R.samplePeak, nowTs);
 
             const readSpectrumSnapshot =
-              (layoutMode === "equalizer" || layoutMode === "vuHybrid" || layoutMode === "visualizer" ||
+              (layoutMode === "equalizer" || layoutMode === "vuHybrid" || (layoutMode === "visualizer" && visualizerNeedsSpectrum(CONFIG.display.visualizerStyle)) ||
                 (CONFIG.display.renderMode === "radial" && MIRRORED_LAYOUTS.includes(layoutMode) && layoutMode !== "sa"))
                 ? shouldReadSpectrumSnapshot()
                 : false;
@@ -12703,7 +12990,7 @@ function saveAMXPanelGeometry(panel) {
               }
             }
 
-            if (layoutMode === "equalizer" || layoutMode === "visualizer") {
+            if (layoutMode === "equalizer" || (layoutMode === "visualizer" && visualizerNeedsSpectrum(CONFIG.display.visualizerStyle))) {
               updateEqualizerLevels(
                 nowTs,
                 STATE.levels.equalizer,
@@ -13019,7 +13306,7 @@ function saveAMXPanelGeometry(panel) {
               next = Math.max(c.min || 1, Math.min(c.max || 4, next));
               c.interval = next;
             }
-            requestRender();
+            if (CONFIG.display.layoutMode !== "visualizer" || visualizerFrameDue(performance.now())) requestRender();
           }
 
           if (!runAudio && RENDER_GATE.dirty !== true) {
@@ -13037,7 +13324,7 @@ function saveAMXPanelGeometry(panel) {
             isCircularStyle(CONFIG.display.renderMode)
               ? 1000 / 60
               : FRAME_INTERVAL;
-          if (__now - _lastRenderTime < activeFrameInterval) {
+          if (__now - _lastRenderTime < activeFrameInterval - 0.5) {
             RENDER_GATE.rafId = requestAnimationFrame(updateMetersFrame);
             return;
           }
@@ -13074,7 +13361,7 @@ function saveAMXPanelGeometry(panel) {
           }
           const dirtyValues =
             (MIRRORED_LAYOUTS.includes(CONFIG.display.layoutMode) && isCircularStyle(CONFIG.display.renderMode)) ||
-            CONFIG.display.layoutMode === "visualizer" ||
+            (CONFIG.display.layoutMode === "visualizer" && visualizerFrameDue(__now)) ||
             (CONFIG.display.layoutMode === "equalizer" && CONFIG.display.equalizerRenderMode === "spectrum") ||
             CONFIG.display.layoutMode === "oscilloscope" ||
             _lastDrawn.L === null ||
@@ -13085,6 +13372,8 @@ function saveAMXPanelGeometry(panel) {
             (spectrumState && eqSignature !== _lastDrawn.EQ) ||
             streamChanged;
 
+          // One cadence for DOM and canvas, independent of renderer FPS.
+          const refreshReadouts = advanceReadoutCadence();
           const manualDirty = (RENDER_GATE.dirty === true);
 
           if (dirtyValues) {
@@ -13116,9 +13405,7 @@ function saveAMXPanelGeometry(panel) {
           }
 
           // READOUTS — REAL-TIME UPDATE (THROTTLED)
-          _readoutFrame++;
-          if (_readoutFrame >= READOUT_FRAME_SKIP) {
-            _readoutFrame = 0;
+          if (refreshReadouts) {
 
             if (CONFIG.display.showReadouts && STATE.dom.readouts) {
 
@@ -13317,6 +13604,9 @@ function saveAMXPanelGeometry(panel) {
         AMX_RUNTIME.pageVisible = document.visibilityState !== "hidden";
 
         if (!AMX_RUNTIME.pageVisible) {
+          if (AMX_RUNTIME.idleRenderTimer != null) {
+            clearTimeout(AMX_RUNTIME.idleRenderTimer);AMX_RUNTIME.idleRenderTimer = null;
+          }
           resetVisualizerState();
           stopRenderingLoop();
           AMX_RUNTIME.autoRebindState = "hidden";
@@ -13336,6 +13626,16 @@ function saveAMXPanelGeometry(panel) {
       function destroyAudioMetrix() {
         if (AMX_RUNTIME.destroyed) return;
         AMX_RUNTIME.destroyed = true;
+        if (AMX_RUNTIME.idleRenderTimer != null) clearTimeout(AMX_RUNTIME.idleRenderTimer);
+        AMX_RUNTIME.idleRenderTimer = null;
+        AMX_RUNTIME.transportObserver?.disconnect();
+        AMX_RUNTIME.transportObserver = null;AMX_RUNTIME.transportElement = null;
+        if (AMX_RUNTIME.transportClickHandler) document.removeEventListener("click", AMX_RUNTIME.transportClickHandler, true);
+        AMX_RUNTIME.transportClickHandler = null;
+        if (AMX_RUNTIME.panelOutsideHandler) {
+          for (const type of AMX_RUNTIME.panelOutsideEvents) document.removeEventListener(type, AMX_RUNTIME.panelOutsideHandler, true);
+        }
+        AMX_RUNTIME.panelOutsideHandler = null;AMX_RUNTIME.panelOutsideEvents = [];
         resetVisualizerState();
 
         stopRenderingLoop();
@@ -13428,7 +13728,16 @@ function saveAMXPanelGeometry(panel) {
       console.log(`[AudioMetrix] Loaded v${AMX_VERSION}`);
       runAMXSetupUpdateCheck();
 
+      attachTransportObserver();
+      AMX_RUNTIME.transportClickHandler = event => {
+        if (event.target?.closest?.(".playbutton")) queueMicrotask(() => {
+          if (!AMX_RUNTIME.destroyed) { attachTransportObserver();handleTransportChange(); }
+        });
+      };
+      document.addEventListener("click", AMX_RUNTIME.transportClickHandler, true);
+
       // Start system
+      handleTransportChange();
       initAudioSystem();
 
       // Keep floating settings panel inside viewport on window resize
@@ -13451,3 +13760,4 @@ function saveAMXPanelGeometry(panel) {
     }
   });
 })(); //END
+
